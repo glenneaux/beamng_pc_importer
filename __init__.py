@@ -95,6 +95,18 @@ class JBeamBeamSpec:
     resolved_part_id: int = -1
 
 
+@dataclass
+class JBeamTriangleSpec:
+    id1: str
+    id2: str
+    id3: str
+    p1: Vector
+    p2: Vector
+    p3: Vector
+    part_name: str
+    resolved_part_id: int = -1
+
+
 @dataclass(frozen=True)
 class DaeAssetSource:
     asset_type: str
@@ -683,6 +695,65 @@ def parse_beams(
     return beams
 
 
+def parse_triangles(
+    part_def: PartDefinition,
+    local_node_positions=None,
+    global_node_positions=None,
+    component_context=None,
+    resolved_part_id=-1,
+):
+    triangles = []
+    rows = part_def.data.get("triangles", [])
+    if not isinstance(rows, list):
+        return triangles
+    local_node_positions = local_node_positions or {}
+    global_node_positions = global_node_positions or {}
+
+    def lookup_node(name):
+        key = str(name)
+        if key in local_node_positions:
+            return local_node_positions[key]
+        return global_node_positions.get(key)
+
+    current_options = {}
+    for row in rows:
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
+        if not isinstance(row, list) or len(row) < 3:
+            continue
+        if row and str(row[0]).lower().startswith("id"):
+            continue
+
+        inline_options = row[3] if len(row) > 3 and isinstance(row[3], dict) else {}
+        options = merge_options(current_options, inline_options)
+        if is_disabled(options, component_context):
+            continue
+
+        id1 = str(row[0])
+        id2 = str(row[1])
+        id3 = str(row[2])
+        p1 = lookup_node(id1)
+        p2 = lookup_node(id2)
+        p3 = lookup_node(id3)
+        if p1 is None or p2 is None or p3 is None:
+            continue
+
+        triangles.append(
+            JBeamTriangleSpec(
+                id1=id1,
+                id2=id2,
+                id3=id3,
+                p1=p1,
+                p2=p2,
+                p3=p3,
+                part_name=part_def.name,
+                resolved_part_id=resolved_part_id,
+            )
+        )
+    return triangles
+
+
 def get_prop_anchor(row, local_node_positions, global_node_positions):
     if len(row) < 5:
         return None, None, {"missing": tuple()}
@@ -917,6 +988,7 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
     flexbodies = []
     visual_nodes = []
     visual_beams = []
+    visual_triangles = []
     for index, resolved_part in enumerate(resolved_parts):
         component_context = resolved_component_contexts[index]
         for node_name, position in resolved_node_positions[index].items():
@@ -930,6 +1002,15 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
             )
         visual_beams.extend(
             parse_beams(
+                resolved_part.part_def,
+                resolved_node_positions[index],
+                global_node_positions,
+                component_context,
+                resolved_part.id,
+            )
+        )
+        visual_triangles.extend(
+            parse_triangles(
                 resolved_part.part_def,
                 resolved_node_positions[index],
                 global_node_positions,
@@ -957,7 +1038,7 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
                 )
             )
 
-    return resolved_parts, flexbodies, visual_nodes, visual_beams
+    return resolved_parts, flexbodies, visual_nodes, visual_beams, visual_triangles
 
 
 def build_dae_name_index(dae_path: Path):
@@ -1146,6 +1227,21 @@ def get_or_create_material(name, color):
     return material
 
 
+def get_or_create_translucent_material(name, color, alpha=0.24):
+    material = get_or_create_material(name, (color[0], color[1], color[2], alpha))
+    material.use_nodes = True
+    material.blend_method = "BLEND"
+    material.show_transparent_back = True
+    material.diffuse_color = (color[0], color[1], color[2], alpha)
+    bsdf = material.node_tree.nodes.get("Principled BSDF") if material.node_tree else None
+    if bsdf:
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = alpha
+        if "Base Color" in bsdf.inputs:
+            bsdf.inputs["Base Color"].default_value = (color[0], color[1], color[2], alpha)
+    return material
+
+
 JBEAM_PART_COLORS = (
     (0.95, 0.34, 0.22, 1.0),
     (0.12, 0.62, 0.95, 1.0),
@@ -1323,7 +1419,70 @@ def create_selectable_jbeam_beam(beam, collection, color, index):
     return obj
 
 
-def create_selectable_jbeam_debug_objects(nodes, beams, collection, color, show_node_labels=False):
+def create_jbeam_triangles_object(triangles, collection, part_name="", resolved_part_id=-1, color=None):
+    if not triangles:
+        return None
+    color = color or color_for_resolved_part(resolved_part_id)
+
+    vertices = []
+    faces = []
+    for triangle in triangles:
+        base = len(vertices)
+        vertices.extend((tuple(triangle.p1), tuple(triangle.p2), tuple(triangle.p3)))
+        faces.append((base, base + 1, base + 2))
+
+    mesh = bpy.data.meshes.new(f"BeamNG_JBeam_Triangles_{safe_collection_name(part_name)}_Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+
+    obj = bpy.data.objects.new("JBeam Triangles", mesh)
+    obj["beamng_layer"] = "jbeam"
+    obj["beamng_visual_type"] = "triangles"
+    obj["beamng_triangle_count"] = len(triangles)
+    obj["beamng_part_name"] = part_name
+    obj["beamng_resolved_part_id"] = resolved_part_id
+    obj["beamng_parent_resolved_part_id"] = collection.get("beamng_parent_resolved_part_id", -1)
+    obj.show_in_front = True
+    obj.hide_select = True
+    obj.color = (color[0], color[1], color[2], 0.24)
+    mesh.materials.append(get_or_create_translucent_material(f"BeamNG JBeam Part {resolved_part_id:03d} Triangles", color, 0.24))
+    collection.objects.link(obj)
+    return obj
+
+
+def create_selectable_jbeam_triangle(triangle, collection, color, index):
+    mesh = bpy.data.meshes.new(
+        f"JBeam_Selectable_Triangle_{safe_collection_name(triangle.id1)}_{safe_collection_name(triangle.id2)}_{safe_collection_name(triangle.id3)}"
+    )
+    mesh.from_pydata((tuple(triangle.p1), tuple(triangle.p2), tuple(triangle.p3)), [], ((0, 1, 2),))
+    mesh.update()
+
+    obj = bpy.data.objects.new(f"Triangle {triangle.id1}-{triangle.id2}-{triangle.id3}", mesh)
+    obj.show_in_front = True
+    obj.hide_select = False
+    obj.color = (color[0], color[1], color[2], 0.38)
+    obj["beamng_layer"] = "jbeam"
+    obj["beamng_visual_type"] = "selectable_triangle"
+    obj["beamng_triangle_name"] = f"{triangle.id1}-{triangle.id2}-{triangle.id3}"
+    obj["beamng_triangle_id1"] = triangle.id1
+    obj["beamng_triangle_id2"] = triangle.id2
+    obj["beamng_triangle_id3"] = triangle.id3
+    obj["beamng_triangle_index"] = index
+    obj["beamng_part_name"] = triangle.part_name
+    obj["beamng_resolved_part_id"] = triangle.resolved_part_id
+    obj["beamng_parent_resolved_part_id"] = collection.get("beamng_parent_resolved_part_id", -1)
+    mesh.materials.append(
+        get_or_create_translucent_material(
+            f"BeamNG JBeam Part {triangle.resolved_part_id:03d} Selectable Triangles",
+            color,
+            0.38,
+        )
+    )
+    collection.objects.link(obj)
+    return obj
+
+
+def create_selectable_jbeam_debug_objects(nodes, beams, triangles, collection, color, show_node_labels=False):
     debug_collection = link_collection(collection, "Selectable IDs")
     debug_collection["beamng_layer"] = "jbeam"
     debug_collection["beamng_visual_type"] = "selectable_debug"
@@ -1337,18 +1496,21 @@ def create_selectable_jbeam_debug_objects(nodes, beams, collection, color, show_
             create_jbeam_node_label(node, debug_collection, color)
     for index, beam in enumerate(beams, 1):
         create_selectable_jbeam_beam(beam, debug_collection, color, index)
+    for index, triangle in enumerate(triangles, 1):
+        create_selectable_jbeam_triangle(triangle, debug_collection, color, index)
     return debug_collection
 
 
 def create_jbeam_visuals(
     nodes,
     beams,
+    triangles,
     parent_collection,
     resolved_parts=None,
     selectable_debug=False,
     show_node_labels=False,
 ):
-    visual_collection = link_collection(parent_collection, "JBeam Nodes and Beams")
+    visual_collection = link_collection(parent_collection, "JBeam Nodes Beams and Triangles")
     visual_collection["beamng_layer"] = "jbeam"
 
     part_labels = {}
@@ -1363,6 +1525,7 @@ def create_jbeam_visuals(
 
     nodes_by_part = defaultdict(list)
     beams_by_part = defaultdict(list)
+    triangles_by_part = defaultdict(list)
     part_names = {}
     for node in nodes:
         nodes_by_part[node.resolved_part_id].append(node)
@@ -1370,8 +1533,11 @@ def create_jbeam_visuals(
     for beam in beams:
         beams_by_part[beam.resolved_part_id].append(beam)
         part_names[beam.resolved_part_id] = beam.part_name
+    for triangle in triangles:
+        triangles_by_part[triangle.resolved_part_id].append(triangle)
+        part_names[triangle.resolved_part_id] = triangle.part_name
 
-    for resolved_part_id in sorted(set(nodes_by_part) | set(beams_by_part)):
+    for resolved_part_id in sorted(set(nodes_by_part) | set(beams_by_part) | set(triangles_by_part)):
         part_name = part_names.get(resolved_part_id, "")
         label = part_labels.get(resolved_part_id, f"{resolved_part_id:03d}_{part_name}")
         part_collection = link_collection(visual_collection, safe_collection_name(label))
@@ -1382,10 +1548,12 @@ def create_jbeam_visuals(
         color = color_for_resolved_part(resolved_part_id)
         part_nodes = nodes_by_part.get(resolved_part_id, [])
         part_beams = beams_by_part.get(resolved_part_id, [])
+        part_triangles = triangles_by_part.get(resolved_part_id, [])
         create_jbeam_nodes_object(part_nodes, part_collection, part_name, resolved_part_id, color)
         create_jbeam_beams_object(part_beams, part_collection, part_name, resolved_part_id, color)
+        create_jbeam_triangles_object(part_triangles, part_collection, part_name, resolved_part_id, color)
         if selectable_debug:
-            create_selectable_jbeam_debug_objects(part_nodes, part_beams, part_collection, color, show_node_labels)
+            create_selectable_jbeam_debug_objects(part_nodes, part_beams, part_triangles, part_collection, color, show_node_labels)
 
     visual_collection.hide_viewport = True
     return visual_collection
@@ -1615,6 +1783,8 @@ def set_import_layer_visibility(root_collection, show_meshes=True, show_props=Tr
         elif layer == "jbeam":
             obj.hide_set(not show_jbeam)
             obj.hide_render = not show_jbeam
+            if obj.get("beamng_visual_type") == "selectable_triangle":
+                obj.hide_select = not show_jbeam
 
     for child in root_collection.children:
         if child.get("beamng_layer") == "jbeam":
@@ -1706,12 +1876,26 @@ def related_jbeam_part_ids(root_collection, part_id, relation):
     return set()
 
 
-def jbeam_objects_for_part_ids(root_collection, part_ids):
+def jbeam_objects_for_part_ids(root_collection, part_ids, visual_types=None):
+    if visual_types is not None:
+        visual_types = set(visual_types)
     objects = []
     for obj in walk_collection_objects(root_collection):
         if obj.get("beamng_layer") != "jbeam":
             continue
-        if obj.get("beamng_visual_type") not in {"nodes", "beams", "selectable_node", "selectable_beam", "node_label"}:
+        allowed_visual_types = {
+            "nodes",
+            "beams",
+            "triangles",
+            "selectable_node",
+            "selectable_beam",
+            "selectable_triangle",
+            "node_label",
+        }
+        visual_type = obj.get("beamng_visual_type")
+        if visual_type not in allowed_visual_types:
+            continue
+        if visual_types is not None and visual_type not in visual_types:
             continue
         try:
             part_id = int(obj.get("beamng_resolved_part_id", -999999))
@@ -1746,6 +1930,21 @@ def set_all_jbeam_visibility(root_collection, visible):
             continue
         obj.hide_set(not visible)
         obj.hide_render = obj.get("beamng_visual_type") == "node_label" or not visible
+        if obj.get("beamng_visual_type") == "selectable_triangle":
+            obj.hide_select = not visible
+
+
+def set_jbeam_visual_type_visibility(root_collection, visual_types, visible):
+    visual_types = set(visual_types)
+    for obj in walk_collection_objects(root_collection):
+        if obj.get("beamng_layer") != "jbeam":
+            continue
+        if obj.get("beamng_visual_type") not in visual_types:
+            continue
+        obj.hide_set(not visible)
+        obj.hide_render = not visible
+        if obj.get("beamng_visual_type") == "selectable_triangle":
+            obj.hide_select = not visible
 
 
 class BEAMNG_OT_jbeam_relationship(Operator):
@@ -1796,6 +1995,43 @@ class BEAMNG_OT_jbeam_relationship(Operator):
         return {"CANCELLED"}
 
 
+class BEAMNG_OT_select_jbeam_body_structure(Operator):
+    bl_idname = "beamng_pc_importer.select_jbeam_body_structure"
+    bl_label = "Select Same Body Nodes/Beams"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return selected_jbeam_part_id(context) is not None
+
+    def execute(self, context):
+        part_id = selected_jbeam_part_id(context)
+        root = find_jbeam_root_for_object(context, context.active_object)
+        if root is None or part_id is None:
+            self.report({"WARNING"}, "No BeamNG JBeam selection found")
+            return {"CANCELLED"}
+
+        set_jbeam_collections_visibility(root, {part_id}, True)
+        objects = jbeam_objects_for_part_ids(
+            root,
+            {part_id},
+            {"selectable_node", "selectable_beam"},
+        )
+        if not objects:
+            self.report({"WARNING"}, "No selectable nodes or beams found for this body")
+            return {"CANCELLED"}
+
+        for obj in context.scene.objects:
+            obj.select_set(False)
+        for obj in objects:
+            obj.hide_set(False)
+            obj.hide_select = False
+            obj.select_set(True)
+        context.view_layer.objects.active = objects[0]
+        self.report({"INFO"}, f"Selected {len(objects)} node/beam objects from this body")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_show_all_jbeams(Operator):
     bl_idname = "beamng_pc_importer.show_all_jbeams"
     bl_label = "Show All JBeams"
@@ -1813,6 +2049,39 @@ class BEAMNG_OT_show_all_jbeams(Operator):
             shown_roots += 1
 
         self.report({"INFO"}, f"Showed all JBeams in {shown_roots} import collection(s)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_set_jbeam_visual_visibility(Operator):
+    bl_idname = "beamng_pc_importer.set_jbeam_visual_visibility"
+    bl_label = "Set JBeam Visual Visibility"
+    bl_options = {"REGISTER", "UNDO"}
+
+    visual_group: StringProperty(default="triangles")
+    action: StringProperty(default="show")
+
+    def execute(self, context):
+        roots = find_beamng_import_collections(context.scene)
+        if not roots:
+            self.report({"WARNING"}, "No BeamNG import collections found")
+            return {"CANCELLED"}
+
+        visual_groups = {
+            "nodes": {"nodes", "selectable_node", "node_label"},
+            "beams": {"beams", "selectable_beam"},
+            "triangles": {"triangles", "selectable_triangle"},
+        }
+        visual_types = visual_groups.get(self.visual_group)
+        if not visual_types:
+            self.report({"WARNING"}, f"Unknown JBeam visual group: {self.visual_group}")
+            return {"CANCELLED"}
+
+        visible = self.action == "show"
+        for root in roots:
+            set_jbeam_visual_type_visibility(root, visual_types, visible)
+
+        label = self.visual_group.capitalize()
+        self.report({"INFO"}, f"{'Showed' if visible else 'Hid'} JBeam {label}")
         return {"FINISHED"}
 
 
@@ -1982,6 +2251,13 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         op = layout.operator(BEAMNG_OT_set_visibility.bl_idname, text="Show All")
         op.mode = "ALL"
         layout.operator(BEAMNG_OT_show_all_jbeams.bl_idname, text="Show All JBeams")
+        row = layout.row(align=True)
+        op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Triangles")
+        op.visual_group = "triangles"
+        op.action = "show"
+        op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Triangles")
+        op.visual_group = "triangles"
+        op.action = "hide"
 
         layout.separator()
         active = context.active_object
@@ -1995,10 +2271,16 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
                 box.label(text=f"Beam: {active.get('beamng_beam_name', '')}")
                 box.label(text=f"From: {active.get('beamng_beam_id1', '')}")
                 box.label(text=f"To: {active.get('beamng_beam_id2', '')}")
+            elif visual_type == "selectable_triangle":
+                box.label(text=f"Triangle: {active.get('beamng_triangle_name', '')}")
+                box.label(text=f"Node 1: {active.get('beamng_triangle_id1', '')}")
+                box.label(text=f"Node 2: {active.get('beamng_triangle_id2', '')}")
+                box.label(text=f"Node 3: {active.get('beamng_triangle_id3', '')}")
             else:
                 box.label(text=f"Type: {visual_type}")
             box.label(text=f"Part: {active.get('beamng_part_name', '')}")
             box.label(text=f"Resolved ID: {active.get('beamng_resolved_part_id', '')}")
+            box.operator(BEAMNG_OT_select_jbeam_body_structure.bl_idname, text="Select Same Body Nodes/Beams")
 
         layout.separator()
         layout.operator(BEAMNG_OT_toggle_relationship_lines.bl_idname, text="Toggle Parent Lines")
@@ -2018,8 +2300,8 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
         default=True,
     )
     include_jbeam_visuals: BoolProperty(
-        name="Create JBeam Nodes/Beams",
-        description="Create a hidden visualization layer for resolved JBeam nodes and beams",
+        name="Create JBeam Visuals",
+        description="Create a hidden visualization layer for resolved JBeam nodes, beams, and collision triangles",
         default=True,
     )
     selectable_jbeam_debug: BoolProperty(
@@ -2058,7 +2340,7 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
                 return {"CANCELLED"}
 
             update_import_progress(context, 20, "resolving selected part tree")
-            resolved_parts, flexbodies, visual_nodes, visual_beams = resolve_selected_parts(
+            resolved_parts, flexbodies, visual_nodes, visual_beams, visual_triangles = resolve_selected_parts(
                 pc_data,
                 part_index,
                 True,
@@ -2088,6 +2370,7 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
                 create_jbeam_visuals(
                     visual_nodes,
                     visual_beams,
+                    visual_triangles,
                     root_collection,
                     resolved_parts,
                     self.selectable_jbeam_debug,
@@ -2168,7 +2451,15 @@ def menu_func_jbeam_context(self, context):
     layout.separator()
     box = layout.box()
     box.label(text="BeamNG JBeam Relations")
+    box.operator(BEAMNG_OT_select_jbeam_body_structure.bl_idname, text="Select Same Body Nodes/Beams")
     box.operator(BEAMNG_OT_show_all_jbeams.bl_idname, text="Show All JBeams")
+    row = box.row(align=True)
+    op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Triangles")
+    op.visual_group = "triangles"
+    op.action = "show"
+    op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Triangles")
+    op.visual_group = "triangles"
+    op.action = "hide"
     for relation, label in (
         ("siblings", "Siblings"),
         ("children", "Children"),
@@ -2189,7 +2480,9 @@ def menu_func_jbeam_context(self, context):
 classes = (
     BEAMNG_OT_set_visibility,
     BEAMNG_OT_jbeam_relationship,
+    BEAMNG_OT_select_jbeam_body_structure,
     BEAMNG_OT_show_all_jbeams,
+    BEAMNG_OT_set_jbeam_visual_visibility,
     BEAMNG_OT_print_prop_transforms,
     BEAMNG_OT_toggle_relationship_lines,
     VIEW3D_PT_beamng_pc_importer,
