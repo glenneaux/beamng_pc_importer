@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local scratch backups kept beside the Blender add-on during development.
+__init__ copy.py
+__init___backup*.py
