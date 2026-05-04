@@ -1,7 +1,7 @@
 bl_info = {
     "name": "BeamNG .pc Importer",
     "author": "OpenAI",
-    "version": (0, 1, 0),
+    "version": (1, 0, 0),
     "blender": (3, 6, 0),
     "location": "File > Import > BeamNG Config (.pc)",
     "description": "Import a BeamNG .pc vehicle config with only the selected meshes visible",
