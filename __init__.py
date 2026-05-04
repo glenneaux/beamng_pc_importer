@@ -21,7 +21,7 @@ from xml.etree import ElementTree as ET
 
 import bpy
 from bpy.props import BoolProperty, StringProperty
-from bpy.types import Operator, Panel
+from bpy.types import AddonPreferences, Operator, Panel
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Euler, Matrix, Vector
 
@@ -148,6 +148,109 @@ class DaeAssetSource:
     path: str
     zip_path: str = ""
     zip_entry: str = ""
+    virtual_path: str = ""
+    precedence: int = 0
+
+
+@dataclass(frozen=True)
+class BeamNGAssetSource:
+    asset_type: str
+    virtual_path: str
+    path: str = ""
+    zip_path: str = ""
+    zip_entry: str = ""
+    precedence: int = 0
+
+
+@dataclass
+class BeamNGAssetLayer:
+    name: str
+    root: Path
+    virtual_prefix: Path = field(default_factory=lambda: Path(""))
+    precedence: int = 0
+
+
+DAE_CATALOG_CACHE = {}
+DAE_NAME_INDEX_CACHE = {}
+PART_INDEX_CACHE = {}
+DISK_CACHE_DATA = {}
+DISK_CACHE_DIRTY = set()
+
+
+def persistent_cache_dir():
+    cache_dir = Path(bpy.utils.user_resource("CONFIG", path="beamng_pc_importer_cache", create=True))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def persistent_cache_key(source):
+    return json.dumps(source_signature(source), separators=(",", ":"))
+
+
+def load_disk_cache(name):
+    if name in DISK_CACHE_DATA:
+        return DISK_CACHE_DATA[name]
+    cache_path = persistent_cache_dir() / f"{name}.json"
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    DISK_CACHE_DATA[name] = data
+    return data
+
+
+def mark_disk_cache_dirty(name):
+    DISK_CACHE_DIRTY.add(name)
+
+
+def save_disk_cache(name):
+    if name not in DISK_CACHE_DIRTY:
+        return
+    cache_path = persistent_cache_dir() / f"{name}.json"
+    try:
+        cache_path.write_text(json.dumps(DISK_CACHE_DATA.get(name, {}), separators=(",", ":")), encoding="utf-8")
+        DISK_CACHE_DIRTY.discard(name)
+    except Exception as exc:
+        print(f"[BeamNG Importer] Failed to write cache {cache_path}: {exc}")
+
+
+def save_dirty_disk_caches():
+    for name in tuple(DISK_CACHE_DIRTY):
+        save_disk_cache(name)
+
+
+def zip_contents_for_path(zip_path: Path, cache_enabled=True):
+    cache_name = "zip_contents"
+    key = json.dumps(("zip", *path_signature(zip_path)), separators=(",", ":"))
+    if cache_enabled:
+        disk_cache = load_disk_cache(cache_name)
+        cached = disk_cache.get(key)
+        if isinstance(cached, list):
+            return cached
+
+    entries = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            for entry in archive.infolist():
+                if entry.is_dir():
+                    continue
+                entries.append(
+                    {
+                        "filename": entry.filename,
+                        "length": int(entry.file_size),
+                    }
+                )
+    except Exception as exc:
+        print(f"[BeamNG Importer] Failed to inspect archive {zip_path}: {exc}")
+        return []
+
+    if cache_enabled:
+        disk_cache = load_disk_cache(cache_name)
+        disk_cache[key] = entries
+        mark_disk_cache_dirty(cache_name)
+    return entries
 
 
 def strip_json_comments(text: str) -> str:
@@ -338,6 +441,19 @@ def load_jsonc(path: Path):
     text = path.read_text(encoding="utf-8")
     cleaned = strip_trailing_commas(insert_missing_commas(strip_json_comments(text)))
     return json.loads(cleaned)
+
+
+def load_jsonc_text(text: str):
+    cleaned = strip_trailing_commas(insert_missing_commas(strip_json_comments(text)))
+    return json.loads(cleaned)
+
+
+def load_jsonc_asset(source: BeamNGAssetSource):
+    if source.asset_type == "file":
+        return load_jsonc(Path(source.path))
+    with zipfile.ZipFile(source.zip_path, "r") as archive:
+        text = archive.read(source.zip_entry).decode("utf-8", errors="ignore")
+    return load_jsonc_text(text)
 
 
 def normalized_name(name: str) -> str:
@@ -558,7 +674,223 @@ def extract_component_context(part_data):
     return {}
 
 
-def parse_parts_index(vehicle_root: Path):
+def normalize_virtual_path(value):
+    return str(value).replace("\\", "/").strip("/")
+
+
+def path_signature(path: Path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), 0, 0)
+    return (str(path), int(stat.st_mtime), int(stat.st_size))
+
+
+def source_signature(source):
+    if source.asset_type == "file":
+        return (
+            source.asset_type,
+            normalize_virtual_path(source.virtual_path),
+            *path_signature(Path(source.path)),
+            source.precedence,
+        )
+    return (
+        source.asset_type,
+        normalize_virtual_path(source.virtual_path),
+        source.zip_entry,
+        *path_signature(Path(source.zip_path)),
+        source.precedence,
+    )
+
+
+def resolve_user_current_folder(user_folder: str, pc_path: Path):
+    candidates = []
+    if user_folder:
+        supplied = Path(user_folder)
+        candidates.append(supplied if supplied.name.lower() == "current" else supplied / "current")
+
+    for parent in (pc_path.parent, *pc_path.parents):
+        if parent.name.lower() == "current":
+            candidates.append(parent)
+            break
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def resolve_vanilla_vehicles_folder(vanilla_folder: str):
+    if not vanilla_folder:
+        return None
+    root = Path(vanilla_folder)
+    if (root / "content" / "vehicles").exists():
+        root = root / "content" / "vehicles"
+    if root.exists() and root.is_dir():
+        return root
+    return None
+
+
+def vehicle_folder_from_vehicles_root(vehicles_root: Path, vehicle_name: str):
+    if not vehicles_root:
+        return None
+    if vehicles_root.name.lower() == vehicle_name.lower():
+        return vehicles_root
+    candidate = vehicles_root / vehicle_name
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return None
+
+
+def add_file_asset_sources(sources, root: Path, pattern: str, virtual_prefix: str, precedence: int, asset_type: str):
+    if not root or not root.exists() or not root.is_dir():
+        return
+    prefix = Path(virtual_prefix)
+    for path in root.rglob(pattern):
+        if not path.is_file():
+            continue
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            relative = Path(path.name)
+        virtual_path = normalize_virtual_path(prefix / relative)
+        sources.append(
+            BeamNGAssetSource(
+                asset_type="file",
+                virtual_path=virtual_path,
+                path=str(path),
+                precedence=precedence,
+            )
+        )
+
+
+def add_zip_asset_sources(sources, zip_path: Path, vehicle_name: str, suffix: str, precedence: int, cache_enabled=True):
+    if not zip_path or not zip_path.exists() or not zip_path.is_file():
+        return
+    wanted_prefixes = (
+        f"vehicles/{vehicle_name.lower()}/",
+        "vehicles/common/",
+        f"content/vehicles/{vehicle_name.lower()}/",
+        "content/vehicles/common/",
+    )
+
+    for entry in zip_contents_for_path(zip_path, cache_enabled):
+        entry_filename = str(entry.get("filename", ""))
+        if not entry_filename.lower().endswith(suffix):
+            continue
+        entry_name = normalize_virtual_path(entry_filename)
+        entry_lower = entry_name.lower()
+        if not entry_lower.startswith(wanted_prefixes):
+            continue
+        if entry_lower.startswith("content/"):
+            virtual_path = entry_name[len("content/") :]
+        else:
+            virtual_path = entry_name
+        sources.append(
+            BeamNGAssetSource(
+                asset_type="zip",
+                virtual_path=normalize_virtual_path(virtual_path),
+                path=normalize_virtual_path(virtual_path),
+                zip_path=str(zip_path),
+                zip_entry=entry_filename,
+                precedence=precedence,
+            )
+        )
+
+
+def collect_beamng_asset_sources(pc_path: Path, user_folder: str = "", vanilla_folder: str = "", cache_enabled=True):
+    vehicle_name = pc_path.parent.name
+    selected_vehicle_root = pc_path.parent
+    current_folder = resolve_user_current_folder(user_folder, pc_path)
+    vanilla_vehicles = resolve_vanilla_vehicles_folder(vanilla_folder)
+    vanilla_vehicle_root = vehicle_folder_from_vehicles_root(vanilla_vehicles, vehicle_name) if vanilla_vehicles else None
+
+    jbeam_sources = []
+    dae_sources = []
+
+    def add_vehicle_root(root, precedence):
+        if not root:
+            return
+        add_file_asset_sources(jbeam_sources, root, "*.jbeam", f"vehicles/{vehicle_name}", precedence, "jbeam")
+        add_file_asset_sources(dae_sources, root, "*.dae", f"vehicles/{vehicle_name}", precedence, "dae")
+
+    def add_common_root(root, precedence):
+        if root and root.exists() and root.is_dir():
+            add_file_asset_sources(dae_sources, root, "*.dae", "vehicles/common", precedence, "dae")
+
+    add_vehicle_root(vanilla_vehicle_root, 0)
+    if vanilla_vehicles:
+        add_common_root(vanilla_vehicles / "common", 0)
+        for zip_path in sorted(vanilla_vehicles.glob("*.zip")):
+            add_zip_asset_sources(jbeam_sources, zip_path, vehicle_name, ".jbeam", 0, cache_enabled)
+            add_zip_asset_sources(dae_sources, zip_path, vehicle_name, ".dae", 0, cache_enabled)
+
+    if current_folder:
+        mods_folder = current_folder / "mods"
+        unpacked_folder = mods_folder / "unpacked"
+        if unpacked_folder.exists():
+            for mod_index, mod_root in enumerate(sorted(path for path in unpacked_folder.iterdir() if path.is_dir())):
+                precedence = 30 + mod_index
+                add_vehicle_root(mod_root / "vehicles" / vehicle_name, precedence)
+                add_common_root(mod_root / "vehicles" / "common", precedence)
+                add_vehicle_root(mod_root / "content" / "vehicles" / vehicle_name, precedence)
+                add_common_root(mod_root / "content" / "vehicles" / "common", precedence)
+        if mods_folder.exists():
+            for zip_index, zip_path in enumerate(sorted(mods_folder.glob("*.zip"))):
+                precedence = 20 + zip_index
+                add_zip_asset_sources(jbeam_sources, zip_path, vehicle_name, ".jbeam", precedence, cache_enabled)
+                add_zip_asset_sources(dae_sources, zip_path, vehicle_name, ".dae", precedence, cache_enabled)
+
+        add_vehicle_root(current_folder / "vehicles" / vehicle_name, 30)
+
+    add_vehicle_root(selected_vehicle_root, 40)
+    return jbeam_sources, dae_sources, Path(f"vehicles/{vehicle_name}")
+
+
+def parse_parts_for_source(source: BeamNGAssetSource, cache_enabled=True):
+    cache_name = "jbeam_parts"
+    key = persistent_cache_key(source)
+    if cache_enabled:
+        disk_cache = load_disk_cache(cache_name)
+        cached = disk_cache.get(key)
+        if isinstance(cached, dict):
+            return cached
+
+    try:
+        payload = load_jsonc_asset(source)
+    except Exception as exc:
+        print(f"[BeamNG Importer] Failed to parse {source.virtual_path}: {exc}")
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    parts = {part_name: part_data for part_name, part_data in payload.items() if isinstance(part_data, dict)}
+    if cache_enabled:
+        disk_cache = load_disk_cache(cache_name)
+        disk_cache[key] = parts
+        mark_disk_cache_dirty(cache_name)
+    return parts
+
+
+def parse_parts_index(vehicle_root: Path, asset_sources=None, cache_enabled=True):
+    if asset_sources is not None:
+        cache_key = tuple(source_signature(source) for source in asset_sources)
+        if cache_enabled and cache_key in PART_INDEX_CACHE:
+            return PART_INDEX_CACHE[cache_key]
+
+        part_index = {}
+        for source in sorted(asset_sources, key=lambda item: item.precedence):
+            for part_name, part_data in parse_parts_for_source(source, cache_enabled).items():
+                part_index[part_name] = PartDefinition(
+                    name=part_name,
+                    data=part_data,
+                    source_path=Path(normalize_virtual_path(source.virtual_path)),
+                )
+        if cache_enabled:
+            PART_INDEX_CACHE[cache_key] = part_index
+            save_dirty_disk_caches()
+        return part_index
+
     part_index = {}
     for jbeam_path in vehicle_root.rglob("*.jbeam"):
         try:
@@ -1327,7 +1659,97 @@ def find_common_asset_roots(vehicle_root: Path):
     return common_dirs, common_zip_paths
 
 
-def build_dae_catalog(vehicle_root: Path):
+def dae_names_for_source(source, cache_enabled=True):
+    cache_key = source_signature(source)
+    if cache_enabled:
+        cached = DAE_NAME_INDEX_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    disk_key = persistent_cache_key(source)
+    if cache_enabled:
+        disk_cache = load_disk_cache("dae_name_indexes")
+        cached_names = disk_cache.get(disk_key)
+        if isinstance(cached_names, list):
+            names = set(cached_names)
+            DAE_NAME_INDEX_CACHE[cache_key] = names
+            return names
+
+    if source.asset_type == "file":
+        names = build_dae_name_index(Path(source.path))
+    else:
+        names = set()
+        try:
+            with zipfile.ZipFile(source.zip_path, "r") as archive:
+                xml_text = archive.read(source.zip_entry).decode("utf-8", errors="ignore")
+            names = build_dae_name_index_from_text(xml_text)
+        except Exception as exc:
+            print(f"[BeamNG Importer] Failed to index {source.virtual_path}: {exc}")
+
+    if cache_enabled:
+        DAE_NAME_INDEX_CACHE[cache_key] = names
+        disk_cache = load_disk_cache("dae_name_indexes")
+        disk_cache[disk_key] = sorted(names)
+        mark_disk_cache_dirty("dae_name_indexes")
+    return names
+
+
+def build_dae_catalog(vehicle_root: Path, asset_sources=None, cache_enabled=True, required_mesh_names=None):
+    if asset_sources is not None:
+        required_names = {normalized_name(name) for name in (required_mesh_names or []) if name}
+        cache_key = (
+            tuple(source_signature(source) for source in asset_sources),
+            tuple(sorted(required_names)),
+        )
+        cached = DAE_CATALOG_CACHE.get(cache_key)
+        if cache_enabled and cached is not None:
+            return cached
+
+        dae_name_cache = {}
+        dae_paths_by_dir = defaultdict(list)
+        mesh_to_dae_paths = defaultdict(list)
+
+        unresolved_names = set(required_names)
+        sources_by_precedence = defaultdict(list)
+        for source in asset_sources:
+            sources_by_precedence[source.precedence].append(source)
+
+        for precedence in sorted(sources_by_precedence.keys(), reverse=True):
+            layer_found = set()
+            for source in sorted(sources_by_precedence[precedence], key=lambda item: item.virtual_path):
+                virtual_path = normalize_virtual_path(source.virtual_path)
+                names = dae_names_for_source(source, cache_enabled)
+                relevant_names = names
+                if required_names:
+                    relevant_names = names.intersection(unresolved_names or required_names)
+                    if not relevant_names:
+                        continue
+
+                dae_source = DaeAssetSource(
+                    asset_type=source.asset_type,
+                    path=source.path or virtual_path,
+                    zip_path=source.zip_path,
+                    zip_entry=source.zip_entry,
+                    virtual_path=virtual_path,
+                    precedence=source.precedence,
+                )
+                dae_paths_by_dir[Path(virtual_path).parent].append(dae_source)
+                dae_name_cache[dae_source] = names
+                for name in relevant_names:
+                    mesh_to_dae_paths[name].append(dae_source)
+                layer_found.update(relevant_names)
+
+            if required_names:
+                unresolved_names.difference_update(layer_found)
+                if not unresolved_names:
+                    break
+
+        result = (dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths)
+        if cache_enabled:
+            DAE_CATALOG_CACHE[cache_key] = result
+            save_dirty_disk_caches()
+        return result
+
     dae_paths = list(vehicle_root.rglob("*.dae"))
     dae_name_cache = {}
     dae_paths_by_dir = defaultdict(list)
@@ -1393,11 +1815,11 @@ def choose_dae_for_mesh(mesh_name: str, jbeam_path: Path, vehicle_root: Path, da
         current = current.parent
 
     for directory in search_dirs:
-        for asset in dae_paths_by_dir.get(directory, []):
+        for asset in reversed(dae_paths_by_dir.get(directory, [])):
             if asset in candidate_paths:
                 return asset
 
-    return candidate_paths[0]
+    return max(candidate_paths, key=lambda item: item.precedence)
 
 
 def link_collection(parent, name):
@@ -2029,9 +2451,11 @@ def materialize_dae_asset(asset: DaeAssetSource, extracted_zip_assets: dict):
     if cached is not None:
         return cached
 
-    temp_dir = Path(tempfile.gettempdir()) / "beamng_pc_importer_common"
+    zip_label = safe_collection_name(Path(asset.zip_path).stem or "zip")
+    entry_label = safe_collection_name(asset.zip_entry)
+    temp_dir = Path(tempfile.gettempdir()) / "beamng_pc_importer_common" / zip_label
     temp_dir.mkdir(parents=True, exist_ok=True)
-    out_path = temp_dir / Path(asset.zip_entry).name
+    out_path = temp_dir / entry_label
 
     with zipfile.ZipFile(asset.zip_path, "r") as archive:
         with archive.open(asset.zip_entry, "r") as src, out_path.open("wb") as dst:
@@ -2803,6 +3227,40 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         layout.operator(BEAMNG_OT_print_prop_transforms.bl_idname, text="Write Prop Debug File")
 
 
+class BeamNGPCImporterPreferences(AddonPreferences):
+    bl_idname = __name__
+
+    beamng_user_folder: StringProperty(
+        name="BeamNG User Folder",
+        description="BeamNG user folder containing the current/mods and current/vehicles folders",
+        subtype="DIR_PATH",
+        default="",
+    )
+    vanilla_vehicles_folder: StringProperty(
+        name="Vanilla Vehicles Folder",
+        description="BeamNG install folder, or the game content/vehicles folder",
+        subtype="DIR_PATH",
+        default="",
+    )
+    cache_asset_catalogs: BoolProperty(
+        name="Cache Asset Catalogs",
+        description="Reuse parsed JBeam/DAE catalog data across imports while the add-on remains loaded",
+        default=True,
+    )
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.label(text="BeamNG Asset Roots")
+        layout.prop(self, "beamng_user_folder")
+        layout.prop(self, "vanilla_vehicles_folder")
+        layout.prop(self, "cache_asset_catalogs")
+
+
+def get_addon_preferences(context):
+    addon = context.preferences.addons.get(__name__)
+    return addon.preferences if addon else None
+
+
 class IMPORT_OT_beamng_pc(Operator, ImportHelper):
     bl_idname = "import_scene.beamng_pc"
     bl_label = "Import BeamNG Config"
@@ -2849,8 +3307,21 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
             pc_data = load_jsonc(pc_path)
 
             vehicle_root = pc_path.parent
+            prefs = get_addon_preferences(context)
+            beamng_user_folder = prefs.beamng_user_folder if prefs else ""
+            vanilla_vehicles_folder = prefs.vanilla_vehicles_folder if prefs else ""
+            cache_asset_catalogs = prefs.cache_asset_catalogs if prefs else True
+            jbeam_sources, dae_sources, virtual_vehicle_root = collect_beamng_asset_sources(
+                pc_path,
+                beamng_user_folder,
+                vanilla_vehicles_folder,
+                cache_asset_catalogs,
+            )
             update_import_progress(context, 10, "scanning JBeam parts")
-            part_index = parse_parts_index(vehicle_root)
+            if jbeam_sources:
+                part_index = parse_parts_index(vehicle_root, jbeam_sources, cache_asset_catalogs)
+            else:
+                part_index = parse_parts_index(vehicle_root)
             if not part_index:
                 self.report({"ERROR"}, "No JBeam parts were found next to the selected .pc")
                 return {"CANCELLED"}
@@ -2907,7 +3378,18 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
             vehicle_model = str(pc_data.get("model", ""))
 
             update_import_progress(context, 35, "cataloging DAE assets")
-            dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths = build_dae_catalog(vehicle_root)
+            if dae_sources:
+                required_mesh_names = {spec.mesh for spec in flexbodies if spec.mesh}
+                dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths = build_dae_catalog(
+                    virtual_vehicle_root,
+                    dae_sources,
+                    cache_asset_catalogs,
+                    required_mesh_names,
+                )
+                dae_search_root = virtual_vehicle_root
+            else:
+                dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths = build_dae_catalog(vehicle_root)
+                dae_search_root = vehicle_root
             imported_dae_cache = {}
             extracted_zip_assets = {}
             warnings = []
@@ -2923,7 +3405,7 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
                 dae_asset = choose_dae_for_mesh(
                     spec.mesh,
                     spec.jbeam_path,
-                    vehicle_root,
+                    dae_search_root,
                     dae_paths_by_dir,
                     mesh_to_dae_paths,
                 )
@@ -2960,6 +3442,7 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
             self.report({"ERROR"}, f"Failed to import BeamNG config: {exc}")
             return {"CANCELLED"}
         finally:
+            save_dirty_disk_caches()
             wm.progress_end()
             if context.workspace:
                 context.workspace.status_text_set(None)
@@ -3021,6 +3504,7 @@ def menu_func_jbeam_context(self, context):
 
 
 classes = (
+    BeamNGPCImporterPreferences,
     BEAMNG_OT_set_visibility,
     BEAMNG_OT_jbeam_relationship,
     BEAMNG_OT_select_jbeam_body_structure,
