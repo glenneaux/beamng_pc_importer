@@ -107,6 +107,41 @@ class JBeamTriangleSpec:
     resolved_part_id: int = -1
 
 
+@dataclass
+class JBeamHydroSpec:
+    id1: str
+    id2: str
+    start: Vector
+    end: Vector
+    part_name: str
+    resolved_part_id: int = -1
+    input_source: str = ""
+    factor: str = ""
+
+
+@dataclass
+class JBeamRailSpec:
+    name: str
+    node_ids: tuple
+    points: tuple
+    part_name: str
+    resolved_part_id: int = -1
+    capped: str = ""
+    looped: str = ""
+
+
+@dataclass
+class JBeamSlidenodeSpec:
+    node_id: str
+    rail_name: str
+    position: Vector
+    rail_points: tuple
+    part_name: str
+    resolved_part_id: int = -1
+    attached: str = ""
+    fix_to_rail: str = ""
+
+
 @dataclass(frozen=True)
 class DaeAssetSource:
     asset_type: str
@@ -754,6 +789,166 @@ def parse_triangles(
     return triangles
 
 
+def parse_hydros(
+    part_def: PartDefinition,
+    local_node_positions=None,
+    global_node_positions=None,
+    component_context=None,
+    resolved_part_id=-1,
+):
+    hydros = []
+    rows = part_def.data.get("hydros", [])
+    if not isinstance(rows, list):
+        return hydros
+    local_node_positions = local_node_positions or {}
+    global_node_positions = global_node_positions or {}
+
+    def lookup_node(name):
+        key = str(name)
+        if key in local_node_positions:
+            return local_node_positions[key]
+        return global_node_positions.get(key)
+
+    current_options = {}
+    for row in rows:
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        if row and str(row[0]).lower().startswith("id"):
+            continue
+
+        inline_options = row[2] if len(row) > 2 and isinstance(row[2], dict) else {}
+        options = merge_options(current_options, inline_options)
+        if is_disabled(options, component_context):
+            continue
+
+        id1 = str(row[0])
+        id2 = str(row[1])
+        start = lookup_node(id1)
+        end = lookup_node(id2)
+        if start is None or end is None:
+            continue
+
+        hydros.append(
+            JBeamHydroSpec(
+                id1=id1,
+                id2=id2,
+                start=start,
+                end=end,
+                part_name=part_def.name,
+                resolved_part_id=resolved_part_id,
+                input_source=str(options.get("inputSource", "")),
+                factor=str(options.get("factor", options.get("inputFactor", ""))),
+            )
+        )
+    return hydros
+
+
+def parse_rails_and_slidenodes(
+    part_def: PartDefinition,
+    local_node_positions=None,
+    global_node_positions=None,
+    component_context=None,
+    resolved_part_id=-1,
+):
+    rails = []
+    slidenodes = []
+    rails_by_name = {}
+    local_node_positions = local_node_positions or {}
+    global_node_positions = global_node_positions or {}
+
+    def lookup_node(name):
+        key = str(name)
+        if key in local_node_positions:
+            return local_node_positions[key]
+        return global_node_positions.get(key)
+
+    def add_rail(name, links, data=None):
+        if not name or not isinstance(links, list) or len(links) < 2:
+            return
+        node_ids = tuple(str(value) for value in links)
+        points = tuple(lookup_node(value) for value in node_ids)
+        if any(point is None for point in points):
+            return
+        data = data or {}
+        rail = JBeamRailSpec(
+            name=str(name),
+            node_ids=node_ids,
+            points=points,
+            part_name=part_def.name,
+            resolved_part_id=resolved_part_id,
+            capped=str(data.get("capped", "")),
+            looped=str(data.get("looped", "")),
+        )
+        rails.append(rail)
+        rails_by_name[rail.name] = rail
+
+    raw_rails = part_def.data.get("rails", {})
+    if isinstance(raw_rails, dict):
+        for name, data in raw_rails.items():
+            if not isinstance(data, dict):
+                continue
+            add_rail(name, data.get("links:", data.get("links", [])), data)
+
+    raw_rails2 = part_def.data.get("rails2", [])
+    if isinstance(raw_rails2, list):
+        for row in raw_rails2:
+            if isinstance(row, dict):
+                continue
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            if row and str(row[0]).lower().startswith("id"):
+                continue
+            data = {}
+            if len(row) > 3:
+                data["looped"] = row[3]
+            if len(row) > 4:
+                data["capped"] = row[4]
+            add_rail(str(row[0]), row[1], data)
+
+    rows = part_def.data.get("slidenodes", [])
+    if not isinstance(rows, list):
+        return rails, slidenodes
+
+    current_options = {}
+    for row in rows:
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        if row and str(row[0]).lower().startswith("id"):
+            continue
+
+        inline_options = row[-1] if row and isinstance(row[-1], dict) else {}
+        options = merge_options(current_options, inline_options)
+        if is_disabled(options, component_context):
+            continue
+
+        node_id = str(row[0])
+        rail_name = str(row[1])
+        position = lookup_node(node_id)
+        rail = rails_by_name.get(rail_name)
+        if position is None or rail is None:
+            continue
+
+        slidenodes.append(
+            JBeamSlidenodeSpec(
+                node_id=node_id,
+                rail_name=rail_name,
+                position=position,
+                rail_points=rail.points,
+                part_name=part_def.name,
+                resolved_part_id=resolved_part_id,
+                attached=str(row[2]) if len(row) > 2 else "",
+                fix_to_rail=str(row[3]) if len(row) > 3 else "",
+            )
+        )
+    return rails, slidenodes
+
+
 def get_prop_anchor(row, local_node_positions, global_node_positions):
     if len(row) < 5:
         return None, None, {"missing": tuple()}
@@ -989,6 +1184,9 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
     visual_nodes = []
     visual_beams = []
     visual_triangles = []
+    visual_hydros = []
+    visual_rails = []
+    visual_slidenodes = []
     for index, resolved_part in enumerate(resolved_parts):
         component_context = resolved_component_contexts[index]
         for node_name, position in resolved_node_positions[index].items():
@@ -1018,6 +1216,24 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
                 resolved_part.id,
             )
         )
+        visual_hydros.extend(
+            parse_hydros(
+                resolved_part.part_def,
+                resolved_node_positions[index],
+                global_node_positions,
+                component_context,
+                resolved_part.id,
+            )
+        )
+        part_rails, part_slidenodes = parse_rails_and_slidenodes(
+            resolved_part.part_def,
+            resolved_node_positions[index],
+            global_node_positions,
+            component_context,
+            resolved_part.id,
+        )
+        visual_rails.extend(part_rails)
+        visual_slidenodes.extend(part_slidenodes)
         flexbodies.extend(
             parse_flexbodies(
                 resolved_part.part_def,
@@ -1038,7 +1254,16 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
                 )
             )
 
-    return resolved_parts, flexbodies, visual_nodes, visual_beams, visual_triangles
+    return (
+        resolved_parts,
+        flexbodies,
+        visual_nodes,
+        visual_beams,
+        visual_triangles,
+        visual_hydros,
+        visual_rails,
+        visual_slidenodes,
+    )
 
 
 def build_dae_name_index(dae_path: Path):
@@ -1262,6 +1487,14 @@ def color_for_resolved_part(resolved_part_id: int):
     return JBEAM_PART_COLORS[resolved_part_id % len(JBEAM_PART_COLORS)]
 
 
+def hydro_color_for_resolved_part(_resolved_part_id: int):
+    return (0.0, 0.92, 1.0, 1.0)
+
+
+def slider_color_for_resolved_part(_resolved_part_id: int):
+    return (1.0, 0.55, 0.05, 1.0)
+
+
 def safe_collection_name(value: str):
     return re.sub(r"[\\/:*?\"<>|]+", "_", value).strip() or "unnamed"
 
@@ -1482,7 +1715,166 @@ def create_selectable_jbeam_triangle(triangle, collection, color, index):
     return obj
 
 
-def create_selectable_jbeam_debug_objects(nodes, beams, triangles, collection, color, show_node_labels=False):
+def create_jbeam_hydros_object(hydros, collection, part_name="", resolved_part_id=-1, color=None):
+    if not hydros:
+        return None
+    color = color or hydro_color_for_resolved_part(resolved_part_id)
+
+    curve = bpy.data.curves.new(f"BeamNG_JBeam_Hydros_{safe_collection_name(part_name)}_Curve", "CURVE")
+    curve.dimensions = "3D"
+    curve.resolution_u = 1
+    curve.bevel_depth = 0.006
+    curve.bevel_resolution = 2
+
+    for hydro in hydros:
+        spline = curve.splines.new("POLY")
+        spline.points.add(1)
+        spline.points[0].co = (hydro.start.x, hydro.start.y, hydro.start.z, 1.0)
+        spline.points[1].co = (hydro.end.x, hydro.end.y, hydro.end.z, 1.0)
+
+    obj = bpy.data.objects.new("JBeam Hydros", curve)
+    obj["beamng_layer"] = "jbeam"
+    obj["beamng_visual_type"] = "hydros"
+    obj["beamng_hydro_count"] = len(hydros)
+    obj["beamng_part_name"] = part_name
+    obj["beamng_resolved_part_id"] = resolved_part_id
+    obj["beamng_parent_resolved_part_id"] = collection.get("beamng_parent_resolved_part_id", -1)
+    obj.show_in_front = True
+    obj.hide_select = True
+    obj.color = color
+    curve.materials.append(get_or_create_material(f"BeamNG JBeam Part {resolved_part_id:03d} Hydros", color))
+    collection.objects.link(obj)
+    return obj
+
+
+def create_selectable_jbeam_hydro(hydro, collection, color, index):
+    curve = bpy.data.curves.new(f"JBeam_Selectable_Hydro_{safe_collection_name(hydro.id1)}_{safe_collection_name(hydro.id2)}", "CURVE")
+    curve.dimensions = "3D"
+    curve.resolution_u = 1
+    curve.bevel_depth = 0.014
+    curve.bevel_resolution = 3
+
+    spline = curve.splines.new("POLY")
+    spline.points.add(1)
+    spline.points[0].co = (hydro.start.x, hydro.start.y, hydro.start.z, 1.0)
+    spline.points[1].co = (hydro.end.x, hydro.end.y, hydro.end.z, 1.0)
+
+    obj = bpy.data.objects.new(f"Hydro {hydro.id1}-{hydro.id2}", curve)
+    obj.show_in_front = True
+    obj.color = color
+    obj["beamng_layer"] = "jbeam"
+    obj["beamng_visual_type"] = "selectable_hydro"
+    obj["beamng_hydro_name"] = f"{hydro.id1}-{hydro.id2}"
+    obj["beamng_hydro_id1"] = hydro.id1
+    obj["beamng_hydro_id2"] = hydro.id2
+    obj["beamng_hydro_index"] = index
+    obj["beamng_hydro_input_source"] = hydro.input_source
+    obj["beamng_hydro_factor"] = hydro.factor
+    obj["beamng_part_name"] = hydro.part_name
+    obj["beamng_resolved_part_id"] = hydro.resolved_part_id
+    obj["beamng_parent_resolved_part_id"] = collection.get("beamng_parent_resolved_part_id", -1)
+    curve.materials.append(get_or_create_material(f"BeamNG JBeam Part {hydro.resolved_part_id:03d} Selectable Hydros", color))
+    collection.objects.link(obj)
+    return obj
+
+
+def create_jbeam_rails_object(rails, collection, part_name="", resolved_part_id=-1, color=None):
+    if not rails:
+        return None
+    color = color or slider_color_for_resolved_part(resolved_part_id)
+
+    curve = bpy.data.curves.new(f"BeamNG_JBeam_Rails_{safe_collection_name(part_name)}_Curve", "CURVE")
+    curve.dimensions = "3D"
+    curve.resolution_u = 1
+    curve.bevel_depth = 0.007
+    curve.bevel_resolution = 2
+
+    for rail in rails:
+        if len(rail.points) < 2:
+            continue
+        spline = curve.splines.new("POLY")
+        spline.points.add(len(rail.points) - 1)
+        for index, point in enumerate(rail.points):
+            spline.points[index].co = (point.x, point.y, point.z, 1.0)
+
+    obj = bpy.data.objects.new("JBeam Rails", curve)
+    obj["beamng_layer"] = "jbeam"
+    obj["beamng_visual_type"] = "rails"
+    obj["beamng_rail_count"] = len(rails)
+    obj["beamng_part_name"] = part_name
+    obj["beamng_resolved_part_id"] = resolved_part_id
+    obj["beamng_parent_resolved_part_id"] = collection.get("beamng_parent_resolved_part_id", -1)
+    obj.show_in_front = True
+    obj.hide_select = True
+    obj.color = color
+    curve.materials.append(get_or_create_material(f"BeamNG JBeam Part {resolved_part_id:03d} Rails", color))
+    collection.objects.link(obj)
+    return obj
+
+
+def create_selectable_jbeam_rail(rail, collection, color, index):
+    if len(rail.points) < 2:
+        return None
+    curve = bpy.data.curves.new(f"JBeam_Selectable_Rail_{safe_collection_name(rail.name)}", "CURVE")
+    curve.dimensions = "3D"
+    curve.resolution_u = 1
+    curve.bevel_depth = 0.015
+    curve.bevel_resolution = 3
+    spline = curve.splines.new("POLY")
+    spline.points.add(len(rail.points) - 1)
+    for point_index, point in enumerate(rail.points):
+        spline.points[point_index].co = (point.x, point.y, point.z, 1.0)
+
+    obj = bpy.data.objects.new(f"Rail {rail.name}", curve)
+    obj.show_in_front = True
+    obj.color = color
+    obj["beamng_layer"] = "jbeam"
+    obj["beamng_visual_type"] = "selectable_rail"
+    obj["beamng_rail_name"] = rail.name
+    obj["beamng_rail_nodes"] = ", ".join(rail.node_ids)
+    obj["beamng_rail_index"] = index
+    obj["beamng_rail_capped"] = rail.capped
+    obj["beamng_rail_looped"] = rail.looped
+    obj["beamng_part_name"] = rail.part_name
+    obj["beamng_resolved_part_id"] = rail.resolved_part_id
+    obj["beamng_parent_resolved_part_id"] = collection.get("beamng_parent_resolved_part_id", -1)
+    curve.materials.append(get_or_create_material(f"BeamNG JBeam Part {rail.resolved_part_id:03d} Selectable Rails", color))
+    collection.objects.link(obj)
+    return obj
+
+
+def create_selectable_jbeam_slidenode(slidenode, collection, color, index):
+    empty = bpy.data.objects.new(f"Slidenode {slidenode.node_id} on {slidenode.rail_name}", None)
+    empty.empty_display_type = "ARROWS"
+    empty.empty_display_size = 0.12
+    empty.location = slidenode.position
+    empty.show_in_front = True
+    empty.color = color
+    empty["beamng_layer"] = "jbeam"
+    empty["beamng_visual_type"] = "selectable_slidenode"
+    empty["beamng_slidenode_id"] = slidenode.node_id
+    empty["beamng_slidenode_rail"] = slidenode.rail_name
+    empty["beamng_slidenode_index"] = index
+    empty["beamng_slidenode_attached"] = slidenode.attached
+    empty["beamng_slidenode_fix_to_rail"] = slidenode.fix_to_rail
+    empty["beamng_part_name"] = slidenode.part_name
+    empty["beamng_resolved_part_id"] = slidenode.resolved_part_id
+    empty["beamng_parent_resolved_part_id"] = collection.get("beamng_parent_resolved_part_id", -1)
+    collection.objects.link(empty)
+    return empty
+
+
+def create_selectable_jbeam_debug_objects(
+    nodes,
+    beams,
+    triangles,
+    hydros,
+    rails,
+    slidenodes,
+    collection,
+    color,
+    show_node_labels=False,
+):
     debug_collection = link_collection(collection, "Selectable IDs")
     debug_collection["beamng_layer"] = "jbeam"
     debug_collection["beamng_visual_type"] = "selectable_debug"
@@ -1498,6 +1890,14 @@ def create_selectable_jbeam_debug_objects(nodes, beams, triangles, collection, c
         create_selectable_jbeam_beam(beam, debug_collection, color, index)
     for index, triangle in enumerate(triangles, 1):
         create_selectable_jbeam_triangle(triangle, debug_collection, color, index)
+    hydro_color = hydro_color_for_resolved_part(collection.get("beamng_resolved_part_id", -1))
+    slider_color = slider_color_for_resolved_part(collection.get("beamng_resolved_part_id", -1))
+    for index, hydro in enumerate(hydros, 1):
+        create_selectable_jbeam_hydro(hydro, debug_collection, hydro_color, index)
+    for index, rail in enumerate(rails, 1):
+        create_selectable_jbeam_rail(rail, debug_collection, slider_color, index)
+    for index, slidenode in enumerate(slidenodes, 1):
+        create_selectable_jbeam_slidenode(slidenode, debug_collection, slider_color, index)
     return debug_collection
 
 
@@ -1505,12 +1905,15 @@ def create_jbeam_visuals(
     nodes,
     beams,
     triangles,
+    hydros,
+    rails,
+    slidenodes,
     parent_collection,
     resolved_parts=None,
     selectable_debug=False,
     show_node_labels=False,
 ):
-    visual_collection = link_collection(parent_collection, "JBeam Nodes Beams and Triangles")
+    visual_collection = link_collection(parent_collection, "JBeam Structure")
     visual_collection["beamng_layer"] = "jbeam"
 
     part_labels = {}
@@ -1526,6 +1929,9 @@ def create_jbeam_visuals(
     nodes_by_part = defaultdict(list)
     beams_by_part = defaultdict(list)
     triangles_by_part = defaultdict(list)
+    hydros_by_part = defaultdict(list)
+    rails_by_part = defaultdict(list)
+    slidenodes_by_part = defaultdict(list)
     part_names = {}
     for node in nodes:
         nodes_by_part[node.resolved_part_id].append(node)
@@ -1536,8 +1942,24 @@ def create_jbeam_visuals(
     for triangle in triangles:
         triangles_by_part[triangle.resolved_part_id].append(triangle)
         part_names[triangle.resolved_part_id] = triangle.part_name
+    for hydro in hydros:
+        hydros_by_part[hydro.resolved_part_id].append(hydro)
+        part_names[hydro.resolved_part_id] = hydro.part_name
+    for rail in rails:
+        rails_by_part[rail.resolved_part_id].append(rail)
+        part_names[rail.resolved_part_id] = rail.part_name
+    for slidenode in slidenodes:
+        slidenodes_by_part[slidenode.resolved_part_id].append(slidenode)
+        part_names[slidenode.resolved_part_id] = slidenode.part_name
 
-    for resolved_part_id in sorted(set(nodes_by_part) | set(beams_by_part) | set(triangles_by_part)):
+    for resolved_part_id in sorted(
+        set(nodes_by_part)
+        | set(beams_by_part)
+        | set(triangles_by_part)
+        | set(hydros_by_part)
+        | set(rails_by_part)
+        | set(slidenodes_by_part)
+    ):
         part_name = part_names.get(resolved_part_id, "")
         label = part_labels.get(resolved_part_id, f"{resolved_part_id:03d}_{part_name}")
         part_collection = link_collection(visual_collection, safe_collection_name(label))
@@ -1549,11 +1971,26 @@ def create_jbeam_visuals(
         part_nodes = nodes_by_part.get(resolved_part_id, [])
         part_beams = beams_by_part.get(resolved_part_id, [])
         part_triangles = triangles_by_part.get(resolved_part_id, [])
+        part_hydros = hydros_by_part.get(resolved_part_id, [])
+        part_rails = rails_by_part.get(resolved_part_id, [])
+        part_slidenodes = slidenodes_by_part.get(resolved_part_id, [])
         create_jbeam_nodes_object(part_nodes, part_collection, part_name, resolved_part_id, color)
         create_jbeam_beams_object(part_beams, part_collection, part_name, resolved_part_id, color)
         create_jbeam_triangles_object(part_triangles, part_collection, part_name, resolved_part_id, color)
+        create_jbeam_hydros_object(part_hydros, part_collection, part_name, resolved_part_id)
+        create_jbeam_rails_object(part_rails, part_collection, part_name, resolved_part_id)
         if selectable_debug:
-            create_selectable_jbeam_debug_objects(part_nodes, part_beams, part_triangles, part_collection, color, show_node_labels)
+            create_selectable_jbeam_debug_objects(
+                part_nodes,
+                part_beams,
+                part_triangles,
+                part_hydros,
+                part_rails,
+                part_slidenodes,
+                part_collection,
+                color,
+                show_node_labels,
+            )
 
     visual_collection.hide_viewport = True
     return visual_collection
@@ -1887,9 +2324,14 @@ def jbeam_objects_for_part_ids(root_collection, part_ids, visual_types=None):
             "nodes",
             "beams",
             "triangles",
+            "hydros",
+            "rails",
             "selectable_node",
             "selectable_beam",
             "selectable_triangle",
+            "selectable_hydro",
+            "selectable_rail",
+            "selectable_slidenode",
             "node_label",
         }
         visual_type = obj.get("beamng_visual_type")
@@ -2052,6 +2494,47 @@ class BEAMNG_OT_show_all_jbeams(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_hide_selected_jbeam_items(Operator):
+    bl_idname = "beamng_pc_importer.hide_selected_jbeam_items"
+    bl_label = "Hide Selected JBeam Items"
+    bl_description = "Hide selected selectable JBeam nodes, beams, triangles, hydros, rails, and slidenodes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    selectable_visual_types = {
+        "selectable_node",
+        "node_label",
+        "selectable_beam",
+        "selectable_triangle",
+        "selectable_hydro",
+        "selectable_rail",
+        "selectable_slidenode",
+    }
+
+    @classmethod
+    def poll(cls, context):
+        return any(
+            obj.get("beamng_layer") == "jbeam" and obj.get("beamng_visual_type") in cls.selectable_visual_types
+            for obj in context.selected_objects
+        )
+
+    def execute(self, context):
+        objects = [
+            obj
+            for obj in context.selected_objects
+            if obj.get("beamng_layer") == "jbeam" and obj.get("beamng_visual_type") in self.selectable_visual_types
+        ]
+        if not objects:
+            self.report({"WARNING"}, "No selected selectable JBeam items to hide")
+            return {"CANCELLED"}
+
+        for obj in objects:
+            obj.hide_set(True)
+            obj.select_set(False)
+
+        self.report({"INFO"}, f"Hid {len(objects)} selected JBeam item(s)")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_set_jbeam_visual_visibility(Operator):
     bl_idname = "beamng_pc_importer.set_jbeam_visual_visibility"
     bl_label = "Set JBeam Visual Visibility"
@@ -2070,6 +2553,8 @@ class BEAMNG_OT_set_jbeam_visual_visibility(Operator):
             "nodes": {"nodes", "selectable_node", "node_label"},
             "beams": {"beams", "selectable_beam"},
             "triangles": {"triangles", "selectable_triangle"},
+            "hydros": {"hydros", "selectable_hydro"},
+            "sliders": {"rails", "selectable_rail", "selectable_slidenode"},
         }
         visual_types = visual_groups.get(self.visual_group)
         if not visual_types:
@@ -2251,12 +2736,27 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         op = layout.operator(BEAMNG_OT_set_visibility.bl_idname, text="Show All")
         op.mode = "ALL"
         layout.operator(BEAMNG_OT_show_all_jbeams.bl_idname, text="Show All JBeams")
+        layout.operator(BEAMNG_OT_hide_selected_jbeam_items.bl_idname, text="Hide Selected JBeam Items")
         row = layout.row(align=True)
         op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Triangles")
         op.visual_group = "triangles"
         op.action = "show"
         op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Triangles")
         op.visual_group = "triangles"
+        op.action = "hide"
+        row = layout.row(align=True)
+        op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Hydros")
+        op.visual_group = "hydros"
+        op.action = "show"
+        op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Hydros")
+        op.visual_group = "hydros"
+        op.action = "hide"
+        row = layout.row(align=True)
+        op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Sliders")
+        op.visual_group = "sliders"
+        op.action = "show"
+        op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Sliders")
+        op.visual_group = "sliders"
         op.action = "hide"
 
         layout.separator()
@@ -2276,6 +2776,22 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
                 box.label(text=f"Node 1: {active.get('beamng_triangle_id1', '')}")
                 box.label(text=f"Node 2: {active.get('beamng_triangle_id2', '')}")
                 box.label(text=f"Node 3: {active.get('beamng_triangle_id3', '')}")
+            elif visual_type == "selectable_hydro":
+                box.label(text=f"Hydro: {active.get('beamng_hydro_name', '')}")
+                box.label(text=f"From: {active.get('beamng_hydro_id1', '')}")
+                box.label(text=f"To: {active.get('beamng_hydro_id2', '')}")
+                box.label(text=f"Input: {active.get('beamng_hydro_input_source', '')}")
+                box.label(text=f"Factor: {active.get('beamng_hydro_factor', '')}")
+            elif visual_type == "selectable_rail":
+                box.label(text=f"Rail: {active.get('beamng_rail_name', '')}")
+                box.label(text=f"Nodes: {str(active.get('beamng_rail_nodes', ''))[:80]}")
+                box.label(text=f"Capped: {active.get('beamng_rail_capped', '')}")
+                box.label(text=f"Looped: {active.get('beamng_rail_looped', '')}")
+            elif visual_type == "selectable_slidenode":
+                box.label(text=f"Slidenode: {active.get('beamng_slidenode_id', '')}")
+                box.label(text=f"Rail: {active.get('beamng_slidenode_rail', '')}")
+                box.label(text=f"Attached: {active.get('beamng_slidenode_attached', '')}")
+                box.label(text=f"Fix to Rail: {active.get('beamng_slidenode_fix_to_rail', '')}")
             else:
                 box.label(text=f"Type: {visual_type}")
             box.label(text=f"Part: {active.get('beamng_part_name', '')}")
@@ -2340,7 +2856,16 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
                 return {"CANCELLED"}
 
             update_import_progress(context, 20, "resolving selected part tree")
-            resolved_parts, flexbodies, visual_nodes, visual_beams, visual_triangles = resolve_selected_parts(
+            (
+                resolved_parts,
+                flexbodies,
+                visual_nodes,
+                visual_beams,
+                visual_triangles,
+                visual_hydros,
+                visual_rails,
+                visual_slidenodes,
+            ) = resolve_selected_parts(
                 pc_data,
                 part_index,
                 True,
@@ -2371,6 +2896,9 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
                     visual_nodes,
                     visual_beams,
                     visual_triangles,
+                    visual_hydros,
+                    visual_rails,
+                    visual_slidenodes,
                     root_collection,
                     resolved_parts,
                     self.selectable_jbeam_debug,
@@ -2453,12 +2981,27 @@ def menu_func_jbeam_context(self, context):
     box.label(text="BeamNG JBeam Relations")
     box.operator(BEAMNG_OT_select_jbeam_body_structure.bl_idname, text="Select Same Body Nodes/Beams")
     box.operator(BEAMNG_OT_show_all_jbeams.bl_idname, text="Show All JBeams")
+    box.operator(BEAMNG_OT_hide_selected_jbeam_items.bl_idname, text="Hide Selected JBeam Items")
     row = box.row(align=True)
     op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Triangles")
     op.visual_group = "triangles"
     op.action = "show"
     op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Triangles")
     op.visual_group = "triangles"
+    op.action = "hide"
+    row = box.row(align=True)
+    op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Hydros")
+    op.visual_group = "hydros"
+    op.action = "show"
+    op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Hydros")
+    op.visual_group = "hydros"
+    op.action = "hide"
+    row = box.row(align=True)
+    op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Show Sliders")
+    op.visual_group = "sliders"
+    op.action = "show"
+    op = row.operator(BEAMNG_OT_set_jbeam_visual_visibility.bl_idname, text="Hide Sliders")
+    op.visual_group = "sliders"
     op.action = "hide"
     for relation, label in (
         ("siblings", "Siblings"),
@@ -2482,6 +3025,7 @@ classes = (
     BEAMNG_OT_jbeam_relationship,
     BEAMNG_OT_select_jbeam_body_structure,
     BEAMNG_OT_show_all_jbeams,
+    BEAMNG_OT_hide_selected_jbeam_items,
     BEAMNG_OT_set_jbeam_visual_visibility,
     BEAMNG_OT_print_prop_transforms,
     BEAMNG_OT_toggle_relationship_lines,
