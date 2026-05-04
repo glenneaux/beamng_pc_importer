@@ -13,6 +13,7 @@ import math
 import re
 import tempfile
 import zipfile
+import colorsys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,7 +21,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import bpy
-from bpy.props import BoolProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import AddonPreferences, Operator, Panel
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Euler, Matrix, Vector
@@ -160,6 +161,7 @@ class BeamNGAssetSource:
     zip_path: str = ""
     zip_entry: str = ""
     precedence: int = 0
+    label_prefix: str = ""
 
 
 @dataclass
@@ -437,15 +439,31 @@ def insert_missing_commas(text: str) -> str:
     return "".join(result)
 
 
+def describe_json_error(cleaned: str, exc: Exception):
+    pos = getattr(exc, "pos", None)
+    if pos is None:
+        return str(exc)
+    start = max(0, pos - 80)
+    end = min(len(cleaned), pos + 120)
+    snippet = cleaned[start:end].replace("\r", "\\r").replace("\n", "\\n")
+    return f"{exc}; near: {snippet}"
+
+
 def load_jsonc(path: Path):
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     cleaned = strip_trailing_commas(insert_missing_commas(strip_json_comments(text)))
-    return json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse JSONC file {path}: {describe_json_error(cleaned, exc)}") from exc
 
 
 def load_jsonc_text(text: str):
     cleaned = strip_trailing_commas(insert_missing_commas(strip_json_comments(text)))
-    return json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse JSONC text: {describe_json_error(cleaned, exc)}") from exc
 
 
 def load_jsonc_asset(source: BeamNGAssetSource):
@@ -798,6 +816,115 @@ def add_zip_asset_sources(sources, zip_path: Path, vehicle_name: str, suffix: st
         )
 
 
+def _pc_vehicle_from_virtual_path(virtual_path: str):
+    parts = normalize_virtual_path(virtual_path).split("/")
+    lowered = [part.lower() for part in parts]
+    if "vehicles" not in lowered:
+        return ""
+    index = lowered.index("vehicles")
+    if index + 1 >= len(parts):
+        return ""
+    return parts[index + 1]
+
+
+def add_file_pc_sources(sources, root: Path, precedence: int, label_prefix: str = ""):
+    if not root or not root.exists() or not root.is_dir():
+        return
+    for path in sorted(root.rglob("*.pc")):
+        if not path.is_file():
+            continue
+        virtual_path = normalize_virtual_path(path.relative_to(root))
+        if not virtual_path.lower().startswith("vehicles/"):
+            virtual_path = normalize_virtual_path(Path("vehicles") / virtual_path)
+        vehicle_name = _pc_vehicle_from_virtual_path(virtual_path)
+        if not vehicle_name:
+            continue
+        source = BeamNGAssetSource(
+            asset_type="file",
+            virtual_path=virtual_path,
+            path=str(path),
+            precedence=precedence,
+            label_prefix=label_prefix,
+        )
+        sources.append(source)
+
+
+def add_zip_pc_sources(sources, zip_path: Path, precedence: int, cache_enabled=True, label_prefix: str = ""):
+    if not zip_path or not zip_path.exists() or not zip_path.is_file():
+        return
+    for entry in zip_contents_for_path(zip_path, cache_enabled):
+        entry_filename = str(entry.get("filename", ""))
+        if not entry_filename.lower().endswith(".pc"):
+            continue
+        entry_name = normalize_virtual_path(entry_filename)
+        entry_lower = entry_name.lower()
+        if not entry_lower.startswith(("vehicles/", "content/vehicles/")):
+            continue
+        virtual_path = entry_name[len("content/") :] if entry_lower.startswith("content/") else entry_name
+        vehicle_name = _pc_vehicle_from_virtual_path(virtual_path)
+        if not vehicle_name:
+            continue
+        source = BeamNGAssetSource(
+            asset_type="zip",
+            virtual_path=normalize_virtual_path(virtual_path),
+            path=normalize_virtual_path(virtual_path),
+            zip_path=str(zip_path),
+            zip_entry=entry_filename,
+            precedence=precedence,
+            label_prefix=label_prefix,
+        )
+        sources.append(source)
+
+
+def collect_beamng_pc_sources(user_folder: str = "", vanilla_folder: str = "", cache_enabled=True):
+    sources = []
+    vanilla_vehicles = resolve_vanilla_vehicles_folder(vanilla_folder)
+    if vanilla_vehicles:
+        add_file_pc_sources(sources, vanilla_vehicles, 0, "Vanilla")
+        for zip_path in sorted(vanilla_vehicles.glob("*.zip")):
+            add_zip_pc_sources(sources, zip_path, 0, cache_enabled, "Vanilla zip")
+
+    current_folder = None
+    if user_folder:
+        supplied = Path(user_folder)
+        current_candidate = supplied if supplied.name.lower() == "current" else supplied / "current"
+        if current_candidate.exists() and current_candidate.is_dir():
+            current_folder = current_candidate
+
+    if current_folder:
+        add_file_pc_sources(sources, current_folder / "vehicles", 40, "User")
+        mods_folder = current_folder / "mods"
+        unpacked_folder = mods_folder / "unpacked"
+        if unpacked_folder.exists():
+            for mod_index, mod_root in enumerate(sorted(path for path in unpacked_folder.iterdir() if path.is_dir())):
+                add_file_pc_sources(sources, mod_root, 30 + mod_index, f"Unpacked mod: {mod_root.name}")
+        if mods_folder.exists():
+            for zip_index, zip_path in enumerate(sorted(mods_folder.glob("*.zip"))):
+                add_zip_pc_sources(sources, zip_path, 20 + zip_index, cache_enabled, f"Mod zip: {zip_path.name}")
+
+    return sorted(
+        sources,
+        key=lambda item: (
+            normalize_virtual_path(item.virtual_path).lower(),
+            -item.precedence,
+            getattr(item, "label_prefix", ""),
+        ),
+    )
+
+
+def materialize_pc_asset(source: BeamNGAssetSource):
+    if source.asset_type == "file":
+        return Path(source.path)
+
+    virtual_path = normalize_virtual_path(source.virtual_path)
+    safe_zip_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(source.zip_path).stem)
+    output_path = persistent_cache_dir() / "pc_sources" / safe_zip_name / virtual_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(source.zip_path, "r") as archive:
+        output_path.write_bytes(archive.read(source.zip_entry))
+    return output_path
+
+
 def collect_beamng_asset_sources(pc_path: Path, user_folder: str = "", vanilla_folder: str = "", cache_enabled=True):
     vehicle_name = pc_path.parent.name
     selected_vehicle_root = pc_path.parent
@@ -913,23 +1040,43 @@ def parse_parts_index(vehicle_root: Path, asset_sources=None, cache_enabled=True
 def parse_slots(part_data):
     slots = []
     rows = part_data.get("slots2", [])
-    if not isinstance(rows, list):
-        return slots
-    for row in rows:
-        if not isinstance(row, list) or len(row) < 4:
-            continue
-        if row and row[0] == "name":
-            continue
-        options = row[5] if len(row) > 5 and isinstance(row[5], dict) else {}
-        allow_types = row[1] if isinstance(row[1], list) else []
-        slots.append(
-            {
-                "name": row[0],
-                "allow_types": allow_types,
-                "default": row[3] or "",
-                "options": options,
-            }
-        )
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 4:
+                continue
+            if row and row[0] == "name":
+                continue
+            options = row[5] if len(row) > 5 and isinstance(row[5], dict) else {}
+            allow_types = row[1] if isinstance(row[1], list) else []
+            slots.append(
+                {
+                    "name": row[0],
+                    "allow_types": allow_types,
+                    "default": row[3] or "",
+                    "options": options,
+                }
+            )
+
+    legacy_rows = part_data.get("slots", [])
+    if isinstance(legacy_rows, list):
+        for row in legacy_rows:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            if row and row[0] == "type":
+                continue
+            options = row[3] if len(row) > 3 and isinstance(row[3], dict) else {}
+            slot_name = row[0]
+            default_part = row[1] or ""
+            if not slot_name:
+                continue
+            slots.append(
+                {
+                    "name": slot_name,
+                    "allow_types": [slot_name],
+                    "default": default_part,
+                    "options": options,
+                }
+            )
     return slots
 
 
@@ -1441,10 +1588,33 @@ def parse_props(
     return results
 
 
-def resolve_selected_parts(pc_data, part_index, include_props=True):
+def infer_main_part_name(pc_data, part_index):
     main_part = pc_data.get("mainPartName")
+    if main_part:
+        return main_part, "mainPartName"
+
+    model_name = pc_data.get("model")
+    if model_name in part_index:
+        part_data = part_index[model_name].data
+        if str(part_data.get("slotType", "")).lower() == "main":
+            return model_name, "model main slot"
+
+    main_slot_parts = [
+        part_name
+        for part_name, part_def in part_index.items()
+        if str(part_def.data.get("slotType", "")).lower() == "main"
+    ]
+    if len(main_slot_parts) == 1:
+        return main_slot_parts[0], "single main slot"
+    if model_name in part_index:
+        return model_name, "model fallback"
+    return "", ""
+
+
+def resolve_selected_parts(pc_data, part_index, include_props=True):
+    main_part, _main_part_source = infer_main_part_name(pc_data, part_index)
     if not main_part:
-        raise ValueError("The .pc file is missing mainPartName")
+        raise ValueError("The .pc file is missing mainPartName and no main slot part could be inferred")
 
     selected_parts = pc_data.get("parts", {})
     resolved_parts = []
@@ -1889,24 +2059,20 @@ def get_or_create_translucent_material(name, color, alpha=0.24):
     return material
 
 
-JBEAM_PART_COLORS = (
-    (0.95, 0.34, 0.22, 1.0),
-    (0.12, 0.62, 0.95, 1.0),
-    (0.24, 0.78, 0.38, 1.0),
-    (1.00, 0.72, 0.18, 1.0),
-    (0.68, 0.42, 0.95, 1.0),
-    (0.95, 0.38, 0.68, 1.0),
-    (0.22, 0.82, 0.76, 1.0),
-    (0.82, 0.80, 0.28, 1.0),
-    (0.95, 0.56, 0.24, 1.0),
-    (0.50, 0.72, 1.00, 1.0),
-)
+JBEAM_COLOR_GOLDEN_RATIO = 0.618033988749895
+JBEAM_COLOR_SEED_HUE = 0.02
+JBEAM_COLOR_SATURATIONS = (0.78, 0.64, 0.86)
+JBEAM_COLOR_VALUES = (0.95, 0.82, 0.70)
 
 
 def color_for_resolved_part(resolved_part_id: int):
     if resolved_part_id < 0:
         return (0.9, 0.9, 0.9, 1.0)
-    return JBEAM_PART_COLORS[resolved_part_id % len(JBEAM_PART_COLORS)]
+    hue = (JBEAM_COLOR_SEED_HUE + resolved_part_id * JBEAM_COLOR_GOLDEN_RATIO) % 1.0
+    saturation = JBEAM_COLOR_SATURATIONS[resolved_part_id % len(JBEAM_COLOR_SATURATIONS)]
+    value = JBEAM_COLOR_VALUES[(resolved_part_id // len(JBEAM_COLOR_SATURATIONS)) % len(JBEAM_COLOR_VALUES)]
+    red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+    return (red, green, blue, 1.0)
 
 
 def hydro_color_for_resolved_part(_resolved_part_id: int):
@@ -3261,6 +3427,241 @@ def get_addon_preferences(context):
     return addon.preferences if addon else None
 
 
+def write_import_report(lines):
+    text = bpy.data.texts.get("BeamNG Import Report") or bpy.data.texts.new("BeamNG Import Report")
+    text.clear()
+    text.write("\n".join(str(line) for line in lines))
+    text.write("\n")
+    return text
+
+
+def import_beamng_pc_path(
+    context,
+    operator,
+    pc_path: Path,
+    clear_existing=True,
+    include_jbeam_visuals=True,
+    selectable_jbeam_debug=False,
+    show_jbeam_node_labels=False,
+    source_description="",
+):
+    wm = context.window_manager
+    update_import_progress.last_percent = None
+    wm.progress_begin(0, 100)
+    if context.window:
+        context.window.cursor_set("WAIT")
+
+    report_lines = [
+        "[BeamNG Importer] Import report",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"PC path: {pc_path}",
+    ]
+    if source_description:
+        report_lines.append(f"Selected source: {source_description}")
+
+    try:
+        update_import_progress(context, 1, "checking selected file")
+        if not pc_path.exists():
+            operator.report({"ERROR"}, f"Missing file: {pc_path}")
+            return {"CANCELLED"}
+
+        update_import_progress(context, 5, "parsing .pc config")
+        pc_data = load_jsonc(pc_path)
+
+        vehicle_root = pc_path.parent
+        prefs = get_addon_preferences(context)
+        beamng_user_folder = prefs.beamng_user_folder if prefs else ""
+        vanilla_vehicles_folder = prefs.vanilla_vehicles_folder if prefs else ""
+        cache_asset_catalogs = prefs.cache_asset_catalogs if prefs else True
+        jbeam_sources, dae_sources, virtual_vehicle_root = collect_beamng_asset_sources(
+            pc_path,
+            beamng_user_folder,
+            vanilla_vehicles_folder,
+            cache_asset_catalogs,
+        )
+        report_lines.extend(
+            [
+                f"Vehicle folder inferred as: {pc_path.parent.name}",
+                f"User folder preference: {beamng_user_folder or '(not set)'}",
+                f"Vanilla vehicles preference: {vanilla_vehicles_folder or '(not set)'}",
+                f"JBeam sources found: {len(jbeam_sources)}",
+                f"DAE sources found: {len(dae_sources)}",
+            ]
+        )
+        update_import_progress(context, 10, "scanning JBeam parts")
+        if jbeam_sources:
+            part_index = parse_parts_index(vehicle_root, jbeam_sources, cache_asset_catalogs)
+        else:
+            part_index = parse_parts_index(vehicle_root)
+        report_lines.append(f"JBeam parts indexed: {len(part_index)}")
+        if not part_index:
+            write_import_report(report_lines)
+            operator.report({"ERROR"}, "No JBeam parts were found next to the selected .pc")
+            return {"CANCELLED"}
+        main_part_name, main_part_source = infer_main_part_name(pc_data, part_index)
+        report_lines.append(
+            f"Main part: {main_part_name or '(not found)'}"
+            + (f" ({main_part_source})" if main_part_source else "")
+        )
+
+        update_import_progress(context, 20, "resolving selected part tree")
+        (
+            resolved_parts,
+            flexbodies,
+            visual_nodes,
+            visual_beams,
+            visual_triangles,
+            visual_hydros,
+            visual_rails,
+            visual_slidenodes,
+        ) = resolve_selected_parts(
+            pc_data,
+            part_index,
+            True,
+        )
+        report_lines.extend(
+            [
+                f"Resolved parts: {len(resolved_parts)}",
+                f"Resolved flexbodies/props: {len(flexbodies)}",
+                f"Visual nodes: {len(visual_nodes)}",
+                f"Visual beams: {len(visual_beams)}",
+                f"Visual triangles: {len(visual_triangles)}",
+                f"Visual hydros: {len(visual_hydros)}",
+                f"Visual rails/slidenodes: {len(visual_rails) + len(visual_slidenodes)}",
+            ]
+        )
+        if not flexbodies:
+            write_import_report(report_lines)
+            operator.report({"ERROR"}, "No flexbodies were resolved from the selected config")
+            return {"CANCELLED"}
+
+        root_collection_name = f"BeamNG_{pc_path.stem}"
+        template_collection_name = f"{root_collection_name}_templates"
+
+        update_import_progress(context, 28, "creating Blender collections")
+        if clear_existing:
+            for collection_name in (root_collection_name, template_collection_name):
+                existing = bpy.data.collections.get(collection_name)
+                if existing:
+                    bpy.data.collections.remove(existing)
+
+        scene_root = context.scene.collection
+        root_collection = link_collection(scene_root, root_collection_name)
+        root_collection["beamng_pc_import_root"] = True
+        root_collection["beamng_pc_path"] = str(pc_path)
+        template_collection = link_collection(scene_root, template_collection_name)
+        template_collection.hide_viewport = True
+        part_objects = build_part_hierarchy(resolved_parts, root_collection)
+        if include_jbeam_visuals:
+            create_jbeam_visuals(
+                visual_nodes,
+                visual_beams,
+                visual_triangles,
+                visual_hydros,
+                visual_rails,
+                visual_slidenodes,
+                root_collection,
+                resolved_parts,
+                selectable_jbeam_debug,
+                show_jbeam_node_labels,
+            )
+        vehicle_model = str(pc_data.get("model", ""))
+
+        update_import_progress(context, 35, "cataloging DAE assets")
+        if dae_sources:
+            required_mesh_names = {spec.mesh for spec in flexbodies if spec.mesh}
+            dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths = build_dae_catalog(
+                virtual_vehicle_root,
+                dae_sources,
+                cache_asset_catalogs,
+                required_mesh_names,
+            )
+            dae_search_root = virtual_vehicle_root
+        else:
+            dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths = build_dae_catalog(vehicle_root)
+            dae_search_root = vehicle_root
+        report_lines.extend(
+            [
+                f"DAE files cataloged: {len(dae_name_cache)}",
+                f"Mesh names with DAE candidates: {len(mesh_to_dae_paths)}",
+            ]
+        )
+        imported_dae_cache = {}
+        extracted_zip_assets = {}
+        warnings = []
+        imported_count = 0
+        total_specs = max(len(flexbodies), 1)
+
+        for index, spec in enumerate(flexbodies):
+            update_import_progress(
+                context,
+                40 + int((index / total_specs) * 55),
+                f"importing {index + 1}/{len(flexbodies)}: {spec.mesh}",
+            )
+            dae_asset = choose_dae_for_mesh(
+                spec.mesh,
+                spec.jbeam_path,
+                dae_search_root,
+                dae_paths_by_dir,
+                mesh_to_dae_paths,
+            )
+            if dae_asset is None:
+                warnings.append(f"No DAE found for mesh '{spec.mesh}' from part '{spec.part_name}'")
+                continue
+
+            dae_path = materialize_dae_asset(dae_asset, extracted_zip_assets)
+
+            if dae_asset not in imported_dae_cache:
+                mesh_objects = import_dae_templates(context, dae_path, template_collection)
+                imported_dae_cache[dae_asset] = build_template_lookup(mesh_objects)
+
+            template_lookup = imported_dae_cache[dae_asset]
+            template_obj = find_matching_template(spec.mesh, template_lookup)
+            if template_obj is None:
+                warnings.append(f"No imported object matched mesh '{spec.mesh}' in {dae_path.name}")
+                continue
+
+            parent_obj = part_objects.get(spec.resolved_part_id)
+            instantiate_flexbody(template_obj, spec, root_collection, parent_obj)
+            imported_count += 1
+
+        update_import_progress(context, 98, "finishing import")
+        summary = f"Imported {imported_count} meshes/props for {pc_path.name}"
+        if warnings:
+            summary += f" with {len(warnings)} warnings"
+            report_lines.append("")
+            report_lines.append("Warnings:")
+            report_lines.extend(f"- {warning}" for warning in warnings)
+            for warning in warnings[:10]:
+                operator.report({"WARNING"}, warning)
+        report_lines.extend(
+            [
+                "",
+                f"Imported meshes/props: {imported_count}",
+                f"Warnings: {len(warnings)}",
+                f"Result: {summary}",
+            ]
+        )
+        write_import_report(report_lines)
+        if imported_count == 0:
+            operator.report({"WARNING"}, "No meshes were imported. Open the 'BeamNG Import Report' text block for details.")
+        operator.report({"INFO"}, summary)
+        update_import_progress(context, 100, "complete")
+        return {"FINISHED"}
+    except Exception as exc:
+        report_lines.extend(["", f"Exception: {exc}"])
+        write_import_report(report_lines)
+        operator.report({"ERROR"}, f"Failed to import BeamNG config: {exc}")
+        return {"CANCELLED"}
+    finally:
+        save_dirty_disk_caches()
+        wm.progress_end()
+        if context.workspace:
+            context.workspace.status_text_set(None)
+        if context.window:
+            context.window.cursor_set("DEFAULT")
+
+
 class IMPORT_OT_beamng_pc(Operator, ImportHelper):
     bl_idname = "import_scene.beamng_pc"
     bl_label = "Import BeamNG Config"
@@ -3290,168 +3691,131 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
     )
 
     def execute(self, context):
-        wm = context.window_manager
-        update_import_progress.last_percent = None
-        wm.progress_begin(0, 100)
-        if context.window:
-            context.window.cursor_set("WAIT")
+        return import_beamng_pc_path(
+            context,
+            self,
+            Path(self.filepath),
+            self.clear_existing,
+            self.include_jbeam_visuals,
+            self.selectable_jbeam_debug,
+            self.show_jbeam_node_labels,
+            str(Path(self.filepath)),
+        )
 
-        pc_path = Path(self.filepath)
-        try:
-            update_import_progress(context, 1, "checking selected file")
-            if not pc_path.exists():
-                self.report({"ERROR"}, f"Missing file: {pc_path}")
-                return {"CANCELLED"}
 
-            update_import_progress(context, 5, "parsing .pc config")
-            pc_data = load_jsonc(pc_path)
+PC_SOURCE_ENUM_ITEMS = []
+PC_SOURCE_BY_KEY = {}
 
-            vehicle_root = pc_path.parent
-            prefs = get_addon_preferences(context)
-            beamng_user_folder = prefs.beamng_user_folder if prefs else ""
-            vanilla_vehicles_folder = prefs.vanilla_vehicles_folder if prefs else ""
-            cache_asset_catalogs = prefs.cache_asset_catalogs if prefs else True
-            jbeam_sources, dae_sources, virtual_vehicle_root = collect_beamng_asset_sources(
-                pc_path,
-                beamng_user_folder,
-                vanilla_vehicles_folder,
-                cache_asset_catalogs,
+
+def refresh_pc_source_options(context):
+    global PC_SOURCE_ENUM_ITEMS, PC_SOURCE_BY_KEY
+    prefs = get_addon_preferences(context)
+    beamng_user_folder = prefs.beamng_user_folder if prefs else ""
+    vanilla_vehicles_folder = prefs.vanilla_vehicles_folder if prefs else ""
+    cache_asset_catalogs = prefs.cache_asset_catalogs if prefs else True
+    sources = collect_beamng_pc_sources(
+        beamng_user_folder,
+        vanilla_vehicles_folder,
+        cache_asset_catalogs,
+    )
+
+    items = []
+    by_key = {}
+    for index, source in enumerate(sources):
+        vehicle_name = _pc_vehicle_from_virtual_path(source.virtual_path)
+        config_name = Path(source.virtual_path).name
+        label_prefix = getattr(source, "label_prefix", "") or ("Zip" if source.asset_type == "zip" else "File")
+        key = str(index)
+        if source.asset_type == "zip":
+            description = f"{source.zip_path} :: {source.zip_entry}"
+        else:
+            description = source.path
+        label = f"{vehicle_name} | {config_name} | {label_prefix}"
+        items.append((key, label, description))
+        by_key[key] = source
+
+    PC_SOURCE_ENUM_ITEMS = items
+    PC_SOURCE_BY_KEY = by_key
+    return items
+
+
+def pc_source_enum_items(self, context):
+    if not PC_SOURCE_ENUM_ITEMS:
+        refresh_pc_source_options(context)
+    return PC_SOURCE_ENUM_ITEMS
+
+
+class IMPORT_OT_beamng_pc_from_assets(Operator):
+    bl_idname = "import_scene.beamng_pc_from_assets"
+    bl_label = "Import BeamNG Config From Assets"
+    bl_options = {"REGISTER", "UNDO"}
+
+    pc_source_key: EnumProperty(
+        name="BeamNG Config",
+        description="A .pc file discovered in the configured BeamNG user, mod, or vanilla asset folders",
+        items=pc_source_enum_items,
+    )
+    clear_existing: BoolProperty(
+        name="Clear Existing Imported Collection",
+        description="Remove a previous BeamNG import collection with the same config name",
+        default=True,
+    )
+    include_jbeam_visuals: BoolProperty(
+        name="Create JBeam Visuals",
+        description="Create a hidden visualization layer for resolved JBeam nodes, beams, and collision triangles",
+        default=True,
+    )
+    selectable_jbeam_debug: BoolProperty(
+        name="Selectable JBeam IDs",
+        description="Create individual selectable node and beam debug objects with exact ID metadata",
+        default=False,
+    )
+    show_jbeam_node_labels: BoolProperty(
+        name="Show JBeam Node Labels",
+        description="Create viewport text labels for selectable JBeam nodes",
+        default=False,
+    )
+
+    def invoke(self, context, _event):
+        refresh_pc_source_options(context)
+        if not PC_SOURCE_ENUM_ITEMS:
+            self.report(
+                {"ERROR"},
+                "No BeamNG .pc configs found. Set the BeamNG user folder and vanilla vehicles folder in add-on preferences.",
             )
-            update_import_progress(context, 10, "scanning JBeam parts")
-            if jbeam_sources:
-                part_index = parse_parts_index(vehicle_root, jbeam_sources, cache_asset_catalogs)
-            else:
-                part_index = parse_parts_index(vehicle_root)
-            if not part_index:
-                self.report({"ERROR"}, "No JBeam parts were found next to the selected .pc")
-                return {"CANCELLED"}
-
-            update_import_progress(context, 20, "resolving selected part tree")
-            (
-                resolved_parts,
-                flexbodies,
-                visual_nodes,
-                visual_beams,
-                visual_triangles,
-                visual_hydros,
-                visual_rails,
-                visual_slidenodes,
-            ) = resolve_selected_parts(
-                pc_data,
-                part_index,
-                True,
-            )
-            if not flexbodies:
-                self.report({"ERROR"}, "No flexbodies were resolved from the selected config")
-                return {"CANCELLED"}
-
-            root_collection_name = f"BeamNG_{pc_path.stem}"
-            template_collection_name = f"{root_collection_name}_templates"
-
-            update_import_progress(context, 28, "creating Blender collections")
-            if self.clear_existing:
-                for collection_name in (root_collection_name, template_collection_name):
-                    existing = bpy.data.collections.get(collection_name)
-                    if existing:
-                        bpy.data.collections.remove(existing)
-
-            scene_root = context.scene.collection
-            root_collection = link_collection(scene_root, root_collection_name)
-            root_collection["beamng_pc_import_root"] = True
-            root_collection["beamng_pc_path"] = str(pc_path)
-            template_collection = link_collection(scene_root, template_collection_name)
-            template_collection.hide_viewport = True
-            part_objects = build_part_hierarchy(resolved_parts, root_collection)
-            if self.include_jbeam_visuals:
-                create_jbeam_visuals(
-                    visual_nodes,
-                    visual_beams,
-                    visual_triangles,
-                    visual_hydros,
-                    visual_rails,
-                    visual_slidenodes,
-                    root_collection,
-                    resolved_parts,
-                    self.selectable_jbeam_debug,
-                    self.show_jbeam_node_labels,
-                )
-            vehicle_model = str(pc_data.get("model", ""))
-
-            update_import_progress(context, 35, "cataloging DAE assets")
-            if dae_sources:
-                required_mesh_names = {spec.mesh for spec in flexbodies if spec.mesh}
-                dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths = build_dae_catalog(
-                    virtual_vehicle_root,
-                    dae_sources,
-                    cache_asset_catalogs,
-                    required_mesh_names,
-                )
-                dae_search_root = virtual_vehicle_root
-            else:
-                dae_name_cache, dae_paths_by_dir, mesh_to_dae_paths = build_dae_catalog(vehicle_root)
-                dae_search_root = vehicle_root
-            imported_dae_cache = {}
-            extracted_zip_assets = {}
-            warnings = []
-            imported_count = 0
-            total_specs = max(len(flexbodies), 1)
-
-            for index, spec in enumerate(flexbodies):
-                update_import_progress(
-                    context,
-                    40 + int((index / total_specs) * 55),
-                    f"importing {index + 1}/{len(flexbodies)}: {spec.mesh}",
-                )
-                dae_asset = choose_dae_for_mesh(
-                    spec.mesh,
-                    spec.jbeam_path,
-                    dae_search_root,
-                    dae_paths_by_dir,
-                    mesh_to_dae_paths,
-                )
-                if dae_asset is None:
-                    warnings.append(f"No DAE found for mesh '{spec.mesh}' from part '{spec.part_name}'")
-                    continue
-
-                dae_path = materialize_dae_asset(dae_asset, extracted_zip_assets)
-
-                if dae_asset not in imported_dae_cache:
-                    mesh_objects = import_dae_templates(context, dae_path, template_collection)
-                    imported_dae_cache[dae_asset] = build_template_lookup(mesh_objects)
-
-                template_lookup = imported_dae_cache[dae_asset]
-                template_obj = find_matching_template(spec.mesh, template_lookup)
-                if template_obj is None:
-                    warnings.append(f"No imported object matched mesh '{spec.mesh}' in {dae_path.name}")
-                    continue
-
-                parent_obj = part_objects.get(spec.resolved_part_id)
-                instantiate_flexbody(template_obj, spec, root_collection, parent_obj)
-                imported_count += 1
-
-            update_import_progress(context, 98, "finishing import")
-            summary = f"Imported {imported_count} meshes/props for {pc_path.name}"
-            if warnings:
-                summary += f" with {len(warnings)} warnings"
-                for warning in warnings[:10]:
-                    self.report({"WARNING"}, warning)
-            self.report({"INFO"}, summary)
-            update_import_progress(context, 100, "complete")
-            return {"FINISHED"}
-        except Exception as exc:
-            self.report({"ERROR"}, f"Failed to import BeamNG config: {exc}")
             return {"CANCELLED"}
-        finally:
-            save_dirty_disk_caches()
-            wm.progress_end()
-            if context.workspace:
-                context.workspace.status_text_set(None)
-            if context.window:
-                context.window.cursor_set("DEFAULT")
+        self.pc_source_key = PC_SOURCE_ENUM_ITEMS[0][0]
+        return context.window_manager.invoke_props_dialog(self, width=650)
+
+    def execute(self, context):
+        source = PC_SOURCE_BY_KEY.get(self.pc_source_key)
+        if source is None:
+            refresh_pc_source_options(context)
+            source = PC_SOURCE_BY_KEY.get(self.pc_source_key)
+        if source is None:
+            self.report({"ERROR"}, "Selected BeamNG .pc config is no longer available")
+            return {"CANCELLED"}
+
+        pc_path = materialize_pc_asset(source)
+        if source.asset_type == "zip":
+            source_description = f"{source.zip_path} :: {source.zip_entry}"
+        else:
+            source_description = source.path
+        return import_beamng_pc_path(
+            context,
+            self,
+            pc_path,
+            self.clear_existing,
+            self.include_jbeam_visuals,
+            self.selectable_jbeam_debug,
+            self.show_jbeam_node_labels,
+            source_description,
+        )
 
 
 def menu_func_import(self, _context):
-    self.layout.operator(IMPORT_OT_beamng_pc.bl_idname, text="BeamNG Config (.pc)")
+    self.layout.operator(IMPORT_OT_beamng_pc.bl_idname, text="BeamNG Config (.pc File)")
+    self.layout.operator(IMPORT_OT_beamng_pc_from_assets.bl_idname, text="BeamNG Config From BeamNG Assets")
 
 
 def menu_func_jbeam_context(self, context):
@@ -3515,6 +3879,7 @@ classes = (
     BEAMNG_OT_toggle_relationship_lines,
     VIEW3D_PT_beamng_pc_importer,
     IMPORT_OT_beamng_pc,
+    IMPORT_OT_beamng_pc_from_assets,
 )
 
 
