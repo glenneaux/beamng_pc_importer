@@ -5,3 +5,6 @@ __pycache__/
 # Local scratch backups kept beside the Blender add-on during development.
 __init__ copy.py
 __init___backup*.py
+
+# Release archives are generated locally and attached to GitHub releases.
+dist/
