@@ -289,6 +289,44 @@ def strip_trailing_commas(text: str) -> str:
     return cleaned
 
 
+def strip_leading_commas(text: str) -> str:
+    result = []
+    in_string = False
+    escape = False
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        result.append(ch)
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+
+        if ch in "{[":
+            j = i + 1
+            while j < length and text[j] in " \t\r\n":
+                result.append(text[j])
+                j += 1
+            if j < length and text[j] == ",":
+                i = j + 1
+                continue
+
+        i += 1
+    return "".join(result)
+
+
 def insert_missing_commas(text: str) -> str:
     result = []
     stack = []
@@ -436,7 +474,7 @@ def describe_json_error(cleaned: str, exc: Exception):
 
 def load_jsonc(path: Path):
     text = path.read_text(encoding="utf-8-sig")
-    cleaned = strip_trailing_commas(insert_missing_commas(strip_json_comments(text)))
+    cleaned = strip_leading_commas(strip_trailing_commas(insert_missing_commas(strip_json_comments(text))))
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
@@ -444,7 +482,7 @@ def load_jsonc(path: Path):
 
 
 def load_jsonc_text(text: str):
-    cleaned = strip_trailing_commas(insert_missing_commas(strip_json_comments(text)))
+    cleaned = strip_leading_commas(strip_trailing_commas(insert_missing_commas(strip_json_comments(text))))
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
@@ -1033,10 +1071,12 @@ def parse_slots(part_data):
                 continue
             options = row[5] if len(row) > 5 and isinstance(row[5], dict) else {}
             allow_types = row[1] if isinstance(row[1], list) else []
+            deny_types = row[2] if len(row) > 2 and isinstance(row[2], list) else []
             slots.append(
                 {
                     "name": row[0],
                     "allow_types": allow_types,
+                    "deny_types": deny_types,
                     "default": row[3] or "",
                     "options": options,
                     "core_slot": bool(options.get("coreSlot")),
@@ -1059,6 +1099,7 @@ def parse_slots(part_data):
                 {
                     "name": slot_name,
                     "allow_types": [slot_name],
+                    "deny_types": [],
                     "default": default_part,
                     "options": options,
                     "core_slot": bool(options.get("coreSlot")),
@@ -1601,12 +1642,23 @@ def infer_main_part_name(pc_data, part_index):
 def compatible_parts_for_slot(slot, part_index):
     allow_types = slot.get("allow_types") or [slot.get("name", "")]
     allow_types = {str(item) for item in allow_types if item}
+    deny_types = {str(item) for item in slot.get("deny_types", []) if item}
     if not allow_types:
         allow_types = {str(slot.get("name", ""))}
+
+    def part_slot_types(part_def):
+        slot_type = part_def.data.get("slotType", "")
+        if isinstance(slot_type, list):
+            return {str(item) for item in slot_type if item}
+        if slot_type:
+            return {str(slot_type)}
+        return set()
+
     return sorted(
         part_name
         for part_name, part_def in part_index.items()
-        if str(part_def.data.get("slotType", "")) in allow_types
+        if (part_slot_types(part_def) & allow_types)
+        and not (part_slot_types(part_def) & deny_types)
     )
 
 

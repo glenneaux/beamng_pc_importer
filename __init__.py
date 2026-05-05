@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 1
+ADDON_BUILD = 2
 
 
 def addon_version_label():
@@ -151,7 +151,16 @@ def set_slot_editor_item(item, slot, part_index, selected_part, parent_part, dep
     if slot.get("core_slot") and choice == "__EMPTY__":
         choice = selected_part if selected_part else slot.get("default", "")
         if choice not in valid_identifiers:
-            choice = option_items[0]["identifier"] if option_items else "__NEW__"
+            unresolved = choice or slot.get("name", "")
+            option_items.insert(
+                0,
+                {
+                    "identifier": "__ERROR__",
+                    "name": "<Error>",
+                    "description": f"Required slot could not resolve '{unresolved}'",
+                },
+            )
+            choice = "__ERROR__"
 
     item.path = path
     item.parent_path = parent_path
@@ -263,7 +272,7 @@ def refresh_slot_editor_descendants(scene, item):
 
 
 def slot_choice_updated(self, _context):
-    self.selected_part = "" if self.choice == "__EMPTY__" else self.choice
+    self.selected_part = "" if self.choice in {"__EMPTY__", "__ERROR__"} else self.choice
     if _context is not None and hasattr(_context.scene, "beamng_slot_editor_items"):
         refresh_slot_editor_descendants(_context.scene, self)
 
@@ -325,8 +334,10 @@ def slot_editor_pc_data_from_scene(scene):
 
     for item in scene.beamng_slot_editor_items:
         choice = item.choice
+        if choice == "__ERROR__":
+            raise ValueError(f"Required slot '{item.slot_name}' has no valid resolved part")
         if choice == "__NEW__":
-            raise ValueError(f"Slot '{item.slot_name}' is set to New...., which is not implemented yet")
+            continue
         if choice == "__EMPTY__":
             parts[item.slot_name] = ""
         else:
@@ -535,7 +546,113 @@ def find_beamng_import_collections(scene):
     ]
 
 
+AUTHORING_GHOST_MATERIAL_NAME = "BeamNG Authoring Body Ghost"
+AUTHORING_ORIGINAL_MESH_PROP = "beamng_authoring_original_mesh_data"
+AUTHORING_ORIGINAL_HIDE_SELECT_PROP = "beamng_authoring_original_hide_select"
+
+
+def get_authoring_ghost_material():
+    material = bpy.data.materials.get(AUTHORING_GHOST_MATERIAL_NAME)
+    if material is None:
+        material = bpy.data.materials.new(AUTHORING_GHOST_MATERIAL_NAME)
+    material.diffuse_color = (0.55, 0.75, 1.0, 0.22)
+    material.use_nodes = True
+    material.blend_method = "BLEND"
+    material.show_transparent_back = True
+    bsdf = material.node_tree.nodes.get("Principled BSDF") if material.node_tree else None
+    if bsdf:
+        if "Base Color" in bsdf.inputs:
+            bsdf.inputs["Base Color"].default_value = material.diffuse_color
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = material.diffuse_color[3]
+    return material
+
+
+def restore_authoring_reference_object(obj):
+    if AUTHORING_ORIGINAL_MESH_PROP in obj:
+        original_mesh_name = obj.get(AUTHORING_ORIGINAL_MESH_PROP, "")
+        original_mesh = bpy.data.meshes.get(original_mesh_name)
+        ghost_mesh = obj.data if obj.type == "MESH" else None
+        if original_mesh is not None:
+            obj.data = original_mesh
+        if ghost_mesh is not None and ghost_mesh != original_mesh and ghost_mesh.users == 0:
+            bpy.data.meshes.remove(ghost_mesh)
+        del obj[AUTHORING_ORIGINAL_MESH_PROP]
+
+    if AUTHORING_ORIGINAL_HIDE_SELECT_PROP in obj:
+        obj.hide_select = bool(obj.get(AUTHORING_ORIGINAL_HIDE_SELECT_PROP))
+        del obj[AUTHORING_ORIGINAL_HIDE_SELECT_PROP]
+
+
+def restore_authoring_reference_mode(root_collection):
+    for obj in walk_collection_objects(root_collection):
+        restore_authoring_reference_object(obj)
+
+
+def make_object_authoring_reference(obj, ghost_material):
+    if AUTHORING_ORIGINAL_HIDE_SELECT_PROP not in obj:
+        obj[AUTHORING_ORIGINAL_HIDE_SELECT_PROP] = bool(obj.hide_select)
+    obj.hide_select = True
+    obj.hide_set(False)
+    obj.hide_render = False
+    if hasattr(obj, "show_transparent"):
+        obj.show_transparent = True
+    obj.color = ghost_material.diffuse_color
+
+    if obj.type != "MESH" or obj.data is None:
+        return
+
+    if AUTHORING_ORIGINAL_MESH_PROP not in obj:
+        obj[AUTHORING_ORIGINAL_MESH_PROP] = obj.data.name
+        obj.data = obj.data.copy()
+        obj.data.name = f"{obj.name}_authoring_ghost_mesh"
+
+    obj.data.materials.clear()
+    obj.data.materials.append(ghost_material)
+
+
+def set_jbeam_authoring_selectability(root_collection):
+    selectable_types = {
+        "nodes",
+        "beams",
+        "triangles",
+        "hydros",
+        "rails",
+        "selectable_node",
+        "selectable_beam",
+        "selectable_triangle",
+        "selectable_hydro",
+        "selectable_rail",
+        "selectable_slidenode",
+    }
+    for collection in walk_child_collections(root_collection):
+        if collection.get("beamng_layer") == "jbeam":
+            collection.hide_viewport = False
+            collection.hide_render = False
+
+    for obj in walk_collection_objects(root_collection):
+        if obj.get("beamng_layer") != "jbeam":
+            continue
+        obj.hide_set(False)
+        obj.hide_render = obj.get("beamng_visual_type") == "node_label"
+        obj.hide_select = obj.get("beamng_visual_type") not in selectable_types
+
+
+def set_authoring_reference_mode(root_collection):
+    ghost_material = get_authoring_ghost_material()
+    for obj in walk_collection_objects(root_collection):
+        layer = obj.get("beamng_layer")
+        if layer == "hierarchy":
+            obj.hide_set(False)
+            obj.hide_render = True
+            obj.hide_select = True
+        elif layer in {"mesh", "prop"}:
+            make_object_authoring_reference(obj, ghost_material)
+    set_jbeam_authoring_selectability(root_collection)
+
+
 def set_import_layer_visibility(root_collection, show_meshes=True, show_props=True, show_jbeam=True):
+    restore_authoring_reference_mode(root_collection)
     show_hierarchy = show_meshes or show_props
     for obj in walk_collection_objects(root_collection):
         layer = obj.get("beamng_layer")
@@ -933,6 +1050,12 @@ class BEAMNG_OT_set_visibility(Operator):
             self.report({"WARNING"}, "No BeamNG import collections found")
             return {"CANCELLED"}
 
+        if self.mode == "AUTHORING":
+            for root in roots:
+                set_authoring_reference_mode(root)
+            self.report({"INFO"}, "JBeam authoring mode enabled")
+            return {"FINISHED"}
+
         show_meshes = self.mode in {"MESHES", "MESHES_PROPS", "ALL"}
         show_props = self.mode in {"PROPS", "MESHES_PROPS", "ALL"}
         show_jbeam = self.mode in {"JBEAM", "ALL"}
@@ -940,6 +1063,347 @@ class BEAMNG_OT_set_visibility(Operator):
             set_import_layer_visibility(root, show_meshes, show_props, show_jbeam)
 
         return {"FINISHED"}
+
+
+def view3d_window_region(area):
+    return next((region for region in area.regions if region.type == "WINDOW"), None)
+
+
+def view3d_space(area):
+    return next((space for space in area.spaces if space.type == "VIEW_3D"), None)
+
+
+def beamng_objects_by_layer(context, layer_name):
+    return [
+        obj
+        for root in find_beamng_import_collections(context.scene)
+        for obj in walk_collection_objects(root)
+        if obj.get("beamng_layer") == layer_name
+    ]
+
+
+def beamng_objects_for_view_mode(context, mode):
+    layer_names = {
+        "FLEX": {"mesh"},
+        "PROPS": {"prop"},
+        "JBEAM": {"jbeam"},
+        "FLEX_PROPS": {"mesh", "prop"},
+        "ALL": {"mesh", "prop", "jbeam"},
+    }.get(mode, set())
+    if not layer_names:
+        return []
+
+    return [
+        obj
+        for root in find_beamng_import_collections(context.scene)
+        for obj in walk_collection_objects(root)
+        if obj.get("beamng_layer") in layer_names
+    ]
+
+
+def local_view_is_active(space):
+    return bool(getattr(space, "local_view", None))
+
+
+def restore_selection(context, selected_objects, active_object):
+    for obj in context.scene.objects:
+        obj.select_set(False)
+    for obj in selected_objects:
+        if bpy.data.objects.get(obj.name):
+            obj.select_set(True)
+    if active_object and bpy.data.objects.get(active_object.name):
+        context.view_layer.objects.active = active_object
+
+
+def reveal_collections_for_local_view_objects(objects):
+    collections = set()
+    for obj in objects:
+        collections.update(obj.users_collection)
+
+    pending = list(collections)
+    seen = set()
+    while pending:
+        collection = pending.pop()
+        if collection in seen:
+            continue
+        seen.add(collection)
+        collection.hide_viewport = False
+        collection.hide_render = False
+        parents = [candidate for candidate in bpy.data.collections if collection.name in candidate.children.keys()]
+        pending.extend(parents)
+
+
+def set_view3d_local_view(context, area, objects):
+    region = view3d_window_region(area)
+    space = view3d_space(area)
+    if region is None or space is None:
+        return False
+
+    objects = [obj for obj in objects if obj and bpy.data.objects.get(obj.name)]
+    if not objects:
+        return False
+
+    reveal_collections_for_local_view_objects(objects)
+    for obj in objects:
+        obj.hide_set(False)
+        obj.hide_select = False
+
+    with context.temp_override(
+        window=context.window,
+        screen=context.screen,
+        area=area,
+        region=region,
+        space_data=space,
+    ):
+        if local_view_is_active(space):
+            bpy.ops.view3d.localview(frame_selected=False)
+        bpy.ops.object.select_all(action="DESELECT")
+        for obj in objects:
+            obj.select_set(True)
+        context.view_layer.objects.active = objects[0]
+        bpy.ops.view3d.localview(frame_selected=True)
+    return True
+
+
+def exit_view3d_local_view(context, area):
+    region = view3d_window_region(area)
+    space = view3d_space(area)
+    if region is None or space is None or not local_view_is_active(space):
+        return False
+
+    with context.temp_override(
+        window=context.window,
+        screen=context.screen,
+        area=area,
+        region=region,
+        space_data=space,
+    ):
+        bpy.ops.view3d.localview(frame_selected=False)
+    return True
+
+
+def copy_view3d_region_state(source_region_3d, target_region_3d):
+    target_region_3d.view_location = source_region_3d.view_location.copy()
+    target_region_3d.view_rotation = source_region_3d.view_rotation.copy()
+    target_region_3d.view_distance = source_region_3d.view_distance
+    target_region_3d.view_perspective = source_region_3d.view_perspective
+    target_region_3d.view_camera_zoom = source_region_3d.view_camera_zoom
+    target_region_3d.view_camera_offset = source_region_3d.view_camera_offset.copy()
+
+
+def sync_view3d_areas_from_source(context, source_area):
+    source_space = view3d_space(source_area)
+    source_region_3d = getattr(source_space, "region_3d", None) if source_space else None
+    if source_region_3d is None:
+        return 0
+
+    synced = 0
+    for area in context.screen.areas:
+        if area == source_area or area.type != "VIEW_3D":
+            continue
+        target_space = view3d_space(area)
+        target_region_3d = getattr(target_space, "region_3d", None) if target_space else None
+        if target_region_3d is None:
+            continue
+        copy_view3d_region_state(source_region_3d, target_region_3d)
+        area.tag_redraw()
+        synced += 1
+    return synced
+
+
+def split_current_view3d_area(context):
+    if not context.area or context.area.type != "VIEW_3D":
+        return []
+
+    screen = context.screen
+    before = set(screen.areas)
+    region = view3d_window_region(context.area)
+    space = view3d_space(context.area)
+    if region is None or space is None:
+        return []
+
+    with context.temp_override(
+        window=context.window,
+        screen=screen,
+        area=context.area,
+        region=region,
+        space_data=space,
+    ):
+        result = bpy.ops.screen.area_split(direction="VERTICAL", factor=0.5)
+    if "FINISHED" not in result:
+        return []
+
+    created = [area for area in screen.areas if area not in before and area.type == "VIEW_3D"]
+    existing = [area for area in before if area.type == "VIEW_3D"]
+    return existing + created
+
+
+def two_view3d_areas_for_split(context):
+    view_areas = [area for area in context.screen.areas if area.type == "VIEW_3D"]
+    if len(view_areas) < 2:
+        view_areas = split_current_view3d_area(context)
+    view_areas = [area for area in context.screen.areas if area.type == "VIEW_3D"] if len(view_areas) < 2 else view_areas
+    if len(view_areas) < 2:
+        return None, None
+
+    view_areas = sorted(view_areas, key=lambda area: (area.x, area.y))
+    if context.area in view_areas:
+        current_index = view_areas.index(context.area)
+        if current_index == 0:
+            return view_areas[0], view_areas[1]
+        return view_areas[current_index - 1], view_areas[current_index]
+    return view_areas[0], view_areas[1]
+
+
+class BEAMNG_OT_setup_split_prop_flexbody_views(Operator):
+    bl_idname = "beamng_pc_importer.setup_split_prop_flexbody_views"
+    bl_label = "Split Props/Flexbody Views"
+    bl_description = "Create two 3D Viewports: one isolated to flexbody meshes and one isolated to props"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.area and context.area.type == "VIEW_3D")
+
+    def execute(self, context):
+        flexbody_objects = beamng_objects_by_layer(context, "mesh")
+        prop_objects = beamng_objects_by_layer(context, "prop")
+        if not flexbody_objects:
+            self.report({"WARNING"}, "No imported BeamNG flexbody mesh objects found")
+            return {"CANCELLED"}
+        if not prop_objects:
+            self.report({"WARNING"}, "No imported BeamNG prop objects found")
+            return {"CANCELLED"}
+
+        selected_objects = list(context.selected_objects)
+        active_object = context.view_layer.objects.active
+        flexbody_area, prop_area = two_view3d_areas_for_split(context)
+        if flexbody_area is None or prop_area is None:
+            self.report({"ERROR"}, "Could not create or find two 3D Viewports")
+            return {"CANCELLED"}
+
+        try:
+            flexbody_ok = set_view3d_local_view(context, flexbody_area, flexbody_objects)
+            prop_ok = set_view3d_local_view(context, prop_area, prop_objects)
+        finally:
+            restore_selection(context, selected_objects, active_object)
+
+        if not flexbody_ok or not prop_ok:
+            self.report({"ERROR"}, "Could not isolate one or both 3D Viewports")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, "Split view set up: flexbodies in one Viewport, props in the other")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_set_active_view_filter(Operator):
+    bl_idname = "beamng_pc_importer.set_active_view_filter"
+    bl_label = "Set This View Filter"
+    bl_description = "Switch only the active 3D Viewport between BeamNG flexbodies, props, JBeam, or combinations"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: StringProperty(default="ALL")
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.area and context.area.type == "VIEW_3D")
+
+    def execute(self, context):
+        objects = beamng_objects_for_view_mode(context, self.mode)
+        if not objects:
+            self.report({"WARNING"}, "No BeamNG objects were found for this view filter")
+            return {"CANCELLED"}
+
+        selected_objects = list(context.selected_objects)
+        active_object = context.view_layer.objects.active
+        try:
+            if not set_view3d_local_view(context, context.area, objects):
+                self.report({"ERROR"}, "Could not set Local View for this 3D Viewport")
+                return {"CANCELLED"}
+        finally:
+            restore_selection(context, selected_objects, active_object)
+
+        labels = {
+            "FLEX": "Flexbodies",
+            "PROPS": "Props",
+            "JBEAM": "JBeam",
+            "FLEX_PROPS": "Flexbodies + Props",
+            "ALL": "All BeamNG Layers",
+        }
+        self.report({"INFO"}, f"This View: {labels.get(self.mode, self.mode)}")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_exit_split_local_views(Operator):
+    bl_idname = "beamng_pc_importer.exit_split_local_views"
+    bl_label = "Exit Split Local Views"
+    bl_description = "Exit Local View in every 3D Viewport on the current screen"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        exited = 0
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D" and exit_view3d_local_view(context, area):
+                exited += 1
+
+        if exited == 0:
+            self.report({"INFO"}, "No 3D Viewport Local Views were active")
+        else:
+            self.report({"INFO"}, f"Exited Local View in {exited} 3D Viewport(s)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_toggle_view_sync(Operator):
+    bl_idname = "beamng_pc_importer.toggle_view_sync"
+    bl_label = "Sync 3D Views"
+    bl_description = "Synchronize other 3D Viewports to this viewport's view position, rotation, and zoom"
+    bl_options = {"REGISTER"}
+
+    _timer = None
+    _source_area = None
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.area and context.area.type == "VIEW_3D")
+
+    def invoke(self, context, _event):
+        wm = context.window_manager
+        if wm.get("beamng_view_sync_active", False):
+            wm["beamng_view_sync_active"] = False
+            self.report({"INFO"}, "BeamNG viewport sync stopped")
+            return {"FINISHED"}
+
+        view_count = sum(1 for area in context.screen.areas if area.type == "VIEW_3D")
+        if view_count < 2:
+            self.report({"WARNING"}, "Open or split a second 3D Viewport before enabling sync")
+            return {"CANCELLED"}
+
+        wm["beamng_view_sync_active"] = True
+        self._source_area = context.area
+        self._timer = wm.event_timer_add(0.08, window=context.window)
+        wm.modal_handler_add(self)
+        self.report({"INFO"}, "BeamNG viewport sync started from this 3D View")
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        wm = context.window_manager
+        if not wm.get("beamng_view_sync_active", False):
+            self.cancel(context)
+            return {"CANCELLED"}
+
+        if not any(area == self._source_area for area in context.screen.areas):
+            wm["beamng_view_sync_active"] = False
+            self.cancel(context)
+            return {"CANCELLED"}
+
+        if event.type == "TIMER":
+            sync_view3d_areas_from_source(context, self._source_area)
+        return {"PASS_THROUGH"}
+
+    def cancel(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
 
 
 class BEAMNG_OT_print_prop_transforms(Operator):
@@ -1107,6 +1571,47 @@ class BEAMNG_OT_revert_slot_change(Operator):
             return {"CANCELLED"}
 
 
+def draw_vehicle_slot_editor(layout, context):
+    slot_items = getattr(context.scene, "beamng_slot_editor_items", [])
+    box = layout.box()
+    box.label(text="Configuration Editor")
+    if not slot_items:
+        box.label(text="Import a .pc to populate the slot tree")
+        return
+
+    main_part = context.scene.get("beamng_slot_editor_main_part", "")
+    if main_part:
+        box.label(text=f"Root: {main_part}")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_apply_slot_configuration.bl_idname, text="Apply / Reload")
+    row.operator(BEAMNG_OT_revert_slot_change.bl_idname, text="Revert")
+
+    expanded_by_path = {item.path: item.expanded for item in slot_items}
+    for item in slot_items:
+        parent_path = item.parent_path
+        visible = True
+        while parent_path:
+            if not expanded_by_path.get(parent_path, True):
+                visible = False
+                break
+            parent_item = next((candidate for candidate in slot_items if candidate.path == parent_path), None)
+            parent_path = parent_item.parent_path if parent_item else ""
+        if not visible:
+            continue
+
+        row = box.row(align=True)
+        for _indent in range(min(item.depth, 8)):
+            row.label(text="", icon="BLANK1")
+        if item.has_children:
+            icon = "TRIA_DOWN" if item.expanded else "TRIA_RIGHT"
+            row.prop(item, "expanded", text="", icon=icon, emboss=False)
+        else:
+            row.label(text="", icon="BLANK1")
+        label = item.slot_name + (" *" if item.is_core else "")
+        row.label(text=label)
+        row.prop(item, "choice", text="")
+
+
 class VIEW3D_PT_beamng_pc_importer(Panel):
     bl_label = "BeamNG PC Importer"
     bl_idname = "VIEW3D_PT_beamng_pc_importer"
@@ -1134,6 +1639,30 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
 
         op = layout.operator(BEAMNG_OT_set_visibility.bl_idname, text="Show All")
         op.mode = "ALL"
+        op = layout.operator(BEAMNG_OT_set_visibility.bl_idname, text="JBeam Authoring Mode")
+        op.mode = "AUTHORING"
+
+        box = layout.box()
+        box.label(text="This View")
+        row = box.row(align=True)
+        op = row.operator(BEAMNG_OT_set_active_view_filter.bl_idname, text="Flex")
+        op.mode = "FLEX"
+        op = row.operator(BEAMNG_OT_set_active_view_filter.bl_idname, text="Props")
+        op.mode = "PROPS"
+        op = row.operator(BEAMNG_OT_set_active_view_filter.bl_idname, text="JBeam")
+        op.mode = "JBEAM"
+        row = box.row(align=True)
+        op = row.operator(BEAMNG_OT_set_active_view_filter.bl_idname, text="Flex + Props")
+        op.mode = "FLEX_PROPS"
+        op = row.operator(BEAMNG_OT_set_active_view_filter.bl_idname, text="All")
+        op.mode = "ALL"
+        row = box.row(align=True)
+        row.operator(BEAMNG_OT_toggle_view_sync.bl_idname, text="Sync Views")
+        row.operator(BEAMNG_OT_exit_split_local_views.bl_idname, text="Exit Local Views")
+
+        row = layout.row(align=True)
+        row.operator(BEAMNG_OT_setup_split_prop_flexbody_views.bl_idname, text="Split Props/Flex")
+        row.operator(BEAMNG_OT_exit_split_local_views.bl_idname, text="Exit Split")
         layout.operator(BEAMNG_OT_show_all_jbeams.bl_idname, text="Show All JBeams")
         layout.operator(BEAMNG_OT_hide_selected_jbeam_items.bl_idname, text="Hide Selected JBeam Items")
         row = layout.row(align=True)
@@ -1159,44 +1688,7 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         op.action = "hide"
 
         layout.separator()
-        slot_items = getattr(context.scene, "beamng_slot_editor_items", [])
-        if slot_items:
-            box = layout.box()
-            box.label(text="Vehicle Slots")
-            main_part = context.scene.get("beamng_slot_editor_main_part", "")
-            if main_part:
-                box.label(text=f"Root: {main_part}")
-            row = box.row(align=True)
-            row.operator(BEAMNG_OT_apply_slot_configuration.bl_idname, text="Apply / Reload")
-            row.operator(BEAMNG_OT_revert_slot_change.bl_idname, text="Revert")
-            expanded_by_path = {item.path: item.expanded for item in slot_items}
-            for item in slot_items:
-                parent_path = item.parent_path
-                visible = True
-                while parent_path:
-                    if not expanded_by_path.get(parent_path, True):
-                        visible = False
-                        break
-                    parent_item = next((candidate for candidate in slot_items if candidate.path == parent_path), None)
-                    parent_path = parent_item.parent_path if parent_item else ""
-                if not visible:
-                    continue
-
-                row = box.row(align=True)
-                for _indent in range(min(item.depth, 8)):
-                    row.label(text="", icon="BLANK1")
-                if item.has_children:
-                    icon = "TRIA_DOWN" if item.expanded else "TRIA_RIGHT"
-                    row.prop(item, "expanded", text="", icon=icon, emboss=False)
-                else:
-                    row.label(text="", icon="BLANK1")
-                label = item.slot_name + (" *" if item.is_core else "")
-                row.label(text=label)
-                row.prop(item, "choice", text="")
-        else:
-            box = layout.box()
-            box.label(text="Vehicle Slots")
-            box.label(text="Import a .pc to populate the slot tree")
+        draw_vehicle_slot_editor(layout, context)
 
         layout.separator()
         active = context.active_object
@@ -1240,6 +1732,19 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         layout.separator()
         layout.operator(BEAMNG_OT_toggle_relationship_lines.bl_idname, text="Toggle Parent Lines")
         layout.operator(BEAMNG_OT_print_prop_transforms.bl_idname, text="Write Prop Debug File")
+
+
+class SCENE_PT_beamng_configuration_editor(Panel):
+    bl_label = "BeamNG Configuration Editor"
+    bl_idname = "SCENE_PT_beamng_configuration_editor"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "scene"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text=f"Version: {addon_version_label()}")
+        draw_vehicle_slot_editor(layout, context)
 
 
 class BeamNGPCImporterPreferences(AddonPreferences):
@@ -1778,11 +2283,16 @@ classes = (
     BEAMNG_OT_show_all_jbeams,
     BEAMNG_OT_hide_selected_jbeam_items,
     BEAMNG_OT_set_jbeam_visual_visibility,
+    BEAMNG_OT_setup_split_prop_flexbody_views,
+    BEAMNG_OT_set_active_view_filter,
+    BEAMNG_OT_exit_split_local_views,
+    BEAMNG_OT_toggle_view_sync,
     BEAMNG_OT_print_prop_transforms,
     BEAMNG_OT_toggle_relationship_lines,
     BEAMNG_OT_apply_slot_configuration,
     BEAMNG_OT_revert_slot_change,
     VIEW3D_PT_beamng_pc_importer,
+    SCENE_PT_beamng_configuration_editor,
     IMPORT_OT_beamng_pc,
     IMPORT_OT_beamng_pc_from_assets,
 )
