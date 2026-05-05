@@ -8,6 +8,8 @@ bl_info = {
     "category": "Import-Export",
 }
 
+# Build numbers increment for each build of the current bl_info version.
+# Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
 ADDON_BUILD = 1
 
 
