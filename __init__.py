@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 22
+ADDON_BUILD = 31
 
 
 def addon_version_label():
@@ -1047,6 +1047,15 @@ def set_jbeam_collections_visibility(root_collection, part_ids, visible):
             collection.hide_render = not visible
 
 
+def ensure_jbeam_container_visible(root_collection):
+    for collection in walk_child_collections(root_collection):
+        if collection.get("beamng_layer") != "jbeam":
+            continue
+        if collection.get("beamng_resolved_part_id") is None:
+            collection.hide_viewport = False
+            collection.hide_render = False
+
+
 def set_all_jbeam_visibility(root_collection, visible):
     for collection in walk_child_collections(root_collection):
         if collection.get("beamng_layer") == "jbeam":
@@ -1073,6 +1082,93 @@ def set_jbeam_visual_type_visibility(root_collection, visual_types, visible):
         obj.hide_render = not visible
         if obj.get("beamng_visual_type") == "selectable_triangle":
             obj.hide_select = not visible
+
+
+def jbeam_node_owner_part_ids(root_collection):
+    stored = root_collection.get("beamng_resolved_node_owner_part_ids", "")
+    if stored:
+        try:
+            decoded = json.loads(stored)
+            owners = defaultdict(set)
+            for node_id, part_ids in decoded.items():
+                owners[str(node_id)].update(int(part_id) for part_id in part_ids)
+            return owners
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    owners = defaultdict(set)
+    for obj in walk_collection_objects(root_collection):
+        if obj.get("beamng_layer") != "jbeam":
+            continue
+        node_id = obj.get("beamng_node_id")
+        if not node_id:
+            continue
+        try:
+            part_id = int(obj.get("beamng_resolved_part_id", -999999))
+        except (TypeError, ValueError):
+            continue
+        owners[str(node_id)].add(part_id)
+    return owners
+
+
+def jbeam_external_node_refs_for_part(root_collection, part_id):
+    stored = root_collection.get("beamng_resolved_part_external_node_refs", "")
+    if stored:
+        try:
+            decoded = json.loads(stored)
+            return {str(node_id) for node_id in decoded.get(str(part_id), [])}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return set()
+
+
+def jbeam_node_ids_for_object(obj):
+    visual_type = obj.get("beamng_visual_type") if obj else ""
+    if visual_type in {"selectable_node", "node_label"}:
+        node_id = obj.get("beamng_node_id")
+        return {str(node_id)} if node_id else set()
+    if visual_type in {"selectable_beam", "selectable_hydro"}:
+        return {str(value) for value in (obj.get("beamng_beam_id1") or obj.get("beamng_hydro_id1"), obj.get("beamng_beam_id2") or obj.get("beamng_hydro_id2")) if value}
+    if visual_type == "selectable_triangle":
+        return {str(value) for value in (obj.get("beamng_triangle_id1"), obj.get("beamng_triangle_id2"), obj.get("beamng_triangle_id3")) if value}
+    if visual_type == "selectable_slidenode":
+        node_id = obj.get("beamng_slidenode_id")
+        return {str(node_id)} if node_id else set()
+    if visual_type == "selectable_rail":
+        rail_nodes = obj.get("beamng_rail_nodes", "")
+        return {node.strip() for node in str(rail_nodes).split(",") if node.strip()}
+    return set()
+
+
+def jbeam_reference_objects_for_part(root_collection, part_id):
+    reference_types = {
+        "selectable_beam",
+        "selectable_triangle",
+        "selectable_hydro",
+        "selectable_rail",
+        "selectable_slidenode",
+    }
+    return jbeam_objects_for_part_ids(root_collection, {part_id}, reference_types)
+
+
+def jbeam_referenced_part_ids_for_node_ids(root_collection, source_part_id, node_ids):
+    node_owners = jbeam_node_owner_part_ids(root_collection)
+    referenced_node_ids = set()
+    referenced_part_ids = set()
+    for node_id in node_ids:
+        owner_part_ids = node_owners.get(str(node_id), set())
+        external_owner_ids = {part_id for part_id in owner_part_ids if part_id != source_part_id}
+        if external_owner_ids:
+            referenced_node_ids.add(str(node_id))
+            referenced_part_ids.update(external_owner_ids)
+    return referenced_part_ids, referenced_node_ids
+
+
+def jbeam_referenced_part_ids_for_objects(root_collection, source_part_id, objects):
+    node_ids = set()
+    for obj in objects:
+        node_ids.update(jbeam_node_ids_for_object(obj))
+    return jbeam_referenced_part_ids_for_node_ids(root_collection, source_part_id, node_ids)
 
 
 class BEAMNG_OT_jbeam_relationship(Operator):
@@ -1157,6 +1253,79 @@ class BEAMNG_OT_select_jbeam_body_structure(Operator):
             obj.select_set(True)
         context.view_layer.objects.active = objects[0]
         self.report({"INFO"}, f"Selected {len(objects)} node/beam objects from this body")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_show_jbeam_part_with_references(Operator):
+    bl_idname = "beamng_pc_importer.show_jbeam_part_with_references"
+    bl_label = "Show Part With Referenced JBeam Parts"
+    bl_description = "Hide other JBeam visuals and show the selected part plus parts owning nodes referenced by its beams, triangles, hydros, rails, or slidenodes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return selected_jbeam_part_id(context) is not None
+
+    def execute(self, context):
+        part_id = selected_jbeam_part_id(context)
+        root = find_jbeam_root_for_object(context, context.active_object)
+        if root is None or part_id is None:
+            self.report({"WARNING"}, "No BeamNG JBeam selection found")
+            return {"CANCELLED"}
+
+        selected_reference_objects = [
+            obj
+            for obj in context.selected_objects
+            if obj.get("beamng_layer") == "jbeam"
+            and str(obj.get("beamng_resolved_part_id")) == str(part_id)
+            and jbeam_node_ids_for_object(obj)
+        ]
+        selected_node_ids = set()
+        for obj in selected_reference_objects:
+            selected_node_ids.update(jbeam_node_ids_for_object(obj))
+
+        external_node_ids = jbeam_external_node_refs_for_part(root, part_id)
+        if not external_node_ids:
+            source_objects = jbeam_reference_objects_for_part(root, part_id)
+            _source_part_ids, external_node_ids = jbeam_referenced_part_ids_for_objects(
+                root,
+                part_id,
+                source_objects,
+            )
+
+        # A selected connector beam should refine selection, not hide the owning part's other references.
+        reference_node_ids = set(external_node_ids)
+        reference_node_ids.update(selected_node_ids)
+        referenced_part_ids, referenced_node_ids = jbeam_referenced_part_ids_for_node_ids(
+            root,
+            part_id,
+            reference_node_ids,
+        )
+        visible_part_ids = {part_id, *referenced_part_ids}
+
+        set_all_jbeam_visibility(root, False)
+        ensure_jbeam_container_visible(root)
+        set_jbeam_collections_visibility(root, visible_part_ids, True)
+        visible_objects = jbeam_objects_for_part_ids(root, visible_part_ids)
+        for obj in visible_objects:
+            obj.hide_set(False)
+            obj.hide_render = obj.get("beamng_visual_type") == "node_label"
+
+        for obj in context.scene.objects:
+            obj.select_set(False)
+        active_part_objects = jbeam_objects_for_part_ids(root, {part_id}, {"selectable_node", "selectable_beam"})
+        for obj in active_part_objects:
+            obj.select_set(True)
+        if active_part_objects:
+            context.view_layer.objects.active = active_part_objects[0]
+
+        if not referenced_part_ids:
+            self.report({"INFO"}, "Showing selected JBeam part only; no external referenced node owners found")
+        else:
+            self.report(
+                {"INFO"},
+                f"Showing selected part plus {len(referenced_part_ids)} referenced part(s) via {len(referenced_node_ids)} external node id(s)",
+            )
         return {"FINISHED"}
 
 
@@ -2182,6 +2351,16 @@ def write_import_report(lines):
     return text
 
 
+def write_resolved_vehicle_model_report(model):
+    text = bpy.data.texts.get("BeamNG Resolved Vehicle Model") or bpy.data.texts.new(
+        "BeamNG Resolved Vehicle Model"
+    )
+    text.clear()
+    text.write("\n".join(resolved_vehicle_model_report_lines(model)))
+    text.write("\n")
+    return text
+
+
 def import_beamng_pc_path(
     context,
     operator,
@@ -2279,6 +2458,22 @@ def import_beamng_pc_path(
                 f"Visual rails/slidenodes: {len(visual_rails) + len(visual_slidenodes)}",
             ]
         )
+        resolved_vehicle_model = build_resolved_vehicle_model(
+            pc_path,
+            pc_data,
+            source_description,
+            main_part_name,
+            resolved_parts,
+            flexbodies,
+            visual_nodes,
+            visual_beams,
+            visual_triangles,
+            visual_hydros,
+            visual_rails,
+            visual_slidenodes,
+        )
+        write_resolved_vehicle_model_report(resolved_vehicle_model)
+        report_lines.append("Resolved vehicle model report: BeamNG Resolved Vehicle Model")
         if not flexbodies:
             write_import_report(report_lines)
             operator.report({"ERROR"}, "No flexbodies were resolved from the selected config")
@@ -2298,6 +2493,20 @@ def import_beamng_pc_path(
         root_collection = link_collection(scene_root, root_collection_name)
         root_collection["beamng_pc_import_root"] = True
         root_collection["beamng_pc_path"] = str(pc_path)
+        root_collection["beamng_resolved_node_owner_part_ids"] = json.dumps(
+            {
+                node_id: list(part_ids)
+                for node_id, part_ids in resolved_vehicle_model.node_owner_part_ids.items()
+            },
+            sort_keys=True,
+        )
+        root_collection["beamng_resolved_part_external_node_refs"] = json.dumps(
+            {
+                str(part_id): list(node_ids)
+                for part_id, node_ids in resolved_vehicle_model.part_external_node_refs.items()
+            },
+            sort_keys=True,
+        )
         if source_asset is not None:
             source_pc_path = source_asset.path if source_asset.asset_type == "file" else str(pc_path)
             source_virtual_path = source_asset.virtual_path
@@ -2671,6 +2880,7 @@ def menu_func_jbeam_context(self, context):
     box = layout.box()
     box.label(text="BeamNG JBeam Relations")
     box.operator(BEAMNG_OT_select_jbeam_body_structure.bl_idname, text="Select Same Body Nodes/Beams")
+    box.operator(BEAMNG_OT_show_jbeam_part_with_references.bl_idname, text="Show Part + Referenced Parts")
     box.operator(BEAMNG_OT_show_all_jbeams.bl_idname, text="Show All JBeams")
     box.operator(BEAMNG_OT_hide_selected_jbeam_items.bl_idname, text="Hide Selected JBeam Items")
     row = box.row(align=True)
@@ -2717,6 +2927,7 @@ classes = (
     BEAMNG_OT_set_visibility,
     BEAMNG_OT_jbeam_relationship,
     BEAMNG_OT_select_jbeam_body_structure,
+    BEAMNG_OT_show_jbeam_part_with_references,
     BEAMNG_OT_show_all_jbeams,
     BEAMNG_OT_hide_selected_jbeam_items,
     BEAMNG_OT_set_jbeam_visual_visibility,

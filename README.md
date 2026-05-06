@@ -11,6 +11,7 @@ The long-term goal is to grow this from a BeamNG vehicle/configuration importer 
 ## Project Notes
 
 - `ARCHITECTURE.md` captures the larger design direction for the resolved vehicle model, JBeam mesh editing, preserve-first exports, validation, undo/redo, and future authoring workflows.
+- `FUNCTIONAL_DESCRIPTION.md` describes the planned editor engine behaviour: resolver pipeline, dependency graph, stable entity IDs, dirty tracking, transactional edits, export patching, validation, and performance strategy.
 - `TODO.md` tracks shorter-term bugs, experiments, and future work items that are not ready for implementation yet.
 
 ## Milestone Timeline

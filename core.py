@@ -128,6 +128,53 @@ class JBeamSlidenodeSpec:
     fix_to_rail: str = ""
 
 
+@dataclass
+class ResolvedVehiclePartModel:
+    resolved_part_id: int
+    name: str
+    source_path: str
+    parent_id: int = -1
+    slot_name: str = ""
+    node_ids: tuple = field(default_factory=tuple)
+    beam_count: int = 0
+    triangle_count: int = 0
+    hydro_count: int = 0
+    rail_count: int = 0
+    slidenode_count: int = 0
+    flexbody_count: int = 0
+    prop_count: int = 0
+    external_node_refs: tuple = field(default_factory=tuple)
+    ancestor_node_refs: tuple = field(default_factory=tuple)
+    descendant_node_refs: tuple = field(default_factory=tuple)
+    cross_branch_node_refs: tuple = field(default_factory=tuple)
+    unresolved_node_refs: tuple = field(default_factory=tuple)
+
+
+@dataclass
+class ResolvedVehicleModel:
+    pc_path: str
+    source_description: str
+    vehicle_model: str
+    main_part: str
+    parts: list = field(default_factory=list)
+    node_count: int = 0
+    beam_count: int = 0
+    triangle_count: int = 0
+    hydro_count: int = 0
+    rail_count: int = 0
+    slidenode_count: int = 0
+    flexbody_count: int = 0
+    prop_count: int = 0
+    source_files: tuple = field(default_factory=tuple)
+    external_node_ref_count: int = 0
+    ancestor_node_ref_count: int = 0
+    descendant_node_ref_count: int = 0
+    cross_branch_node_ref_count: int = 0
+    unresolved_node_ref_count: int = 0
+    node_owner_part_ids: dict = field(default_factory=dict)
+    part_external_node_refs: dict = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class DaeAssetSource:
     asset_type: str
@@ -1614,6 +1661,278 @@ def parse_props(
             )
         )
     return results
+
+
+def spec_node_ids(spec):
+    ids = []
+    for attr in ("id1", "id2", "id3", "node_id"):
+        value = getattr(spec, attr, None)
+        if value:
+            ids.append(str(value))
+    return tuple(ids)
+
+
+def resolved_part_ancestor_ids(part_id, parent_ids_by_part):
+    ancestors = set()
+    seen = set()
+    current = parent_ids_by_part.get(part_id, -1)
+    while current is not None and current >= 0 and current not in seen:
+        ancestors.add(current)
+        seen.add(current)
+        current = parent_ids_by_part.get(current, -1)
+    return ancestors
+
+
+def resolved_part_descendant_ids(part_id, child_ids_by_part):
+    descendants = set()
+    pending = list(child_ids_by_part.get(part_id, ()))
+    while pending:
+        child_id = pending.pop()
+        if child_id in descendants:
+            continue
+        descendants.add(child_id)
+        pending.extend(child_ids_by_part.get(child_id, ()))
+    return descendants
+
+
+def build_resolved_vehicle_model(
+    pc_path,
+    pc_data,
+    source_description,
+    main_part,
+    resolved_parts,
+    flexbodies,
+    visual_nodes,
+    visual_beams,
+    visual_triangles,
+    visual_hydros,
+    visual_rails,
+    visual_slidenodes,
+):
+    nodes_by_part = defaultdict(list)
+    node_ids_by_part = defaultdict(set)
+    node_owner_part_ids = defaultdict(set)
+    for node in visual_nodes:
+        nodes_by_part[node.resolved_part_id].append(node)
+        node_id = str(node.name)
+        node_ids_by_part[node.resolved_part_id].add(node_id)
+        node_owner_part_ids[node_id].add(node.resolved_part_id)
+
+    beams_by_part = defaultdict(list)
+    for beam in visual_beams:
+        beams_by_part[beam.resolved_part_id].append(beam)
+
+    triangles_by_part = defaultdict(list)
+    for triangle in visual_triangles:
+        triangles_by_part[triangle.resolved_part_id].append(triangle)
+
+    hydros_by_part = defaultdict(list)
+    for hydro in visual_hydros:
+        hydros_by_part[hydro.resolved_part_id].append(hydro)
+
+    rails_by_part = defaultdict(list)
+    for rail in visual_rails:
+        rails_by_part[rail.resolved_part_id].append(rail)
+
+    slidenodes_by_part = defaultdict(list)
+    for slidenode in visual_slidenodes:
+        slidenodes_by_part[slidenode.resolved_part_id].append(slidenode)
+
+    flexbodies_by_part = defaultdict(list)
+    props_by_part = defaultdict(list)
+    for spec in flexbodies:
+        if spec.source_type == "prop":
+            props_by_part[spec.resolved_part_id].append(spec)
+        else:
+            flexbodies_by_part[spec.resolved_part_id].append(spec)
+
+    source_files = sorted({str(part.part_def.source_path) for part in resolved_parts})
+    parent_ids_by_part = {part.id: part.parent_id for part in resolved_parts}
+    child_ids_by_part = defaultdict(list)
+    for part in resolved_parts:
+        if part.parent_id >= 0:
+            child_ids_by_part[part.parent_id].append(part.id)
+    part_models = []
+    external_ref_total = 0
+    ancestor_ref_total = 0
+    descendant_ref_total = 0
+    cross_branch_ref_total = 0
+    unresolved_ref_total = 0
+
+    for part in resolved_parts:
+        local_node_ids = node_ids_by_part[part.id]
+        ancestor_ids = resolved_part_ancestor_ids(part.id, parent_ids_by_part)
+        descendant_ids = resolved_part_descendant_ids(part.id, child_ids_by_part)
+        external_refs = []
+        ancestor_refs = []
+        descendant_refs = []
+        cross_branch_refs = []
+        unresolved_refs = []
+        for spec in (
+            beams_by_part[part.id]
+            + triangles_by_part[part.id]
+            + hydros_by_part[part.id]
+            + slidenodes_by_part[part.id]
+        ):
+            for node_id in spec_node_ids(spec):
+                if node_id not in local_node_ids:
+                    external_refs.append(node_id)
+                    owner_ids = node_owner_part_ids.get(node_id, set())
+                    if not owner_ids:
+                        unresolved_refs.append(node_id)
+                    elif owner_ids & ancestor_ids:
+                        ancestor_refs.append(node_id)
+                    elif owner_ids & descendant_ids:
+                        descendant_refs.append(node_id)
+                    else:
+                        cross_branch_refs.append(node_id)
+
+        external_refs = tuple(sorted(set(external_refs)))
+        ancestor_refs = tuple(sorted(set(ancestor_refs)))
+        descendant_refs = tuple(sorted(set(descendant_refs)))
+        cross_branch_refs = tuple(sorted(set(cross_branch_refs)))
+        unresolved_refs = tuple(sorted(set(unresolved_refs)))
+        external_ref_total += len(external_refs)
+        ancestor_ref_total += len(ancestor_refs)
+        descendant_ref_total += len(descendant_refs)
+        cross_branch_ref_total += len(cross_branch_refs)
+        unresolved_ref_total += len(unresolved_refs)
+        part_models.append(
+            ResolvedVehiclePartModel(
+                resolved_part_id=part.id,
+                name=part.part_def.name,
+                source_path=str(part.part_def.source_path),
+                parent_id=part.parent_id,
+                slot_name=part.slot_name,
+                node_ids=tuple(sorted(local_node_ids)),
+                beam_count=len(beams_by_part[part.id]),
+                triangle_count=len(triangles_by_part[part.id]),
+                hydro_count=len(hydros_by_part[part.id]),
+                rail_count=len(rails_by_part[part.id]),
+                slidenode_count=len(slidenodes_by_part[part.id]),
+                flexbody_count=len(flexbodies_by_part[part.id]),
+                prop_count=len(props_by_part[part.id]),
+                external_node_refs=external_refs,
+                ancestor_node_refs=ancestor_refs,
+                descendant_node_refs=descendant_refs,
+                cross_branch_node_refs=cross_branch_refs,
+                unresolved_node_refs=unresolved_refs,
+            )
+        )
+
+    return ResolvedVehicleModel(
+        pc_path=str(pc_path),
+        source_description=str(source_description or ""),
+        vehicle_model=str(pc_data.get("model", "")) if isinstance(pc_data, dict) else "",
+        main_part=str(main_part or ""),
+        parts=part_models,
+        node_count=len(visual_nodes),
+        beam_count=len(visual_beams),
+        triangle_count=len(visual_triangles),
+        hydro_count=len(visual_hydros),
+        rail_count=len(visual_rails),
+        slidenode_count=len(visual_slidenodes),
+        flexbody_count=sum(1 for spec in flexbodies if spec.source_type != "prop"),
+        prop_count=sum(1 for spec in flexbodies if spec.source_type == "prop"),
+        source_files=tuple(source_files),
+        external_node_ref_count=external_ref_total,
+        ancestor_node_ref_count=ancestor_ref_total,
+        descendant_node_ref_count=descendant_ref_total,
+        cross_branch_node_ref_count=cross_branch_ref_total,
+        unresolved_node_ref_count=unresolved_ref_total,
+        node_owner_part_ids={node_id: tuple(sorted(owner_ids)) for node_id, owner_ids in sorted(node_owner_part_ids.items())},
+        part_external_node_refs={
+            str(part_model.resolved_part_id): tuple(part_model.external_node_refs)
+            for part_model in part_models
+            if part_model.external_node_refs
+        },
+    )
+
+
+def resolved_vehicle_model_report_lines(model: ResolvedVehicleModel):
+    lines = [
+        "[BeamNG Importer] Resolved vehicle model",
+        f"PC path: {model.pc_path}",
+    ]
+    if model.source_description:
+        lines.append(f"Selected source: {model.source_description}")
+    lines.extend(
+        [
+            f"Vehicle model: {model.vehicle_model}",
+            f"Main part: {model.main_part}",
+            f"Resolved parts: {len(model.parts)}",
+            f"Source JBeam files: {len(model.source_files)}",
+            "",
+            "Totals:",
+            f"  nodes={model.node_count}",
+            f"  beams={model.beam_count}",
+            f"  triangles={model.triangle_count}",
+            f"  hydros={model.hydro_count}",
+            f"  rails={model.rail_count}",
+            f"  slidenodes={model.slidenode_count}",
+            f"  flexbodies={model.flexbody_count}",
+            f"  props={model.prop_count}",
+            f"  external_node_refs={model.external_node_ref_count}",
+            f"  ancestor_node_refs={model.ancestor_node_ref_count}",
+            f"  descendant_node_refs={model.descendant_node_ref_count}",
+            f"  cross_branch_node_refs={model.cross_branch_node_ref_count}",
+            f"  unresolved_node_refs={model.unresolved_node_ref_count}",
+            "",
+            "Reference categories:",
+            "  ancestor_node_refs: child/descendant part references a parent/ancestor node.",
+            "  descendant_node_refs: parent/ancestor part references a child/descendant node.",
+            "  cross_branch_node_refs: reference is outside the direct slot ancestry and needs graph review.",
+            "",
+            "Parts:",
+        ]
+    )
+    for part in model.parts:
+        parent = "root" if part.parent_id < 0 else str(part.parent_id)
+        slot = part.slot_name or "(root)"
+        lines.extend(
+            [
+                f"- [{part.resolved_part_id:03d}] {part.name}",
+                f"  slot={slot} parent={parent}",
+                f"  source={part.source_path}",
+                (
+                    "  counts="
+                    f"nodes:{len(part.node_ids)} "
+                    f"beams:{part.beam_count} "
+                    f"triangles:{part.triangle_count} "
+                    f"hydros:{part.hydro_count} "
+                    f"rails:{part.rail_count} "
+                    f"slidenodes:{part.slidenode_count} "
+                    f"flexbodies:{part.flexbody_count} "
+                    f"props:{part.prop_count}"
+                ),
+            ]
+        )
+        if part.external_node_refs:
+            preview = ", ".join(part.external_node_refs[:12])
+            if len(part.external_node_refs) > 12:
+                preview += f", ... (+{len(part.external_node_refs) - 12})"
+            lines.append(f"  external_node_refs={preview}")
+        if part.ancestor_node_refs:
+            preview = ", ".join(part.ancestor_node_refs[:12])
+            if len(part.ancestor_node_refs) > 12:
+                preview += f", ... (+{len(part.ancestor_node_refs) - 12})"
+            lines.append(f"  ancestor_node_refs={preview}")
+        if part.descendant_node_refs:
+            preview = ", ".join(part.descendant_node_refs[:12])
+            if len(part.descendant_node_refs) > 12:
+                preview += f", ... (+{len(part.descendant_node_refs) - 12})"
+            lines.append(f"  descendant_node_refs={preview}")
+        if part.cross_branch_node_refs:
+            preview = ", ".join(part.cross_branch_node_refs[:12])
+            if len(part.cross_branch_node_refs) > 12:
+                preview += f", ... (+{len(part.cross_branch_node_refs) - 12})"
+            lines.append(f"  cross_branch_node_refs={preview}")
+        if part.unresolved_node_refs:
+            preview = ", ".join(part.unresolved_node_refs[:12])
+            if len(part.unresolved_node_refs) > 12:
+                preview += f", ... (+{len(part.unresolved_node_refs) - 12})"
+            lines.append(f"  unresolved_node_refs={preview}")
+    return lines
 
 
 def infer_main_part_name(pc_data, part_index):
