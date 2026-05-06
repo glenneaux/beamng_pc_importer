@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 12
+ADDON_BUILD = 20
 
 
 def addon_version_label():
@@ -1426,27 +1426,51 @@ def copy_view3d_region_state(source_region_3d, target_region_3d):
     target_region_3d.view_distance = source_region_3d.view_distance
     target_region_3d.view_perspective = source_region_3d.view_perspective
     target_region_3d.view_camera_zoom = source_region_3d.view_camera_zoom
-    target_region_3d.view_camera_offset = source_region_3d.view_camera_offset.copy()
+    target_region_3d.view_camera_offset = tuple(source_region_3d.view_camera_offset)
 
 
-def sync_view3d_areas_from_source(context, source_area):
+def view3d_region_entries(context):
+    for area in context.screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        for space in area.spaces:
+            if space.type == "VIEW_3D" and getattr(space, "region_3d", None) is not None:
+                yield area, space.region_3d
+
+
+def view3d_region_state(region_3d):
+    return (
+        tuple(region_3d.view_location),
+        tuple(region_3d.view_rotation),
+        region_3d.view_distance,
+        region_3d.view_perspective,
+        region_3d.view_camera_zoom,
+        tuple(region_3d.view_camera_offset),
+    )
+
+
+BEAMNG_VIEW_SYNC_ENABLED = False
+BEAMNG_VIEW_SYNC_SOURCE_STATE = None
+
+
+def sync_view3d_regions_from_source_area(context, source_area):
+    if source_area is None or not any(area == source_area for area in context.screen.areas):
+        return 0, False, None
+
     source_space = view3d_space(source_area)
-    source_region_3d = getattr(source_space, "region_3d", None) if source_space else None
-    if source_region_3d is None:
-        return 0
+    source_region = getattr(source_space, "region_3d", None) if source_space else None
+    if source_region is None:
+        return 0, False, None
 
     synced = 0
-    for area in context.screen.areas:
-        if area == source_area or area.type != "VIEW_3D":
+    for area, region_3d in view3d_region_entries(context):
+        if area == source_area:
             continue
-        target_space = view3d_space(area)
-        target_region_3d = getattr(target_space, "region_3d", None) if target_space else None
-        if target_region_3d is None:
-            continue
-        copy_view3d_region_state(source_region_3d, target_region_3d)
+        copy_view3d_region_state(source_region, region_3d)
         area.tag_redraw()
         synced += 1
-    return synced
+
+    return synced, True, view3d_region_state(source_region)
 
 
 def split_current_view3d_area(context):
@@ -1594,7 +1618,7 @@ class BEAMNG_OT_exit_split_local_views(Operator):
 class BEAMNG_OT_toggle_view_sync(Operator):
     bl_idname = "beamng_pc_importer.toggle_view_sync"
     bl_label = "Sync 3D Views"
-    bl_description = "Synchronize other 3D Viewports to this viewport's view position, rotation, and zoom"
+    bl_description = "Toggle synchronized 3D View navigation across all 3D Views on the current screen"
     bl_options = {"REGISTER"}
 
     _timer = None
@@ -1604,9 +1628,13 @@ class BEAMNG_OT_toggle_view_sync(Operator):
     def poll(cls, context):
         return bool(context.area and context.area.type == "VIEW_3D")
 
-    def invoke(self, context, _event):
+    def execute(self, context):
+        global BEAMNG_VIEW_SYNC_ENABLED, BEAMNG_VIEW_SYNC_SOURCE_STATE
+
         wm = context.window_manager
-        if wm.get("beamng_view_sync_active", False):
+        if BEAMNG_VIEW_SYNC_ENABLED:
+            BEAMNG_VIEW_SYNC_ENABLED = False
+            BEAMNG_VIEW_SYNC_SOURCE_STATE = None
             wm["beamng_view_sync_active"] = False
             self.report({"INFO"}, "BeamNG viewport sync stopped")
             return {"FINISHED"}
@@ -1616,32 +1644,64 @@ class BEAMNG_OT_toggle_view_sync(Operator):
             self.report({"WARNING"}, "Open or split a second 3D Viewport before enabling sync")
             return {"CANCELLED"}
 
-        wm["beamng_view_sync_active"] = True
+        BEAMNG_VIEW_SYNC_ENABLED = True
         self._source_area = context.area
-        self._timer = wm.event_timer_add(0.08, window=context.window)
+        source_space = view3d_space(self._source_area)
+        source_region = getattr(source_space, "region_3d", None) if source_space else None
+        BEAMNG_VIEW_SYNC_SOURCE_STATE = view3d_region_state(source_region) if source_region else None
+        wm["beamng_view_sync_active"] = True
+        self._timer = wm.event_timer_add(0.05, window=context.window)
         wm.modal_handler_add(self)
         self.report({"INFO"}, "BeamNG viewport sync started from this 3D View")
         return {"RUNNING_MODAL"}
 
-    def modal(self, context, event):
-        wm = context.window_manager
-        if not wm.get("beamng_view_sync_active", False):
-            self.cancel(context)
-            return {"CANCELLED"}
+    def invoke(self, context, _event):
+        return self.execute(context)
 
-        if not any(area == self._source_area for area in context.screen.areas):
+    def modal(self, context, event):
+        global BEAMNG_VIEW_SYNC_ENABLED, BEAMNG_VIEW_SYNC_SOURCE_STATE
+
+        wm = context.window_manager
+        if not BEAMNG_VIEW_SYNC_ENABLED:
             wm["beamng_view_sync_active"] = False
             self.cancel(context)
             return {"CANCELLED"}
 
         if event.type == "TIMER":
-            sync_view3d_areas_from_source(context, self._source_area)
+            source_space = view3d_space(self._source_area) if self._source_area else None
+            source_region = getattr(source_space, "region_3d", None) if source_space else None
+            if source_region is None:
+                source_ok = False
+                source_state = None
+            else:
+                source_ok = True
+                source_state = view3d_region_state(source_region)
+
+            if not source_ok:
+                BEAMNG_VIEW_SYNC_ENABLED = False
+                BEAMNG_VIEW_SYNC_SOURCE_STATE = None
+                wm["beamng_view_sync_active"] = False
+                self.cancel(context)
+                return {"CANCELLED"}
+            if source_state != BEAMNG_VIEW_SYNC_SOURCE_STATE:
+                _synced, source_ok, source_state = sync_view3d_regions_from_source_area(context, self._source_area)
+                if not source_ok:
+                    BEAMNG_VIEW_SYNC_ENABLED = False
+                    BEAMNG_VIEW_SYNC_SOURCE_STATE = None
+                    wm["beamng_view_sync_active"] = False
+                    self.cancel(context)
+                    return {"CANCELLED"}
+                BEAMNG_VIEW_SYNC_SOURCE_STATE = source_state
         return {"PASS_THROUGH"}
 
     def cancel(self, context):
+        global BEAMNG_VIEW_SYNC_SOURCE_STATE
+
         if self._timer is not None:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
+        self._source_area = None
+        BEAMNG_VIEW_SYNC_SOURCE_STATE = None
 
 
 class BEAMNG_OT_print_prop_transforms(Operator):
@@ -2597,6 +2657,11 @@ def menu_func_import(self, _context):
     self.layout.operator(IMPORT_OT_beamng_pc_from_assets.bl_idname, text="BeamNG Config From BeamNG Assets")
 
 
+def menu_func_view_sync(self, _context):
+    self.layout.separator()
+    self.layout.operator(BEAMNG_OT_toggle_view_sync.bl_idname, text="Sync BeamNG 3D Views")
+
+
 def menu_func_jbeam_context(self, context):
     if selected_jbeam_part_id(context) is None:
         return
@@ -2677,11 +2742,13 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.beamng_slot_editor_items = CollectionProperty(type=BeamNGSlotEditorItem)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.VIEW3D_MT_view.append(menu_func_view_sync)
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func_jbeam_context)
 
 
 def unregister():
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func_jbeam_context)
+    bpy.types.VIEW3D_MT_view.remove(menu_func_view_sync)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     if hasattr(bpy.types.Scene, "beamng_slot_editor_items"):
         del bpy.types.Scene.beamng_slot_editor_items
