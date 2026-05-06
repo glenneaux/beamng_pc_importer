@@ -15,6 +15,7 @@ Use this as a parking place for ideas, concepts, bugs, and things to revisit.
 
 - PC export is experimental. Future work needs to verify that all complete .pc information survives export, including paint specs/colors and any other non-slot configuration data used by complex vehicles.
 - Continue investigating BeamNG paint data support. Future work should map how paint details are split across .pc `paints` data, JBeam paint/skin/material slots, `globalSkin`, dynamic decal materials, and `.materials.json`/`skin.materials.json` files so export/editing preserves the full visual configuration.
+- Revisit prop import logic. Props are still not importing correctly, even for visual/reference purposes, so their placement/orientation/scale pipeline needs another dedicated pass.
 
 ## Design Questions
 
