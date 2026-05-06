@@ -13,7 +13,7 @@ Use this as a parking place for ideas, concepts, bugs, and things to revisit.
 
 ## Bugs / Fixes
 
-- 
+- PC export is experimental. Future work needs to verify that all complete .pc information survives export, including paint specs/colors and any other non-slot configuration data used by complex vehicles.
 
 ## Design Questions
 

@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 2
+ADDON_BUILD = 12
 
 
 def addon_version_label():
@@ -142,6 +142,12 @@ def update_slot_editor_dirty_state(scene):
     current = slot_editor_config_snapshot_json(scene.beamng_slot_editor_items)
     baseline = scene.get("beamng_slot_editor_baseline_snapshot", "")
     scene["beamng_slot_editor_dirty"] = bool(baseline and current != baseline)
+
+
+def mark_slot_editor_saved(scene):
+    scene["beamng_slot_editor_baseline_snapshot"] = slot_editor_config_snapshot_json(scene.beamng_slot_editor_items)
+    scene["beamng_slot_editor_last_snapshot"] = ""
+    scene["beamng_slot_editor_dirty"] = False
 
 
 def set_slot_editor_item(item, slot, part_index, selected_part, parent_part, depth, path, parent_path, expanded=True):
@@ -318,6 +324,15 @@ def populate_vehicle_slot_editor(scene, pc_data, part_index):
 
 
 def slot_editor_pc_data_from_scene(scene):
+    pc_data, source_pc_path = build_slot_editor_pc_data(scene)
+    vehicle_name = scene.get("beamng_slot_editor_model", "") or source_pc_path.parent.name
+    edited_path = persistent_cache_dir() / "pc_editor" / "vehicles" / str(vehicle_name) / source_pc_path.name
+    edited_path.parent.mkdir(parents=True, exist_ok=True)
+    edited_path.write_text(json.dumps(pc_data, indent=2), encoding="utf-8")
+    return edited_path, source_pc_path
+
+
+def build_slot_editor_pc_data(scene):
     roots = find_beamng_import_collections(scene)
     if not roots:
         raise ValueError("No BeamNG import collection is available to reload")
@@ -343,11 +358,234 @@ def slot_editor_pc_data_from_scene(scene):
         else:
             parts[item.slot_name] = choice
 
+    return pc_data, source_pc_path
+
+
+def skip_jsonc_ws_comments(text, index):
+    length = len(text)
+    while index < length:
+        if text[index].isspace():
+            index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = length if newline == -1 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+            continue
+        break
+    return index
+
+
+def scan_jsonc_string(text, index):
+    quote = text[index]
+    index += 1
+    length = len(text)
+    escape = False
+    while index < length:
+        char = text[index]
+        if escape:
+            escape = False
+        elif char == "\\":
+            escape = True
+        elif char == quote:
+            return index + 1
+        index += 1
+    return length
+
+
+def scan_jsonc_identifier(text, index):
+    start = index
+    length = len(text)
+    while index < length and (text[index].isalnum() or text[index] in "_-$"):
+        index += 1
+    return text[start:index], index
+
+
+def find_matching_jsonc_brace(text, open_index):
+    pairs = {"{": "}", "[": "]"}
+    open_char = text[open_index]
+    close_char = pairs[open_char]
+    depth = 0
+    index = open_index
+    length = len(text)
+    while index < length:
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = length if newline == -1 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+            continue
+        char = text[index]
+        if char in {'"', "'"}:
+            index = scan_jsonc_string(text, index)
+            continue
+        if char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
+
+
+def find_jsonc_object_for_key(text, key):
+    index = 0
+    length = len(text)
+    while index < length:
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = length if newline == -1 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+            continue
+
+        char = text[index]
+        if char in {'"', "'"}:
+            end = scan_jsonc_string(text, index)
+            token = text[index + 1 : end - 1]
+            next_index = skip_jsonc_ws_comments(text, end)
+        elif char.isalpha() or char in "_$":
+            token, end = scan_jsonc_identifier(text, index)
+            next_index = skip_jsonc_ws_comments(text, end)
+        else:
+            index += 1
+            continue
+
+        if token == key and next_index < length and text[next_index] == ":":
+            object_index = skip_jsonc_ws_comments(text, next_index + 1)
+            if object_index < length and text[object_index] == "{":
+                object_end = find_matching_jsonc_brace(text, object_index)
+                if object_end != -1:
+                    return object_index, object_end + 1
+        index = end
+    return None
+
+
+def indent_multiline(text, indent):
+    lines = text.splitlines()
+    if not lines:
+        return text
+    return "\n".join(lines[:1] + [indent + line if line else line for line in lines[1:]])
+
+
+def text_indent_before_index(text, index):
+    line_start = text.rfind("\n", 0, index) + 1
+    return text[line_start:index].replace(text[line_start:index].lstrip(), "")
+
+
+def updated_pc_text_with_parts(original_text, pc_data):
+    parts = pc_data.get("parts")
+    if not isinstance(parts, dict):
+        raise ValueError("Edited .pc data does not contain a parts object")
+
+    bounds = find_jsonc_object_for_key(original_text, "parts")
+    if bounds is None:
+        raise ValueError("Could not locate a parts object in the source .pc file")
+
+    start, end = bounds
+    base_indent = text_indent_before_index(original_text, start)
+    serialized = json.dumps(parts, indent=2)
+    replacement = indent_multiline(serialized, base_indent)
+    return original_text[:start] + replacement + original_text[end:]
+
+
+def write_pc_parts_preserving_file(source_pc_path, pc_data):
+    original_text = Path(source_pc_path).read_text(encoding="utf-8-sig")
+    updated_text = updated_pc_text_with_parts(original_text, pc_data)
+    Path(source_pc_path).write_text(updated_text, encoding="utf-8")
+
+
+def write_pc_as_preserving_file(source_pc_path, destination_path, pc_data):
+    original_text = Path(source_pc_path).read_text(encoding="utf-8-sig")
+    updated_text = updated_pc_text_with_parts(original_text, pc_data)
+    Path(destination_path).write_text(updated_text, encoding="utf-8")
+
+
+def user_current_folder_from_preferences(context):
+    prefs = get_addon_preferences(context)
+    user_folder = prefs.beamng_user_folder if prefs else ""
+    if not user_folder:
+        return None
+    supplied = Path(user_folder)
+    return supplied if supplied.name.lower() == "current" else supplied / "current"
+
+
+def pc_save_virtual_path_for_scene(scene, source_pc_path=None):
+    roots = find_beamng_import_collections(scene)
+    root = roots[0] if roots else None
+    virtual_path = root.get("beamng_pc_virtual_path", "") if root else ""
+    if virtual_path:
+        return normalize_virtual_path(virtual_path)
+
+    source_pc_path = Path(source_pc_path or "")
     vehicle_name = scene.get("beamng_slot_editor_model", "") or source_pc_path.parent.name
-    edited_path = persistent_cache_dir() / "pc_editor" / "vehicles" / str(vehicle_name) / source_pc_path.name
-    edited_path.parent.mkdir(parents=True, exist_ok=True)
-    edited_path.write_text(json.dumps(pc_data, indent=2), encoding="utf-8")
-    return edited_path, source_pc_path
+    return normalize_virtual_path(Path("vehicles") / str(vehicle_name) / source_pc_path.name)
+
+
+def user_pc_path_for_virtual_path(context, virtual_path, filename=None):
+    current_folder = user_current_folder_from_preferences(context)
+    if current_folder is None:
+        raise ValueError("Set the BeamNG user folder in add-on preferences before saving .pc files")
+
+    virtual = Path(normalize_virtual_path(virtual_path))
+    if filename:
+        safe_name = Path(filename).name
+        if not safe_name.lower().endswith(".pc"):
+            safe_name += ".pc"
+        virtual = virtual.parent / safe_name
+    if not normalize_virtual_path(virtual).lower().startswith("vehicles/"):
+        virtual = Path("vehicles") / virtual
+    return current_folder / virtual
+
+
+def current_user_pc_source_path(context):
+    roots = find_beamng_import_collections(context.scene)
+    if not roots:
+        return None
+    root = roots[0]
+    source_pc_path = Path(root.get("beamng_pc_source_path", root.get("beamng_pc_path", "")))
+    current_folder = user_current_folder_from_preferences(context)
+    if current_folder is None or not source_pc_path.exists():
+        return None
+    try:
+        source_pc_path.relative_to(current_folder / "vehicles")
+    except ValueError:
+        return None
+    return source_pc_path
+
+
+def slot_editor_can_save_as(context):
+    return bool(getattr(context.scene, "beamng_slot_editor_items", None) and context.scene.get("beamng_slot_editor_dirty", False))
+
+
+def slot_editor_can_save(context):
+    return bool(slot_editor_can_save_as(context) and current_user_pc_source_path(context))
+
+
+def update_slot_editor_saved_source(scene, saved_path, virtual_path):
+    for root in find_beamng_import_collections(scene):
+        root["beamng_pc_source_path"] = str(saved_path)
+        root["beamng_pc_virtual_path"] = normalize_virtual_path(virtual_path)
+        root["beamng_pc_source_asset_type"] = "file"
+        root["beamng_pc_source_label_prefix"] = "User"
+        root["beamng_pc_source_zip_path"] = ""
+        root["beamng_pc_source_zip_entry"] = ""
+        root.name = f"BeamNG_{Path(saved_path).stem}"
+        break
+    scene["beamng_slot_editor_source_pc_path"] = str(saved_path)
+    scene["beamng_slot_editor_source_virtual_path"] = normalize_virtual_path(virtual_path)
+    scene["beamng_slot_editor_source_asset_type"] = "file"
+    scene["beamng_slot_editor_source_label_prefix"] = "User"
+    scene["beamng_slot_editor_source_zip_path"] = ""
+    scene["beamng_slot_editor_source_zip_entry"] = ""
 
 
 def resolve_selected_parts(pc_data, part_index, include_props=True):
@@ -1525,7 +1763,7 @@ class BEAMNG_OT_apply_slot_configuration(Operator):
         try:
             edited_pc_path, source_pc_path = slot_editor_pc_data_from_scene(context.scene)
             context.scene["beamng_slot_editor_source_pc_path"] = str(source_pc_path)
-            return import_beamng_pc_path(
+            result = import_beamng_pc_path(
                 context,
                 self,
                 edited_pc_path,
@@ -1535,6 +1773,9 @@ class BEAMNG_OT_apply_slot_configuration(Operator):
                 False,
                 f"Edited slot configuration from {source_pc_path}",
             )
+            if "FINISHED" in result:
+                context.scene["beamng_slot_editor_dirty"] = True
+            return result
         except Exception as exc:
             self.report({"ERROR"}, f"Failed to apply slot configuration: {exc}")
             return {"CANCELLED"}
@@ -1571,6 +1812,91 @@ class BEAMNG_OT_revert_slot_change(Operator):
             return {"CANCELLED"}
 
 
+class BEAMNG_OT_save_slot_configuration(Operator):
+    bl_idname = "beamng_pc_importer.save_slot_configuration"
+    bl_label = "Save PC"
+    bl_description = "Save changes back to the loaded user .pc file by replacing only its parts block"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return slot_editor_can_save(context)
+
+    def invoke(self, context, _event):
+        source_pc_path = current_user_pc_source_path(context)
+        if source_pc_path is None:
+            self.report({"WARNING"}, "Save is only available for .pc files loaded from user data")
+            return {"CANCELLED"}
+        return context.window_manager.invoke_confirm(self, _event)
+
+    def execute(self, context):
+        source_pc_path = current_user_pc_source_path(context)
+        if source_pc_path is None:
+            self.report({"WARNING"}, "Save is only available for .pc files loaded from user data")
+            return {"CANCELLED"}
+
+        try:
+            pc_data, _source = build_slot_editor_pc_data(context.scene)
+            write_pc_parts_preserving_file(source_pc_path, pc_data)
+            mark_slot_editor_saved(context.scene)
+            self.report({"INFO"}, f"Saved .pc parts to {source_pc_path}")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Failed to save .pc: {exc}")
+            return {"CANCELLED"}
+
+
+class BEAMNG_OT_save_as_slot_configuration(Operator):
+    bl_idname = "beamng_pc_importer.save_as_slot_configuration"
+    bl_label = "Save PC As..."
+    bl_description = "Save the edited configuration as a new user .pc file"
+    bl_options = {"REGISTER", "UNDO"}
+
+    config_name: StringProperty(
+        name="Configuration Name",
+        description="New .pc filename to create in the BeamNG user current/vehicles folder",
+        default="",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return slot_editor_can_save_as(context)
+
+    def invoke(self, context, _event):
+        roots = find_beamng_import_collections(context.scene)
+        root = roots[0] if roots else None
+        source_path = Path(root.get("beamng_pc_source_path", root.get("beamng_pc_path", ""))) if root else Path("config.pc")
+        self.config_name = source_path.stem
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, _context):
+        self.layout.prop(self, "config_name")
+
+    def execute(self, context):
+        if not self.config_name.strip():
+            self.report({"ERROR"}, "Enter a configuration name")
+            return {"CANCELLED"}
+
+        try:
+            pc_data, source_pc_path = build_slot_editor_pc_data(context.scene)
+            source_virtual_path = pc_save_virtual_path_for_scene(context.scene, source_pc_path)
+            destination_path = user_pc_path_for_virtual_path(context, source_virtual_path, self.config_name.strip())
+            if destination_path.exists():
+                self.report({"ERROR"}, f"Refusing to overwrite existing .pc: {destination_path}")
+                return {"CANCELLED"}
+
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            write_pc_as_preserving_file(source_pc_path, destination_path, pc_data)
+            relative_virtual = normalize_virtual_path(destination_path.relative_to(user_current_folder_from_preferences(context)))
+            update_slot_editor_saved_source(context.scene, destination_path, relative_virtual)
+            mark_slot_editor_saved(context.scene)
+            self.report({"INFO"}, f"Saved new .pc: {destination_path}")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Failed to save .pc as: {exc}")
+            return {"CANCELLED"}
+
+
 def draw_vehicle_slot_editor(layout, context):
     slot_items = getattr(context.scene, "beamng_slot_editor_items", [])
     box = layout.box()
@@ -1585,6 +1911,13 @@ def draw_vehicle_slot_editor(layout, context):
     row = box.row(align=True)
     row.operator(BEAMNG_OT_apply_slot_configuration.bl_idname, text="Apply / Reload")
     row.operator(BEAMNG_OT_revert_slot_change.bl_idname, text="Revert")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_save_slot_configuration.bl_idname, text="Save PC")
+    row.operator(BEAMNG_OT_save_as_slot_configuration.bl_idname, text="Save PC As...")
+
+    source_label = context.scene.get("beamng_slot_editor_source_pc_path", "")
+    if source_label:
+        box.label(text=f"Source: {Path(source_label).name}")
 
     expanded_by_path = {item.path: item.expanded for item in slot_items}
     for item in slot_items:
@@ -1798,6 +2131,7 @@ def import_beamng_pc_path(
     selectable_jbeam_debug=False,
     show_jbeam_node_labels=False,
     source_description="",
+    source_asset=None,
 ):
     wm = context.window_manager
     update_import_progress.last_percent = None
@@ -1904,8 +2238,31 @@ def import_beamng_pc_path(
         root_collection = link_collection(scene_root, root_collection_name)
         root_collection["beamng_pc_import_root"] = True
         root_collection["beamng_pc_path"] = str(pc_path)
-        root_collection["beamng_pc_source_path"] = context.scene.get("beamng_slot_editor_source_pc_path", str(pc_path))
+        if source_asset is not None:
+            source_pc_path = source_asset.path if source_asset.asset_type == "file" else str(pc_path)
+            source_virtual_path = source_asset.virtual_path
+            root_collection["beamng_pc_source_asset_type"] = source_asset.asset_type
+            root_collection["beamng_pc_source_label_prefix"] = source_asset.label_prefix
+            root_collection["beamng_pc_source_zip_path"] = source_asset.zip_path
+            root_collection["beamng_pc_source_zip_entry"] = source_asset.zip_entry
+        else:
+            source_pc_path = context.scene.get("beamng_slot_editor_source_pc_path", str(pc_path))
+            source_virtual_path = context.scene.get(
+                "beamng_slot_editor_source_virtual_path",
+                normalize_virtual_path(Path("vehicles") / pc_path.parent.name / pc_path.name),
+            )
+            root_collection["beamng_pc_source_asset_type"] = context.scene.get("beamng_slot_editor_source_asset_type", "file")
+            root_collection["beamng_pc_source_label_prefix"] = context.scene.get("beamng_slot_editor_source_label_prefix", "")
+            root_collection["beamng_pc_source_zip_path"] = context.scene.get("beamng_slot_editor_source_zip_path", "")
+            root_collection["beamng_pc_source_zip_entry"] = context.scene.get("beamng_slot_editor_source_zip_entry", "")
+        root_collection["beamng_pc_source_path"] = source_pc_path
+        root_collection["beamng_pc_virtual_path"] = normalize_virtual_path(source_virtual_path)
         context.scene["beamng_slot_editor_source_pc_path"] = root_collection["beamng_pc_source_path"]
+        context.scene["beamng_slot_editor_source_virtual_path"] = root_collection["beamng_pc_virtual_path"]
+        context.scene["beamng_slot_editor_source_asset_type"] = root_collection["beamng_pc_source_asset_type"]
+        context.scene["beamng_slot_editor_source_label_prefix"] = root_collection["beamng_pc_source_label_prefix"]
+        context.scene["beamng_slot_editor_source_zip_path"] = root_collection["beamng_pc_source_zip_path"]
+        context.scene["beamng_slot_editor_source_zip_entry"] = root_collection["beamng_pc_source_zip_entry"]
         template_collection = link_collection(scene_root, template_collection_name)
         template_collection.hide_viewport = True
         part_objects = build_part_hierarchy(resolved_parts, root_collection)
@@ -2048,15 +2405,23 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
     )
 
     def execute(self, context):
+        filepath = Path(self.filepath)
+        context.scene["beamng_slot_editor_source_pc_path"] = str(filepath)
+        context.scene["beamng_slot_editor_source_virtual_path"] = normalize_virtual_path(Path("vehicles") / filepath.parent.name / filepath.name)
+        context.scene["beamng_slot_editor_source_asset_type"] = "file"
+        context.scene["beamng_slot_editor_source_label_prefix"] = ""
+        context.scene["beamng_slot_editor_source_zip_path"] = ""
+        context.scene["beamng_slot_editor_source_zip_entry"] = ""
         return import_beamng_pc_path(
             context,
             self,
-            Path(self.filepath),
+            filepath,
             self.clear_existing,
             self.include_jbeam_visuals,
             self.selectable_jbeam_debug,
             self.show_jbeam_node_labels,
-            str(Path(self.filepath)),
+            str(filepath),
+            None,
         )
 
 
@@ -2208,6 +2573,12 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
             source_description = f"{source.zip_path} :: {source.zip_entry}"
         else:
             source_description = source.path
+        context.scene["beamng_slot_editor_source_pc_path"] = source.path if source.asset_type == "file" else str(pc_path)
+        context.scene["beamng_slot_editor_source_virtual_path"] = normalize_virtual_path(source.virtual_path)
+        context.scene["beamng_slot_editor_source_asset_type"] = source.asset_type
+        context.scene["beamng_slot_editor_source_label_prefix"] = source.label_prefix
+        context.scene["beamng_slot_editor_source_zip_path"] = source.zip_path
+        context.scene["beamng_slot_editor_source_zip_entry"] = source.zip_entry
         return import_beamng_pc_path(
             context,
             self,
@@ -2217,6 +2588,7 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
             self.selectable_jbeam_debug,
             self.show_jbeam_node_labels,
             source_description,
+            source,
         )
 
 
@@ -2291,6 +2663,8 @@ classes = (
     BEAMNG_OT_toggle_relationship_lines,
     BEAMNG_OT_apply_slot_configuration,
     BEAMNG_OT_revert_slot_change,
+    BEAMNG_OT_save_slot_configuration,
+    BEAMNG_OT_save_as_slot_configuration,
     VIEW3D_PT_beamng_pc_importer,
     SCENE_PT_beamng_configuration_editor,
     IMPORT_OT_beamng_pc,
