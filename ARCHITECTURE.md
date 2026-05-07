@@ -77,6 +77,7 @@ Object Mode:
 - Moving a part moves its owned JBeam structure and attached visual elements.
 - Flexbodies configured by that part must remain attached to the part, even if hidden, translucent, or non-selectable.
 - Beams that cross to other parts still belong to the part/file where they are defined.
+- Until the object-level part transform model is implemented, experimental editable JBeam mesh object transforms should be locked. Moving a whole mesh object also moves proxy/reference vertices, which makes cross-part references appear disconnected from their real owner nodes.
 
 Edit Mode:
 
@@ -93,7 +94,11 @@ The future editing representation should use Blender mesh principles:
 - Nodes as vertices.
 - Beams as edges.
 - Collision triangles as faces.
-- Hydros, sliders, special links, and external references as overlays or auxiliary reference data.
+- Hydros, sliders, rails, special links, and external references as overlays or auxiliary reference data.
+- Rail-locked or beam/rail-constrained nodes must be represented as positional constraints along their rail/beam, not as freely editable vertices.
+- Triangle winding order is meaningful because BeamNG collision triangles only collide from one side. The editor must preserve triangle node order, make face normals/direction visible, and warn before any operation flips or normalizes winding.
+- Mesh-native edge visibility should be preferred over separate legacy beam geometry. Duplicate Skin/Wireframe preview meshes were visually promising, but the live synchronization cost was too high during Edit Mode node movement and the approach is parked for now.
+- Experimental editable JBeam meshes should depth-test normally against flexbodies by default. X-ray/always-on-top display can be useful as an explicit inspection mode, but should not be the default authoring view because translucent collision faces appear to float over body geometry.
 
 This lets the editor use Blender's native selection and editing concepts while the internal resolved model remains authoritative.
 
@@ -143,6 +148,8 @@ Triangle, hydro, slider, prop, and flexbody panels should follow the same patter
 - Identity and ownership.
 - Referenced nodes/parts/assets.
 - Known parameters grouped by meaning.
+- Triangle winding/node order and derived collision normal direction for collision faces.
+- Rail/beam constraint data where nodes are locked to a position along a rail or beam.
 - Validation warnings.
 - Other unknown/unmodelled parameters.
 
@@ -184,6 +191,8 @@ Live validation:
 - Missing node references.
 - Duplicate node ids.
 - Beams/triangles/hydros/sliders referencing missing nodes.
+- Triangle winding changes that may flip one-sided collision direction.
+- Rail/beam-locked nodes whose stored position no longer lies on the referenced rail/beam.
 - Cross-part references highlighted clearly.
 - Invalid slot selections.
 
@@ -191,6 +200,7 @@ Export validation:
 
 - Dependency checks across dirty parts/files.
 - Deleted nodes still referenced elsewhere.
+- Collision triangle winding/order preserved or explicitly acknowledged when changed.
 - Required target paths are safe mod/user paths, not vanilla.
 - External references and tool metadata comments are coherent.
 - A report is generated for any questionable output.
@@ -206,4 +216,3 @@ The current visual modes remain useful:
 - One-way 3D View sync from the source viewport where sync was enabled.
 
 Future display work should allow independent view filters per 3D View without relying on heavy geometry where a lightweight mesh/overlay would work better.
-

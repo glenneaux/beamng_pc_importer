@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 31
+ADDON_BUILD = 46
 
 
 def addon_version_label():
@@ -2369,6 +2369,7 @@ def import_beamng_pc_path(
     include_jbeam_visuals=True,
     selectable_jbeam_debug=False,
     show_jbeam_node_labels=False,
+    create_experimental_jbeam_meshes_option=False,
     source_description="",
     source_asset=None,
 ):
@@ -2548,6 +2549,16 @@ def import_beamng_pc_path(
                 selectable_jbeam_debug,
                 show_jbeam_node_labels,
             )
+        experimental_mesh_count = 0
+        if create_experimental_jbeam_meshes_option:
+            experimental_mesh_count = create_experimental_jbeam_meshes(
+                visual_nodes,
+                visual_beams,
+                visual_triangles,
+                root_collection,
+                resolved_parts,
+            )
+            report_lines.append(f"Experimental JBeam mesh parts: {experimental_mesh_count}")
         vehicle_model = str(pc_data.get("model", ""))
 
         update_import_progress(context, 35, "cataloging DAE assets")
@@ -2672,6 +2683,19 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
         description="Create viewport text labels for selectable JBeam nodes",
         default=False,
     )
+    create_experimental_jbeam_meshes: BoolProperty(
+        name="Experimental JBeam Meshes",
+        description="Create one editable Blender mesh per resolved JBeam part using nodes as vertices, beams as edges, and triangles as faces",
+        default=False,
+    )
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.prop(self, "clear_existing")
+        layout.prop(self, "include_jbeam_visuals")
+        layout.prop(self, "selectable_jbeam_debug")
+        layout.prop(self, "show_jbeam_node_labels")
+        layout.prop(self, "create_experimental_jbeam_meshes")
 
     def execute(self, context):
         filepath = Path(self.filepath)
@@ -2689,6 +2713,7 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
             self.include_jbeam_visuals,
             self.selectable_jbeam_debug,
             self.show_jbeam_node_labels,
+            self.create_experimental_jbeam_meshes,
             str(filepath),
             None,
         )
@@ -2804,6 +2829,11 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
         description="Create viewport text labels for selectable JBeam nodes",
         default=False,
     )
+    create_experimental_jbeam_meshes: BoolProperty(
+        name="Experimental JBeam Meshes",
+        description="Create one editable Blender mesh per resolved JBeam part using nodes as vertices, beams as edges, and triangles as faces",
+        default=False,
+    )
 
     def invoke(self, context, _event):
         refresh_pc_source_options(context)
@@ -2827,6 +2857,7 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
         layout.prop(self, "include_jbeam_visuals")
         layout.prop(self, "selectable_jbeam_debug")
         layout.prop(self, "show_jbeam_node_labels")
+        layout.prop(self, "create_experimental_jbeam_meshes")
 
     def execute(self, context):
         source = PC_SOURCE_BY_KEY.get(self.pc_config_key)
@@ -2856,6 +2887,7 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
             self.include_jbeam_visuals,
             self.selectable_jbeam_debug,
             self.show_jbeam_node_labels,
+            self.create_experimental_jbeam_meshes,
             source_description,
             source,
         )

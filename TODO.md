@@ -9,7 +9,7 @@ Use this as a parking place for ideas, concepts, bugs, and things to revisit.
 
 ## Ideas
 
-- 
+- Parked experimental JBeam beam preview: duplicating the JBeam mesh and using a Skin or Wireframe modifier produced excellent beam visibility while preserving translucent triangle faces, but live coupling/synchronization was too slow during Edit Mode node movement. Revisit later with a lighter overlay strategy, GPU draw handler, or deferred/topology-aware sync that does not rebuild modifier-backed mesh data while dragging.
 
 ## Bugs / Fixes
 

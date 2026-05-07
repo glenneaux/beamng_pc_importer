@@ -1,4 +1,5 @@
 import colorsys
+import json
 import tempfile
 import zipfile
 from pathlib import Path
@@ -67,6 +68,7 @@ def get_or_create_translucent_material(name, color, alpha=0.24):
     material = get_or_create_material(name, (color[0], color[1], color[2], alpha))
     material.use_nodes = True
     material.blend_method = "BLEND"
+    material.use_screen_refraction = True
     material.show_transparent_back = True
     material.diffuse_color = (color[0], color[1], color[2], alpha)
     bsdf = material.node_tree.nodes.get("Principled BSDF") if material.node_tree else None
@@ -75,6 +77,27 @@ def get_or_create_translucent_material(name, color, alpha=0.24):
             bsdf.inputs["Alpha"].default_value = alpha
         if "Base Color" in bsdf.inputs:
             bsdf.inputs["Base Color"].default_value = (color[0], color[1], color[2], alpha)
+    return material
+
+
+def get_or_create_jbeam_mesh_material(name, color):
+    material = get_or_create_translucent_material(name, color, 0.46)
+    material.use_nodes = True
+    material.blend_method = "BLEND"
+    material.show_transparent_back = True
+    material.diffuse_color = (color[0], color[1], color[2], 0.46)
+    return material
+
+
+def get_or_create_jbeam_edge_material(name, color):
+    wire_color = (
+        min(color[0] * 1.18 + 0.08, 1.0),
+        min(color[1] * 1.18 + 0.08, 1.0),
+        min(color[2] * 1.18 + 0.08, 1.0),
+        1.0,
+    )
+    material = get_or_create_material(name, wire_color)
+    material.diffuse_color = wire_color
     return material
 
 
@@ -601,6 +624,163 @@ def create_jbeam_visuals(
 
     visual_collection.hide_viewport = True
     return visual_collection
+
+
+def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection, resolved_parts=None):
+    mesh_collection = link_collection(parent_collection, "Experimental JBeam Meshes")
+    mesh_collection["beamng_layer"] = "jbeam_mesh"
+    mesh_collection["beamng_visual_type"] = "experimental_jbeam_meshes"
+
+    part_labels = {}
+    parent_part_ids = {}
+    part_sources = {}
+    for resolved_part in resolved_parts or []:
+        part_labels[resolved_part.id] = (
+            f"{resolved_part.id:03d}_{resolved_part.slot_name}__{resolved_part.part_def.name}"
+            if resolved_part.slot_name
+            else f"{resolved_part.id:03d}_{resolved_part.part_def.name}"
+        )
+        parent_part_ids[resolved_part.id] = resolved_part.parent_id
+        part_sources[resolved_part.id] = str(resolved_part.part_def.source_path)
+
+    nodes_by_part = defaultdict(list)
+    beams_by_part = defaultdict(list)
+    triangles_by_part = defaultdict(list)
+    part_names = {}
+    node_owner_part_ids = defaultdict(set)
+    for node in nodes:
+        nodes_by_part[node.resolved_part_id].append(node)
+        part_names[node.resolved_part_id] = node.part_name
+        node_owner_part_ids[str(node.name)].add(node.resolved_part_id)
+    for beam in beams:
+        beams_by_part[beam.resolved_part_id].append(beam)
+        part_names[beam.resolved_part_id] = beam.part_name
+    for triangle in triangles:
+        triangles_by_part[triangle.resolved_part_id].append(triangle)
+        part_names[triangle.resolved_part_id] = triangle.part_name
+
+    created = 0
+    for resolved_part_id in sorted(set(nodes_by_part) | set(beams_by_part) | set(triangles_by_part)):
+        part_name = part_names.get(resolved_part_id, "")
+        label = part_labels.get(resolved_part_id, f"{resolved_part_id:03d}_{part_name}")
+        color = color_for_resolved_part(resolved_part_id)
+        local_node_ids = {node.name for node in nodes_by_part.get(resolved_part_id, [])}
+        vertex_positions = []
+        vertex_node_ids = []
+        vertex_kinds = []
+        vertex_owner_part_ids = []
+        vertex_index_by_node_id = {}
+
+        def ensure_vertex(node_id, position):
+            node_id = str(node_id)
+            if node_id in vertex_index_by_node_id:
+                return vertex_index_by_node_id[node_id]
+            vertex_index = len(vertex_positions)
+            vertex_index_by_node_id[node_id] = vertex_index
+            vertex_positions.append(tuple(position))
+            vertex_node_ids.append(node_id)
+            if node_id in local_node_ids:
+                owner_part_id = resolved_part_id
+                vertex_kind = "owned"
+            else:
+                owner_ids = sorted(part_id for part_id in node_owner_part_ids.get(node_id, set()) if part_id != resolved_part_id)
+                owner_part_id = owner_ids[0] if owner_ids else -1
+                vertex_kind = "proxy"
+            vertex_kinds.append(vertex_kind)
+            vertex_owner_part_ids.append(owner_part_id)
+            return vertex_index
+
+        for node in nodes_by_part.get(resolved_part_id, []):
+            ensure_vertex(node.name, node.position)
+
+        edges = []
+        edge_ids = []
+        seen_edges = set()
+        for beam in beams_by_part.get(resolved_part_id, []):
+            v1 = ensure_vertex(beam.id1, beam.start)
+            v2 = ensure_vertex(beam.id2, beam.end)
+            if v1 == v2:
+                continue
+            edge_key = tuple(sorted((v1, v2)))
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            edges.append((v1, v2))
+            edge_ids.append((beam.id1, beam.id2))
+
+        faces = []
+        face_ids = []
+        for triangle in triangles_by_part.get(resolved_part_id, []):
+            face = (
+                ensure_vertex(triangle.id1, triangle.p1),
+                ensure_vertex(triangle.id2, triangle.p2),
+                ensure_vertex(triangle.id3, triangle.p3),
+            )
+            if len(set(face)) < 3:
+                continue
+            faces.append(face)
+            face_ids.append((triangle.id1, triangle.id2, triangle.id3))
+
+        if not vertex_positions:
+            continue
+
+        mesh = bpy.data.meshes.new(f"Experimental_JBeam_Mesh_{safe_collection_name(label)}")
+        mesh.from_pydata(vertex_positions, edges, faces)
+        mesh.update()
+        mesh["beamng_node_ids_json"] = json.dumps(vertex_node_ids)
+        mesh["beamng_node_kinds_json"] = json.dumps(vertex_kinds)
+        mesh["beamng_node_owner_part_ids_json"] = json.dumps(vertex_owner_part_ids)
+        mesh["beamng_edge_node_ids_json"] = json.dumps(edge_ids)
+        mesh["beamng_face_node_ids_json"] = json.dumps(face_ids)
+        if hasattr(mesh, "attributes"):
+            owner_attr = mesh.attributes.new("beamng_owner_part_id", "INT", "POINT")
+            proxy_attr = mesh.attributes.new("beamng_is_proxy_node", "BOOLEAN", "POINT")
+            color_attr = mesh.attributes.new("beamng_node_color", "FLOAT_COLOR", "POINT")
+            for index, owner_part_id in enumerate(vertex_owner_part_ids):
+                owner_attr.data[index].value = owner_part_id
+                proxy_attr.data[index].value = vertex_kinds[index] == "proxy"
+                owner_color = color_for_resolved_part(owner_part_id)
+                color_attr.data[index].color = owner_color
+
+        obj = bpy.data.objects.new(f"JBeam Mesh {label}", mesh)
+        obj["beamng_layer"] = "jbeam_mesh"
+        obj["beamng_visual_type"] = "experimental_jbeam_mesh"
+        obj["beamng_part_name"] = part_name
+        obj["beamng_resolved_part_id"] = resolved_part_id
+        obj["beamng_parent_resolved_part_id"] = parent_part_ids.get(resolved_part_id, -1)
+        obj["beamng_jbeam_path"] = part_sources.get(resolved_part_id, "")
+        obj["beamng_owned_node_count"] = sum(1 for kind in vertex_kinds if kind == "owned")
+        obj["beamng_proxy_node_count"] = sum(1 for kind in vertex_kinds if kind == "proxy")
+        obj["beamng_beam_edge_count"] = len(edges)
+        obj["beamng_triangle_face_count"] = len(faces)
+        obj["beamng_object_transform_locked"] = True
+        obj.display_type = "TEXTURED"
+        obj.show_in_front = False
+        obj.show_wire = True
+        obj.lock_location = (True, True, True)
+        obj.lock_rotation = (True, True, True)
+        obj.lock_scale = (True, True, True)
+        obj.color = color
+        mesh.materials.append(get_or_create_jbeam_mesh_material(f"Experimental JBeam Mesh Part {resolved_part_id:03d}", color))
+        mesh.materials.append(get_or_create_jbeam_edge_material(f"Experimental JBeam Mesh Part {resolved_part_id:03d} Edges", color))
+        mesh_collection.objects.link(obj)
+        owned_group = obj.vertex_groups.new(name="Owned Nodes")
+        proxy_group = obj.vertex_groups.new(name="Proxy Nodes")
+        proxy_groups_by_owner = {}
+        for vertex_index, (kind, owner_part_id) in enumerate(zip(vertex_kinds, vertex_owner_part_ids)):
+            if kind == "owned":
+                owned_group.add([vertex_index], 1.0, "ADD")
+            else:
+                proxy_group.add([vertex_index], 1.0, "ADD")
+                owner_group = proxy_groups_by_owner.get(owner_part_id)
+                if owner_group is None:
+                    owner_group = obj.vertex_groups.new(name=f"Proxy Nodes From Part {owner_part_id:03d}")
+                    proxy_groups_by_owner[owner_part_id] = owner_group
+                owner_group.add([vertex_index], 1.0, "ADD")
+
+        created += 1
+
+    return created
 
 
 def tag_mesh_data(mesh_data, part_name: str, jbeam_path: Path, vehicle_model: str, editing_enabled: bool):
