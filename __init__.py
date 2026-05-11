@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 46
+ADDON_BUILD = 83
 
 
 def addon_version_label():
@@ -30,6 +30,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ImportHelper
@@ -295,6 +296,16 @@ class BeamNGSlotEditorItem(PropertyGroup):
     has_children: BoolProperty(default=False)
     expanded: BoolProperty(default=True)
     choice: EnumProperty(name="Part", items=slot_choice_items, update=slot_choice_updated)
+
+
+class BeamNGJBeamExportFileItem(PropertyGroup):
+    include: BoolProperty(name="Export", default=True)
+    virtual_path: StringProperty(default="")
+    source_file: StringProperty(default="")
+    label: StringProperty(default="")
+    parts_label: StringProperty(default="")
+    planned_target_path: StringProperty(default="")
+    node_update_count: IntProperty(default=0)
 
 
 def populate_vehicle_slot_editor(scene, pc_data, part_index):
@@ -642,6 +653,7 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
         global_components = merge_component_context(global_components, extract_component_context(resolved_part.part_def.data))
 
     resolved_node_positions = []
+    resolved_node_options = []
     global_node_positions = {}
     resolved_component_contexts = []
     for resolved_part in resolved_parts:
@@ -655,7 +667,12 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
             resolved_part.transform_matrix,
             component_context,
         )
+        local_node_options = parse_node_options(
+            resolved_part.part_def,
+            component_context,
+        )
         resolved_node_positions.append(local_node_positions)
+        resolved_node_options.append(local_node_options)
         for name, position in local_node_positions.items():
             global_node_positions.setdefault(name, position)
 
@@ -675,6 +692,7 @@ def resolve_selected_parts(pc_data, part_index, include_props=True):
                     position=position,
                     part_name=resolved_part.part_def.name,
                     resolved_part_id=resolved_part.id,
+                    options=resolved_node_options[index].get(node_name, {}),
                 )
             )
         visual_beams.extend(
@@ -915,8 +933,95 @@ def set_import_layer_visibility(root_collection, show_meshes=True, show_props=Tr
             child.hide_render = not show_jbeam
 
 
-def selected_jbeam_part_id(context):
+def selected_active_object(context):
     active = context.active_object
+    if not active:
+        return None
+    if getattr(context, "edit_object", None) is active:
+        return active
+    try:
+        if not active.select_get():
+            return None
+    except ReferenceError:
+        return None
+    return active
+
+
+def active_experimental_jbeam_mesh(context):
+    for obj in (
+        getattr(context, "edit_object", None),
+        getattr(context, "object", None),
+        getattr(context, "active_object", None),
+    ):
+        if obj and obj.type == "MESH" and obj.get("beamng_visual_type") == "experimental_jbeam_mesh":
+            return obj
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj and obj.type == "MESH" and obj.get("beamng_visual_type") == "experimental_jbeam_mesh":
+            return obj
+    for obj in getattr(context.scene, "objects", []) or []:
+        if (
+            obj
+            and obj.type == "MESH"
+            and obj.mode == "EDIT"
+            and obj.get("beamng_visual_type") == "experimental_jbeam_mesh"
+        ):
+            return obj
+    return None
+
+
+def active_object_debug_label(context):
+    obj = getattr(context, "edit_object", None) or getattr(context, "object", None) or getattr(context, "active_object", None)
+    if obj is None:
+        return "Active object: none"
+    return (
+        f"Active object: {obj.name} / {obj.type} / "
+        f"{obj.get('beamng_visual_type', '(no BeamNG visual type)')}"
+    )
+
+
+def experimental_jbeam_panel_redraw_timer():
+    try:
+        has_edit_mesh = any(
+            obj.type == "MESH"
+            and obj.mode == "EDIT"
+            and obj.get("beamng_visual_type") == "experimental_jbeam_mesh"
+            for obj in bpy.data.objects
+        )
+        if has_edit_mesh:
+            for window in bpy.context.window_manager.windows:
+                screen = window.screen
+                for area in screen.areas:
+                    if area.type == "VIEW_3D":
+                        area.tag_redraw()
+            return 0.25
+    except Exception:
+        return 1.0
+    return 1.0
+
+
+def reset_jbeam_edit_session(scene):
+    scene["beamng_jbeam_operation_history_json"] = json.dumps([])
+    scene["beamng_jbeam_operation_history_count"] = 0
+    scene["beamng_jbeam_pending_node_moves_json"] = json.dumps([])
+    scene["beamng_jbeam_pending_node_move_count"] = 0
+    scene["beamng_jbeam_pending_topology_change_count"] = 0
+    scene["beamng_jbeam_restored_proxy_move_count"] = 0
+    scene["beamng_jbeam_dirty"] = False
+    for obj in scene.objects:
+        if obj.type == "MESH" and obj.get("beamng_visual_type") == "experimental_jbeam_mesh":
+            obj.data["beamng_node_move_changes_json"] = json.dumps([])
+            obj["beamng_dirty_node_move_count"] = 0
+            obj["beamng_dirty_topology_change_count"] = 0
+
+
+@persistent
+def clear_jbeam_edit_sessions_on_load(_dummy):
+    for scene in bpy.data.scenes:
+        reset_jbeam_edit_session(scene)
+
+
+def selected_jbeam_part_id(context):
+    active = selected_active_object(context)
     if not active or active.get("beamng_layer") != "jbeam":
         return None
     part_id = active.get("beamng_resolved_part_id")
@@ -1171,6 +1276,3088 @@ def jbeam_referenced_part_ids_for_objects(root_collection, source_part_id, objec
     return jbeam_referenced_part_ids_for_node_ids(root_collection, source_part_id, node_ids)
 
 
+def experimental_jbeam_mesh_objects(scene, active_only=False):
+    active = selected_active_object(bpy.context)
+    if active_only and active and active.get("beamng_visual_type") == "experimental_jbeam_mesh":
+        return [active]
+    return [
+        obj
+        for obj in scene.objects
+        if obj.type == "MESH" and obj.get("beamng_visual_type") == "experimental_jbeam_mesh"
+    ]
+
+
+def read_experimental_mesh_vertices(obj):
+    mesh = obj.data
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.verts.index_update()
+        return edit_mesh, [vertex.co.copy() for vertex in edit_mesh.verts]
+    return None, [vertex.co.copy() for vertex in mesh.vertices]
+
+
+def set_experimental_mesh_vertex(edit_mesh, mesh, index, position):
+    if edit_mesh is not None:
+        edit_mesh.verts[index].co = position
+        import bmesh
+
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    else:
+        mesh.vertices[index].co = position
+        mesh.update()
+
+
+def selected_experimental_jbeam_vertex_indices(obj):
+    if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        return []
+    mesh = obj.data
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.verts.index_update()
+        return [vertex.index for vertex in edit_mesh.verts if vertex.select]
+    return [vertex.index for vertex in mesh.vertices if vertex.select]
+
+
+def selected_experimental_jbeam_edge_indices(obj):
+    if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        return []
+    mesh = obj.data
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.edges.ensure_lookup_table()
+        edit_mesh.edges.index_update()
+        return [edge.index for edge in edit_mesh.edges if edge.select]
+    return [edge.index for edge in mesh.edges if edge.select]
+
+
+def selected_experimental_jbeam_face_indices(obj):
+    if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        return []
+    mesh = obj.data
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.faces.ensure_lookup_table()
+        edit_mesh.faces.index_update()
+        return [face.index for face in edit_mesh.faces if face.select]
+        return [polygon.index for polygon in mesh.polygons if polygon.select]
+
+
+def mesh_json_list(mesh, key, fallback=None):
+    fallback = [] if fallback is None else fallback
+    try:
+        value = json.loads(mesh.get(key, "[]"))
+    except (TypeError, json.JSONDecodeError):
+        return list(fallback)
+    return value if isinstance(value, list) else list(fallback)
+
+
+def mesh_json_dict(mesh, key, fallback=None):
+    fallback = {} if fallback is None else fallback
+    try:
+        value = json.loads(mesh.get(key, "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return dict(fallback)
+    return value if isinstance(value, dict) else dict(fallback)
+
+
+def default_new_jbeam_node_params(scene):
+    params = {}
+    node_weight = str(getattr(scene, "beamng_jbeam_node_weight", "") or "").strip()
+    node_material = str(getattr(scene, "beamng_jbeam_node_material", "") or "").strip()
+    node_group = str(getattr(scene, "beamng_jbeam_node_group", "") or "").strip()
+    friction = str(getattr(scene, "beamng_jbeam_node_friction", "") or "").strip()
+    if node_weight:
+        params["nodeWeight"] = node_weight
+    if node_material:
+        params["nodeMaterial"] = node_material
+    if node_group:
+        params["group"] = node_group
+    if friction:
+        params["frictionCoef"] = friction
+    if getattr(scene, "beamng_jbeam_node_collision_override", False):
+        params["collision"] = bool(getattr(scene, "beamng_jbeam_node_collision", True))
+    if getattr(scene, "beamng_jbeam_node_self_collision_override", False):
+        params["selfCollision"] = bool(getattr(scene, "beamng_jbeam_node_self_collision", False))
+    return params
+
+
+def ensure_experimental_mesh_identity(obj, scene=None, allow_write=True):
+    if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        return {}
+
+    mesh = obj.data
+    _edit_mesh, current_positions = read_experimental_mesh_vertices(obj)
+    vertex_count = len(current_positions)
+    node_ids = [str(node_id) for node_id in mesh_json_list(mesh, "beamng_node_ids_json")]
+    node_kinds = [str(kind or "owned") for kind in mesh_json_list(mesh, "beamng_node_kinds_json")]
+    owner_part_ids = mesh_json_list(mesh, "beamng_node_owner_part_ids_json")
+    original_positions = mesh_json_list(mesh, "beamng_original_node_positions_json")
+    generated_flags = [bool(value) for value in mesh_json_list(mesh, "beamng_node_generated_flags_json")]
+    committed_flags = [bool(value) for value in mesh_json_list(mesh, "beamng_node_committed_flags_json")]
+    node_params = mesh_json_list(mesh, "beamng_node_params_json")
+    committed_node_params = mesh_json_list(mesh, "beamng_node_committed_params_json")
+
+    existing_count = len(node_ids)
+    while len(node_kinds) < existing_count:
+        node_kinds.append("owned")
+    while len(owner_part_ids) < existing_count:
+        owner_part_ids.append(int(obj.get("beamng_resolved_part_id", -1)))
+    while len(original_positions) < existing_count:
+        index = len(original_positions)
+        position = current_positions[index] if index < vertex_count else (0, 0, 0)
+        original_positions.append(rounded_position_list(position))
+    while len(generated_flags) < existing_count:
+        generated_flags.append(False)
+    while len(committed_flags) < existing_count:
+        committed_flags.append(True)
+    while len(node_params) < existing_count:
+        node_params.append({})
+    while len(committed_node_params) < existing_count:
+        committed_node_params.append({})
+
+    if vertex_count < len(node_ids):
+        node_ids = node_ids[:vertex_count]
+        node_kinds = node_kinds[:vertex_count]
+        owner_part_ids = owner_part_ids[:vertex_count]
+        original_positions = original_positions[:vertex_count]
+        generated_flags = generated_flags[:vertex_count]
+        committed_flags = committed_flags[:vertex_count]
+        node_params = node_params[:vertex_count]
+        committed_node_params = committed_node_params[:vertex_count]
+
+    existing_ids = set(node_ids)
+    resolved_part_id = int(obj.get("beamng_resolved_part_id", -1))
+    default_params = default_new_jbeam_node_params(scene) if scene is not None else {}
+    for index in range(len(node_ids), vertex_count):
+        node_id = generated_jbeam_node_id(obj.get("beamng_part_name", ""), index, existing_ids)
+        existing_ids.add(node_id)
+        node_ids.append(node_id)
+        node_kinds.append("owned")
+        owner_part_ids.append(resolved_part_id)
+        original_positions.append(rounded_position_list(current_positions[index]))
+        generated_flags.append(True)
+        committed_flags.append(False)
+        node_params.append(dict(default_params))
+        committed_node_params.append({})
+
+    if allow_write:
+        mesh["beamng_node_ids_json"] = json.dumps(node_ids)
+        mesh["beamng_node_kinds_json"] = json.dumps(node_kinds)
+        mesh["beamng_node_owner_part_ids_json"] = json.dumps(owner_part_ids)
+        mesh["beamng_original_node_positions_json"] = json.dumps(original_positions)
+        mesh["beamng_node_generated_flags_json"] = json.dumps(generated_flags)
+        mesh["beamng_node_committed_flags_json"] = json.dumps(committed_flags)
+        mesh["beamng_node_params_json"] = json.dumps(node_params)
+        mesh["beamng_node_committed_params_json"] = json.dumps(committed_node_params)
+    return {
+        "node_ids": node_ids,
+        "node_kinds": node_kinds,
+        "owner_part_ids": owner_part_ids,
+        "original_positions": original_positions,
+        "generated_flags": generated_flags,
+        "committed_flags": committed_flags,
+        "node_params": node_params,
+        "committed_node_params": committed_node_params,
+        "current_positions": current_positions,
+    }
+
+
+def selected_experimental_jbeam_edge_node_keys(obj):
+    identity = ensure_experimental_mesh_identity(obj)
+    node_ids = identity.get("node_ids", [])
+    keys = []
+    if not node_ids:
+        return keys
+    mesh = obj.data
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.verts.index_update()
+        edit_mesh.edges.ensure_lookup_table()
+        for edge in edit_mesh.edges:
+            if not edge.select:
+                continue
+            indices = [vertex.index for vertex in edge.verts]
+            if len(indices) == 2 and all(0 <= index < len(node_ids) for index in indices):
+                keys.append(edge_key((node_ids[indices[0]], node_ids[indices[1]])))
+    else:
+        for edge in mesh.edges:
+            if not edge.select:
+                continue
+            indices = list(edge.vertices)
+            if len(indices) == 2 and all(0 <= index < len(node_ids) for index in indices):
+                keys.append(edge_key((node_ids[indices[0]], node_ids[indices[1]])))
+    return keys
+
+
+def experimental_jbeam_node_info_for_selection(context, limit=6):
+    obj = active_experimental_jbeam_mesh(context)
+    if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        return []
+    mesh = obj.data
+    identity = ensure_experimental_mesh_identity(obj, context.scene, allow_write=False)
+    if not identity:
+        return []
+    node_ids = identity["node_ids"]
+    node_kinds = identity["node_kinds"]
+    owner_part_ids = identity["owner_part_ids"]
+    baseline_positions = identity["original_positions"]
+    generated_flags = identity["generated_flags"]
+    committed_flags = identity["committed_flags"]
+    node_params = identity["node_params"]
+    committed_node_params = identity["committed_node_params"]
+    pending_changes = mesh_json_list(mesh, "beamng_node_move_changes_json")
+
+    selected_indices = selected_experimental_jbeam_vertex_indices(obj)
+    if not selected_indices:
+        return []
+
+    _edit_mesh, current_positions = read_experimental_mesh_vertices(obj)
+    pending_by_index = {
+        int(change.get("vertex_index", -1)): change
+        for change in pending_changes
+        if str(change.get("vertex_index", "")).lstrip("-").isdigit()
+    }
+    accepted_by_node = {}
+    for operation in jbeam_operation_history(context.scene):
+        if operation.get("source_object") == obj.name and operation.get("field") == "position":
+            accepted_by_node[str(operation.get("row", ""))] = operation
+
+    infos = []
+    for vertex_index in selected_indices[:limit]:
+        if vertex_index >= len(node_ids) or vertex_index >= len(current_positions):
+            continue
+        node_id = str(node_ids[vertex_index])
+        kind = node_kinds[vertex_index] if vertex_index < len(node_kinds) else ""
+        owner_part_id = owner_part_ids[vertex_index] if vertex_index < len(owner_part_ids) else -1
+        baseline = baseline_positions[vertex_index] if vertex_index < len(baseline_positions) else []
+        current = rounded_position_list(current_positions[vertex_index])
+        pending = pending_by_index.get(vertex_index)
+        accepted = accepted_by_node.get(node_id)
+        infos.append(
+            {
+                "node_id": node_id,
+                "kind": kind,
+                "owner_part_id": owner_part_id,
+                "vertex_index": vertex_index,
+                "current_position": current,
+                "baseline_position": rounded_position_list(baseline) if len(baseline) == 3 else [],
+                "pending_position": pending.get("new") if pending else [],
+                "accepted_position": accepted.get("new") if accepted else [],
+                "generated": bool(generated_flags[vertex_index]) if vertex_index < len(generated_flags) else False,
+                "committed": bool(committed_flags[vertex_index]) if vertex_index < len(committed_flags) else True,
+                "params": node_params[vertex_index] if vertex_index < len(node_params) and isinstance(node_params[vertex_index], dict) else {},
+                "committed_params": committed_node_params[vertex_index] if vertex_index < len(committed_node_params) and isinstance(committed_node_params[vertex_index], dict) else {},
+                "source_file": obj.get("beamng_jbeam_path", ""),
+                "part": obj.get("beamng_part_name", ""),
+            }
+        )
+    return infos
+
+
+def experimental_jbeam_edge_info_for_selection(context, limit=6):
+    obj = active_experimental_jbeam_mesh(context)
+    if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        return []
+    edge_node_ids, _faces = read_experimental_mesh_topology(obj, allow_identity_write=False)
+    edge_params = mesh_json_list(obj.data, "beamng_edge_params_json")
+    committed_edge_params = mesh_json_list(obj.data, "beamng_edge_committed_params_json")
+    infos = []
+    for edge_index in selected_experimental_jbeam_edge_indices(obj)[:limit]:
+        if edge_index >= len(edge_node_ids):
+            continue
+        ids = edge_node_ids[edge_index]
+        if not isinstance(ids, (list, tuple)) or len(ids) < 2:
+            continue
+        infos.append(
+            {
+                "edge_index": edge_index,
+                "id1": str(ids[0]),
+                "id2": str(ids[1]),
+                "params": edge_params[edge_index] if edge_index < len(edge_params) and isinstance(edge_params[edge_index], dict) else {},
+                "committed_params": committed_edge_params[edge_index] if edge_index < len(committed_edge_params) and isinstance(committed_edge_params[edge_index], dict) else {},
+                "part": obj.get("beamng_part_name", ""),
+                "source_file": obj.get("beamng_jbeam_path", ""),
+            }
+        )
+    return infos
+
+
+def experimental_jbeam_face_info_for_selection(context, limit=6):
+    obj = active_experimental_jbeam_mesh(context)
+    if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        return []
+    _edges, face_node_ids = read_experimental_mesh_topology(obj, allow_identity_write=False)
+    face_params = mesh_json_list(obj.data, "beamng_face_params_json")
+    committed_face_params = mesh_json_list(obj.data, "beamng_face_committed_params_json")
+    infos = []
+    for face_index in selected_experimental_jbeam_face_indices(obj)[:limit]:
+        if face_index >= len(face_node_ids):
+            continue
+        ids = face_node_ids[face_index]
+        if not isinstance(ids, (list, tuple)) or len(ids) < 3:
+            continue
+        infos.append(
+            {
+                "face_index": face_index,
+                "id1": str(ids[0]),
+                "id2": str(ids[1]),
+                "id3": str(ids[2]),
+                "params": face_params[face_index] if face_index < len(face_params) and isinstance(face_params[face_index], dict) else {},
+                "committed_params": committed_face_params[face_index] if face_index < len(committed_face_params) and isinstance(committed_face_params[face_index], dict) else {},
+                "part": obj.get("beamng_part_name", ""),
+                "source_file": obj.get("beamng_jbeam_path", ""),
+            }
+        )
+    return infos
+
+
+def read_experimental_mesh_topology(obj, allow_identity_write=True):
+    mesh = obj.data
+    identity = ensure_experimental_mesh_identity(obj, allow_write=allow_identity_write)
+    node_ids = identity.get("node_ids", [])
+    if not node_ids:
+        return [], []
+
+    edges = []
+    faces = []
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.verts.index_update()
+        edit_mesh.edges.ensure_lookup_table()
+        edit_mesh.edges.index_update()
+        edit_mesh.faces.ensure_lookup_table()
+        edit_mesh.faces.index_update()
+        for edge in edit_mesh.edges:
+            indices = [vertex.index for vertex in edge.verts]
+            if len(indices) == 2 and all(0 <= index < len(node_ids) for index in indices):
+                edges.append((node_ids[indices[0]], node_ids[indices[1]]))
+        for face in edit_mesh.faces:
+            indices = [vertex.index for vertex in face.verts]
+            if len(indices) == 3 and all(0 <= index < len(node_ids) for index in indices):
+                faces.append(tuple(node_ids[index] for index in indices))
+    else:
+        for edge in mesh.edges:
+            indices = list(edge.vertices)
+            if len(indices) == 2 and all(0 <= index < len(node_ids) for index in indices):
+                edges.append((node_ids[indices[0]], node_ids[indices[1]]))
+        for polygon in mesh.polygons:
+            indices = list(polygon.vertices)
+            if len(indices) == 3 and all(0 <= index < len(node_ids) for index in indices):
+                faces.append(tuple(node_ids[index] for index in indices))
+    return edges, faces
+
+
+def edge_key(edge):
+    return tuple(sorted(str(node_id) for node_id in edge[:2]))
+
+
+def face_key(face):
+    return tuple(str(node_id) for node_id in face[:3])
+
+
+def generated_jbeam_node_id(part_name, vertex_index, existing_ids):
+    stem = re.sub(r"[^A-Za-z0-9_]+", "_", str(part_name or "node")).strip("_") or "node"
+    candidate = f"{stem}_new_{vertex_index}"
+    suffix = 1
+    existing = {str(node_id) for node_id in existing_ids}
+    while candidate in existing:
+        suffix += 1
+        candidate = f"{stem}_new_{vertex_index}_{suffix}"
+    return candidate
+
+
+JBEAM_POSITION_PRECISION = 3
+
+
+def rounded_position_list(position, precision=JBEAM_POSITION_PRECISION):
+    return [round(float(value), precision) for value in position]
+
+
+def rounded_position_vector(position, precision=JBEAM_POSITION_PRECISION):
+    return Vector(rounded_position_list(position, precision))
+
+
+def formatted_jbeam_position_number(value, precision=JBEAM_POSITION_PRECISION):
+    rounded = round(float(value), precision)
+    if rounded == 0:
+        rounded = 0.0
+    return f"{rounded:.{precision}f}"
+
+
+def coerce_jbeam_param_value(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if text.lower() == "true":
+        return True
+    if text.lower() == "false":
+        return False
+    try:
+        if text and re.fullmatch(r"[-+]?\d+", text):
+            return int(text)
+        if text and re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?", text):
+            return float(text)
+    except ValueError:
+        pass
+    return text
+
+
+def selected_node_params_from_scene(scene):
+    params = {}
+    for attr, key in (
+        ("beamng_jbeam_node_weight", "nodeWeight"),
+        ("beamng_jbeam_node_material", "nodeMaterial"),
+        ("beamng_jbeam_node_group", "group"),
+        ("beamng_jbeam_node_friction", "frictionCoef"),
+    ):
+        value = str(getattr(scene, attr, "") or "").strip()
+        if value:
+            params[key] = value
+    if getattr(scene, "beamng_jbeam_node_collision_override", False):
+        params["collision"] = bool(getattr(scene, "beamng_jbeam_node_collision", True))
+    if getattr(scene, "beamng_jbeam_node_self_collision_override", False):
+        params["selfCollision"] = bool(getattr(scene, "beamng_jbeam_node_self_collision", False))
+    return params
+
+
+def selected_beam_params_from_scene(scene):
+    params = {}
+    for attr, key in (
+        ("beamng_jbeam_beam_spring", "beamSpring"),
+        ("beamng_jbeam_beam_damp", "beamDamp"),
+        ("beamng_jbeam_beam_deform", "beamDeform"),
+        ("beamng_jbeam_beam_strength", "beamStrength"),
+        ("beamng_jbeam_beam_precompression", "beamPrecompression"),
+        ("beamng_jbeam_beam_type", "beamType"),
+        ("beamng_jbeam_beam_break_group", "breakGroup"),
+    ):
+        value = str(getattr(scene, attr, "") or "").strip()
+        if value:
+            params[key] = value
+    return params
+
+
+def selected_triangle_params_from_scene(scene):
+    params = {}
+    for attr, key in (
+        ("beamng_jbeam_triangle_group", "group"),
+        ("beamng_jbeam_triangle_drag_coef", "dragCoef"),
+        ("beamng_jbeam_triangle_ground_model", "groundModel"),
+    ):
+        value = str(getattr(scene, attr, "") or "").strip()
+        if value:
+            params[key] = value
+    if getattr(scene, "beamng_jbeam_triangle_collision_override", False):
+        params["collision"] = bool(getattr(scene, "beamng_jbeam_triangle_collision", True))
+    return params
+
+
+def params_by_topology_key(items, params):
+    result = {}
+    for item, param in zip(items, params):
+        if not isinstance(item, (list, tuple)):
+            continue
+        key = edge_key(item) if len(item) == 2 else face_key(item)
+        result[key] = param if isinstance(param, dict) else {}
+    return result
+
+
+def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.0005):
+    changes = []
+    restored_proxy_count = 0
+    topology_change_count = 0
+    scanned_mesh_count = 0
+    dirty_mesh_count = 0
+    objects = experimental_jbeam_mesh_objects(scene, active_only=active_only)
+
+    for obj in objects:
+        mesh = obj.data
+        identity = ensure_experimental_mesh_identity(obj, scene)
+        if not identity:
+            continue
+        try:
+            node_ids = identity["node_ids"]
+            node_kinds = identity["node_kinds"]
+            owner_part_ids = identity["owner_part_ids"]
+            original_positions = identity["original_positions"]
+            committed_flags = identity["committed_flags"]
+            node_params = identity["node_params"]
+            committed_node_params = identity["committed_node_params"]
+            original_edges = json.loads(mesh.get("beamng_edge_node_ids_json", "[]"))
+            original_faces = json.loads(mesh.get("beamng_face_node_ids_json", "[]"))
+            original_mesh_edges = json.loads(mesh.get("beamng_mesh_edge_node_ids_json", "[]"))
+            edge_params = mesh_json_list(mesh, "beamng_edge_params_json")
+            committed_edge_params = mesh_json_list(mesh, "beamng_edge_committed_params_json")
+            face_params = mesh_json_list(mesh, "beamng_face_params_json")
+            committed_face_params = mesh_json_list(mesh, "beamng_face_committed_params_json")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not node_ids:
+            continue
+
+        scanned_mesh_count += 1
+        edit_mesh, current_positions = read_experimental_mesh_vertices(obj)
+        mesh_changes = []
+        resolved_part_id = int(obj.get("beamng_resolved_part_id", -1))
+
+        if len(node_ids) != len(original_positions):
+            continue
+        for index, node_id in enumerate(node_ids):
+            if index >= len(current_positions) or index >= len(node_kinds):
+                continue
+            original_values = rounded_position_list(original_positions[index])
+            current_values = rounded_position_list(current_positions[index])
+            committed = bool(committed_flags[index]) if index < len(committed_flags) else True
+            if not committed:
+                params = node_params[index] if index < len(node_params) and isinstance(node_params[index], dict) else {}
+                mesh_changes.append(
+                    {
+                        "file": obj.get("beamng_jbeam_path", ""),
+                        "part": obj.get("beamng_part_name", ""),
+                        "resolved_part_id": resolved_part_id,
+                        "section": "nodes",
+                        "row": str(node_id),
+                        "field": "position",
+                        "old": [],
+                        "new": current_values,
+                        "params": params,
+                        "operation": "insert",
+                        "owner_resolved_part_id": resolved_part_id,
+                        "source_object": obj.name,
+                        "vertex_index": index,
+                    }
+                )
+                set_experimental_mesh_vertex(edit_mesh, mesh, index, Vector(current_values))
+                continue
+            params = node_params[index] if index < len(node_params) and isinstance(node_params[index], dict) else {}
+            committed_params = (
+                committed_node_params[index]
+                if index < len(committed_node_params) and isinstance(committed_node_params[index], dict)
+                else {}
+            )
+            if params != committed_params:
+                mesh_changes.append(
+                    {
+                        "file": obj.get("beamng_jbeam_path", ""),
+                        "part": obj.get("beamng_part_name", ""),
+                        "resolved_part_id": resolved_part_id,
+                        "section": "nodes",
+                        "row": str(node_id),
+                        "field": "params",
+                        "old": committed_params,
+                        "new": params,
+                        "operation": "update",
+                        "owner_resolved_part_id": resolved_part_id,
+                        "source_object": obj.name,
+                        "vertex_index": index,
+                    }
+                )
+            original = Vector(original_values)
+            current = Vector(current_values)
+            if original_values == current_values or (current - original).length <= tolerance:
+                continue
+
+            kind = node_kinds[index]
+            owner_part_id = owner_part_ids[index] if index < len(owner_part_ids) else -1
+            if kind == "proxy":
+                set_experimental_mesh_vertex(edit_mesh, mesh, index, original)
+                restored_proxy_count += 1
+                continue
+
+            change = {
+                "file": obj.get("beamng_jbeam_path", ""),
+                "part": obj.get("beamng_part_name", ""),
+                "resolved_part_id": int(obj.get("beamng_resolved_part_id", -1)),
+                "section": "nodes",
+                "row": str(node_id),
+                "field": "position",
+                "old": original_values,
+                "new": current_values,
+                "operation": "update",
+                "owner_resolved_part_id": int(owner_part_id) if str(owner_part_id).lstrip("-").isdigit() else owner_part_id,
+                "source_object": obj.name,
+                "vertex_index": index,
+            }
+            mesh_changes.append(change)
+            set_experimental_mesh_vertex(edit_mesh, mesh, index, current)
+
+        current_edges, current_faces = read_experimental_mesh_topology(obj)
+        if not original_mesh_edges:
+            original_mesh_edges = [list(edge) for edge in current_edges]
+            mesh["beamng_mesh_edge_node_ids_json"] = json.dumps(original_mesh_edges)
+
+        original_edge_by_key = {edge_key(edge): edge for edge in original_edges if len(edge) >= 2}
+        original_mesh_edge_by_key = {edge_key(edge): edge for edge in original_mesh_edges if len(edge) >= 2}
+        current_edge_by_key = {edge_key(edge): edge for edge in current_edges if len(edge) >= 2}
+        original_face_by_key = {face_key(face): face for face in original_faces if len(face) >= 3}
+        current_face_by_key = {face_key(face): face for face in current_faces if len(face) >= 3}
+        edge_params_by_key = params_by_topology_key(current_edges, edge_params)
+        committed_edge_params_by_key = params_by_topology_key(current_edges, committed_edge_params)
+        face_params_by_key = params_by_topology_key(current_faces, face_params)
+        committed_face_params_by_key = params_by_topology_key(current_faces, committed_face_params)
+        explicit_beam_keys = {
+            tuple(str(item) for item in key)
+            for key in mesh_json_list(mesh, "beamng_explicit_beam_edge_keys_json")
+            if isinstance(key, (list, tuple)) and len(key) >= 2
+        }
+        new_triangle_edge_keys = set()
+        for key in set(current_face_by_key) - set(original_face_by_key):
+            ids = current_face_by_key[key]
+            if len(ids) >= 3:
+                new_triangle_edge_keys.add(edge_key((ids[0], ids[1])))
+                new_triangle_edge_keys.add(edge_key((ids[1], ids[2])))
+                new_triangle_edge_keys.add(edge_key((ids[2], ids[0])))
+
+        for key in sorted(set(current_edge_by_key) - set(original_mesh_edge_by_key)):
+            if key in new_triangle_edge_keys and key not in explicit_beam_keys:
+                continue
+            ids = current_edge_by_key[key]
+            mesh_changes.append(
+                {
+                    "file": obj.get("beamng_jbeam_path", ""),
+                    "part": obj.get("beamng_part_name", ""),
+                    "resolved_part_id": int(obj.get("beamng_resolved_part_id", -1)),
+                    "section": "beams",
+                    "row": "",
+                    "field": "nodes",
+                    "old": [],
+                    "new": list(ids),
+                    "params": edge_params_by_key.get(key, {}),
+                    "operation": "insert",
+                    "source_object": obj.name,
+                }
+            )
+        for key in sorted((set(current_edge_by_key) & set(original_edge_by_key))):
+            params = edge_params_by_key.get(key, {})
+            committed_params = committed_edge_params_by_key.get(key, {})
+            if params != committed_params:
+                ids = current_edge_by_key[key]
+                mesh_changes.append(
+                    {
+                        "file": obj.get("beamng_jbeam_path", ""),
+                        "part": obj.get("beamng_part_name", ""),
+                        "resolved_part_id": int(obj.get("beamng_resolved_part_id", -1)),
+                        "section": "beams",
+                        "row": "",
+                        "field": "params",
+                        "old": committed_params,
+                        "new": params,
+                        "nodes": list(ids),
+                        "operation": "update",
+                        "source_object": obj.name,
+                    }
+                )
+        for key in sorted(set(original_edge_by_key) - set(current_edge_by_key)):
+            ids = original_edge_by_key[key]
+            mesh_changes.append(
+                {
+                    "file": obj.get("beamng_jbeam_path", ""),
+                    "part": obj.get("beamng_part_name", ""),
+                    "resolved_part_id": int(obj.get("beamng_resolved_part_id", -1)),
+                    "section": "beams",
+                    "row": "",
+                    "field": "nodes",
+                    "old": list(ids),
+                    "new": [],
+                    "operation": "delete",
+                    "source_object": obj.name,
+                }
+            )
+        for key in sorted(set(current_face_by_key) - set(original_face_by_key)):
+            ids = current_face_by_key[key]
+            mesh_changes.append(
+                {
+                    "file": obj.get("beamng_jbeam_path", ""),
+                    "part": obj.get("beamng_part_name", ""),
+                    "resolved_part_id": int(obj.get("beamng_resolved_part_id", -1)),
+                    "section": "triangles",
+                    "row": "",
+                    "field": "nodes",
+                    "old": [],
+                    "new": list(ids),
+                    "params": face_params_by_key.get(key, {}),
+                    "operation": "insert",
+                    "source_object": obj.name,
+                }
+            )
+        for key in sorted((set(current_face_by_key) & set(original_face_by_key))):
+            params = face_params_by_key.get(key, {})
+            committed_params = committed_face_params_by_key.get(key, {})
+            if params != committed_params:
+                ids = current_face_by_key[key]
+                mesh_changes.append(
+                    {
+                        "file": obj.get("beamng_jbeam_path", ""),
+                        "part": obj.get("beamng_part_name", ""),
+                        "resolved_part_id": int(obj.get("beamng_resolved_part_id", -1)),
+                        "section": "triangles",
+                        "row": "",
+                        "field": "params",
+                        "old": committed_params,
+                        "new": params,
+                        "nodes": list(ids),
+                        "operation": "update",
+                        "source_object": obj.name,
+                    }
+                )
+        for key in sorted(set(original_face_by_key) - set(current_face_by_key)):
+            ids = original_face_by_key[key]
+            mesh_changes.append(
+                {
+                    "file": obj.get("beamng_jbeam_path", ""),
+                    "part": obj.get("beamng_part_name", ""),
+                    "resolved_part_id": int(obj.get("beamng_resolved_part_id", -1)),
+                    "section": "triangles",
+                    "row": "",
+                    "field": "nodes",
+                    "old": list(ids),
+                    "new": [],
+                    "operation": "delete",
+                    "source_object": obj.name,
+                }
+            )
+
+        mesh_topology_changes = [
+            change for change in mesh_changes if change.get("section") in {"beams", "triangles"}
+        ]
+        topology_change_count += len(mesh_topology_changes)
+        if mesh_changes:
+            dirty_mesh_count += 1
+        mesh["beamng_node_move_changes_json"] = json.dumps(mesh_changes)
+        obj["beamng_dirty_node_move_count"] = len(mesh_changes)
+        obj["beamng_dirty_topology_change_count"] = len(mesh_topology_changes)
+        changes.extend(mesh_changes)
+
+    scene["beamng_jbeam_pending_node_moves_json"] = json.dumps(changes)
+    scene["beamng_jbeam_pending_node_move_count"] = len(changes)
+    scene["beamng_jbeam_pending_topology_change_count"] = topology_change_count
+    scene["beamng_jbeam_restored_proxy_move_count"] = restored_proxy_count
+    return {
+        "changes": changes,
+        "restored_proxy_count": restored_proxy_count,
+        "topology_change_count": topology_change_count,
+        "scanned_mesh_count": scanned_mesh_count,
+        "dirty_mesh_count": dirty_mesh_count,
+    }
+
+
+def accept_experimental_jbeam_node_moves(scene):
+    try:
+        changes = json.loads(scene.get("beamng_jbeam_pending_node_moves_json", "[]"))
+    except (TypeError, json.JSONDecodeError):
+        changes = []
+    if not changes:
+        return {"accepted_count": 0, "history_count": int(scene.get("beamng_jbeam_operation_history_count", 0))}
+
+    try:
+        history = json.loads(scene.get("beamng_jbeam_operation_history_json", "[]"))
+    except (TypeError, json.JSONDecodeError):
+        history = []
+
+    accepted_at = datetime.now().isoformat(timespec="seconds")
+    accepted_changes = []
+    for change in changes:
+        operation = dict(change)
+        operation["accepted_at"] = accepted_at
+        operation["status"] = "accepted"
+        accepted_changes.append(operation)
+
+    changes_by_object = defaultdict(list)
+    for change in accepted_changes:
+        changes_by_object[change.get("source_object", "")].append(change)
+
+    for object_name, object_changes in changes_by_object.items():
+        obj = bpy.data.objects.get(object_name)
+        if obj is None or obj.type != "MESH":
+            continue
+        mesh = obj.data
+        ensure_experimental_mesh_identity(obj, scene)
+        try:
+            original_positions = json.loads(mesh.get("beamng_original_node_positions_json", "[]"))
+        except (TypeError, json.JSONDecodeError):
+            original_positions = []
+        committed_flags = [bool(value) for value in mesh_json_list(mesh, "beamng_node_committed_flags_json")]
+        try:
+            original_edges = json.loads(mesh.get("beamng_edge_node_ids_json", "[]"))
+        except (TypeError, json.JSONDecodeError):
+            original_edges = []
+        node_params = mesh_json_list(mesh, "beamng_node_params_json")
+        edge_params = mesh_json_list(mesh, "beamng_edge_params_json")
+        face_params = mesh_json_list(mesh, "beamng_face_params_json")
+        for change in object_changes:
+            if change.get("section") != "nodes" or change.get("field") != "position":
+                continue
+            vertex_index = change.get("vertex_index")
+            if not isinstance(vertex_index, int) or vertex_index < 0:
+                continue
+            while vertex_index >= len(original_positions):
+                original_positions.append(change.get("new", [0, 0, 0]))
+            original_positions[vertex_index] = change.get("new", original_positions[vertex_index])
+            while vertex_index >= len(committed_flags):
+                committed_flags.append(True)
+            committed_flags[vertex_index] = True
+        if original_positions:
+            mesh["beamng_original_node_positions_json"] = json.dumps(original_positions)
+        if committed_flags:
+            mesh["beamng_node_committed_flags_json"] = json.dumps(committed_flags)
+        if node_params:
+            mesh["beamng_node_committed_params_json"] = json.dumps(node_params)
+        current_edges, current_faces = read_experimental_mesh_topology(obj)
+        if any(change.get("section") in {"beams", "triangles"} for change in object_changes):
+            mesh["beamng_mesh_edge_node_ids_json"] = json.dumps([list(edge) for edge in current_edges])
+        if any(change.get("section") == "beams" for change in object_changes):
+            beam_edges_by_key = {edge_key(edge): list(edge) for edge in original_edges if len(edge) >= 2}
+            for change in object_changes:
+                if change.get("section") != "beams":
+                    continue
+                if change.get("operation") == "delete":
+                    beam_edges_by_key.pop(edge_key(change.get("old", [])), None)
+                elif change.get("operation") == "insert":
+                    nodes = list(change.get("new", []))
+                    if len(nodes) >= 2:
+                        beam_edges_by_key[edge_key(nodes)] = nodes[:2]
+            mesh["beamng_edge_node_ids_json"] = json.dumps(list(beam_edges_by_key.values()))
+            mesh["beamng_edge_committed_params_json"] = json.dumps(edge_params)
+        if any(change.get("section") == "triangles" for change in object_changes):
+            mesh["beamng_face_node_ids_json"] = json.dumps([list(face) for face in current_faces])
+            mesh["beamng_face_committed_params_json"] = json.dumps(face_params)
+        mesh["beamng_node_move_changes_json"] = json.dumps([])
+        obj["beamng_dirty_node_move_count"] = 0
+        obj["beamng_dirty_topology_change_count"] = 0
+
+    history.extend(accepted_changes)
+    scene["beamng_jbeam_operation_history_json"] = json.dumps(history)
+    scene["beamng_jbeam_operation_history_count"] = len(history)
+    scene["beamng_jbeam_pending_node_moves_json"] = json.dumps([])
+    scene["beamng_jbeam_pending_node_move_count"] = 0
+    scene["beamng_jbeam_pending_topology_change_count"] = 0
+    scene["beamng_jbeam_restored_proxy_move_count"] = 0
+    scene["beamng_jbeam_dirty"] = True
+    return {"accepted_count": len(accepted_changes), "history_count": len(history)}
+
+
+def jbeam_operation_history(scene):
+    try:
+        history = json.loads(scene.get("beamng_jbeam_operation_history_json", "[]"))
+    except (TypeError, json.JSONDecodeError):
+        history = []
+    return history if isinstance(history, list) else []
+
+
+def jbeam_history_counts(history):
+    counts = defaultdict(int)
+    for operation in history:
+        section = operation.get("section", "")
+        operation_type = operation.get("operation", "")
+        counts[section] += 1
+        counts[f"{section}_{operation_type}"] += 1
+    return counts
+
+
+def checkpoint_exported_jbeam_operation_history(
+    scene,
+    stage_manifest_path,
+    stage_manifest,
+    label,
+    selected_virtual_paths=None,
+    current_folder=None,
+):
+    history = jbeam_operation_history(scene)
+    if not history:
+        return {"cleared": False, "checkpoint_path": "", "reason": "No operation history to checkpoint"}
+    if int(stage_manifest.get("skipped_file_count", 0)) != 0:
+        return {
+            "cleared": False,
+            "checkpoint_path": "",
+            "reason": "Skipped files remain; keeping operation history active",
+        }
+
+    selected_set = {normalize_virtual_path(path) for path in selected_virtual_paths or [] if path}
+    if selected_set:
+        exported_history = []
+        remaining_history = []
+        for operation in history:
+            virtual_path = virtual_jbeam_path_from_source(operation.get("file", ""), current_folder=current_folder)
+            if normalize_virtual_path(virtual_path) in selected_set:
+                exported_history.append(operation)
+            else:
+                remaining_history.append(operation)
+        if not exported_history:
+            return {
+                "cleared": False,
+                "checkpoint_path": "",
+                "reason": "No operation history entries matched the selected export files",
+            }
+    else:
+        exported_history = list(history)
+        remaining_history = []
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = persistent_cache_dir() / "jbeam_editor" / "exported_operation_checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"jbeam_exported_operations_{stamp}.json"
+    checkpoint = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "label": label,
+        "stage_manifest_path": str(stage_manifest_path),
+        "operation_count": len(exported_history),
+        "remaining_operation_count": len(remaining_history),
+        "selected_virtual_paths": sorted(selected_set),
+        "operations": exported_history,
+    }
+    checkpoint_path.write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
+
+    stage_manifest["operation_history_checkpoint_path"] = str(checkpoint_path)
+    stage_manifest["operation_history_cleared"] = len(remaining_history) == 0
+    stage_manifest["operation_history_remaining_count"] = len(remaining_history)
+    Path(stage_manifest_path).write_text(json.dumps(stage_manifest, indent=2), encoding="utf-8")
+    text = bpy.data.texts.get("BeamNG Staged JBeam Mod Overrides") or bpy.data.texts.new(
+        "BeamNG Staged JBeam Mod Overrides"
+    )
+    text.clear()
+    text.write("\n".join(jbeam_user_override_stage_lines(stage_manifest)))
+    text.write("\n")
+
+    scene["beamng_jbeam_last_export_checkpoint_path"] = str(checkpoint_path)
+    scene["beamng_jbeam_export_checkpoint_count"] = int(scene.get("beamng_jbeam_export_checkpoint_count", 0)) + 1
+    scene["beamng_jbeam_operation_history_json"] = json.dumps(remaining_history)
+    scene["beamng_jbeam_operation_history_count"] = len(remaining_history)
+    scene["beamng_jbeam_pending_node_moves_json"] = json.dumps([])
+    scene["beamng_jbeam_pending_node_move_count"] = 0
+    scene["beamng_jbeam_pending_topology_change_count"] = 0
+    scene["beamng_jbeam_dirty"] = bool(remaining_history)
+    return {"cleared": len(remaining_history) == 0, "checkpoint_path": str(checkpoint_path), "reason": ""}
+
+
+def build_jbeam_edit_preview(history):
+    grouped_files = {}
+    for operation in history:
+        file_key = operation.get("file", "") or "<unknown file>"
+        part_key = operation.get("part", "") or "<unknown part>"
+        file_group = grouped_files.setdefault(file_key, {"file": file_key, "parts": {}})
+        part_group = file_group["parts"].setdefault(part_key, {"part": part_key, "operations": []})
+        part_group["operations"].append(operation)
+
+    files = []
+    for file_key in sorted(grouped_files):
+        file_group = grouped_files[file_key]
+        parts = []
+        for part_key in sorted(file_group["parts"]):
+            part_group = file_group["parts"][part_key]
+            parts.append(
+                {
+                    "part": part_group["part"],
+                    "operation_count": len(part_group["operations"]),
+                    "operations": part_group["operations"],
+                }
+            )
+        files.append(
+            {
+                "file": file_group["file"],
+                "operation_count": sum(part["operation_count"] for part in parts),
+                "parts": parts,
+            }
+        )
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "operation_count": len(history),
+        "files": files,
+    }
+
+
+def jbeam_edit_preview_lines(preview):
+    lines = [
+        "[BeamNG JBeam Edit Preview]",
+        f"Generated: {preview['generated_at']}",
+        f"Accepted operations: {preview['operation_count']}",
+        "",
+    ]
+    for file_group in preview["files"]:
+        lines.append(f"File: {file_group['file']}")
+        lines.append(f"Operations: {file_group['operation_count']}")
+        for part_group in file_group["parts"]:
+            lines.append(f"  Part: {part_group['part']} ({part_group['operation_count']} operation(s))")
+            for operation in part_group["operations"]:
+                lines.append(
+                    "    "
+                    f"{operation.get('operation', '')} "
+                    f"{operation.get('section', '')}.{operation.get('row', '')}.{operation.get('field', '')}: "
+                    f"{operation.get('old', '')} -> {operation.get('new', '')}"
+                )
+        lines.append("")
+    if not preview["files"]:
+        lines.append("No accepted JBeam edit operations are recorded.")
+    return lines
+
+
+def write_jbeam_edit_preview_report(scene):
+    history = jbeam_operation_history(scene)
+    preview = build_jbeam_edit_preview(history)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir = persistent_cache_dir() / "jbeam_editor"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"jbeam_edit_preview_{stamp}.json"
+    report_path.write_text(json.dumps(preview, indent=2), encoding="utf-8")
+
+    text = bpy.data.texts.get("BeamNG JBeam Edit Preview") or bpy.data.texts.new("BeamNG JBeam Edit Preview")
+    text.clear()
+    text.write("\n".join(jbeam_edit_preview_lines(preview)))
+    text.write("\n")
+
+    scene["beamng_jbeam_last_edit_preview_path"] = str(report_path)
+    return report_path, preview
+
+
+def build_jbeam_node_patch_draft(history):
+    editable_operations = [
+        operation
+        for operation in history
+        if (
+            operation.get("section") == "nodes"
+            and operation.get("field") in {"position", "params"}
+            and operation.get("operation") in {"insert", "update"}
+        )
+        or (
+            operation.get("section") in {"beams", "triangles"}
+            and operation.get("field") in {"nodes", "params"}
+            and operation.get("operation") in {"insert", "delete", "update"}
+        )
+    ]
+
+    grouped_files = {}
+    for operation in editable_operations:
+        file_key = operation.get("file", "") or "<unknown file>"
+        part_key = operation.get("part", "") or "<unknown part>"
+        file_group = grouped_files.setdefault(
+            file_key,
+            {
+                "source_file": file_key,
+                "safe_to_write": False,
+                "parts": {},
+            },
+        )
+        part_group = file_group["parts"].setdefault(
+            part_key,
+            {
+                "part": part_key,
+                "node_inserts": [],
+                "node_updates": [],
+                "node_param_updates": [],
+                "beam_inserts": [],
+                "beam_deletes": [],
+                "beam_param_updates": [],
+                "triangle_inserts": [],
+                "triangle_deletes": [],
+                "triangle_param_updates": [],
+            },
+        )
+        if operation.get("section") == "nodes":
+            item = {
+                "node": operation.get("row", ""),
+                "old_position": rounded_position_list(operation.get("old", [])) if operation.get("old") else [],
+                "new_position": rounded_position_list(operation.get("new", [])),
+                "accepted_at": operation.get("accepted_at", ""),
+                "source_object": operation.get("source_object", ""),
+                "resolved_part_id": operation.get("resolved_part_id", -1),
+                "vertex_index": operation.get("vertex_index", -1),
+                "params": operation.get("params", {}) if isinstance(operation.get("params", {}), dict) else {},
+            }
+            if operation.get("operation") == "insert":
+                part_group["node_inserts"].append(item)
+            elif operation.get("field") == "params":
+                item["old_params"] = operation.get("old", {})
+                item["params"] = operation.get("new", {})
+                part_group.setdefault("node_param_updates", []).append(item)
+            else:
+                part_group["node_updates"].append(item)
+        elif operation.get("section") == "beams":
+            if operation.get("field") == "params":
+                key = "beam_param_updates"
+                node_ids = operation.get("nodes", [])
+            else:
+                key = "beam_inserts" if operation.get("operation") == "insert" else "beam_deletes"
+                node_ids = operation.get("new") if operation.get("operation") == "insert" else operation.get("old")
+            part_group[key].append(
+                {
+                    "nodes": [str(node_id) for node_id in (node_ids or [])[:2]],
+                    "params": operation.get("new", operation.get("params", {})) if operation.get("field") == "params" else operation.get("params", {}),
+                    "accepted_at": operation.get("accepted_at", ""),
+                    "source_object": operation.get("source_object", ""),
+                    "resolved_part_id": operation.get("resolved_part_id", -1),
+                }
+            )
+        elif operation.get("section") == "triangles":
+            if operation.get("field") == "params":
+                key = "triangle_param_updates"
+                node_ids = operation.get("nodes", [])
+            else:
+                key = "triangle_inserts" if operation.get("operation") == "insert" else "triangle_deletes"
+                node_ids = operation.get("new") if operation.get("operation") == "insert" else operation.get("old")
+            part_group[key].append(
+                {
+                    "nodes": [str(node_id) for node_id in (node_ids or [])[:3]],
+                    "params": operation.get("new", operation.get("params", {})) if operation.get("field") == "params" else operation.get("params", {}),
+                    "accepted_at": operation.get("accepted_at", ""),
+                    "source_object": operation.get("source_object", ""),
+                    "resolved_part_id": operation.get("resolved_part_id", -1),
+                }
+            )
+
+    files = []
+    for file_key in sorted(grouped_files):
+        file_group = grouped_files[file_key]
+        parts = []
+        for part_key in sorted(file_group["parts"]):
+            part_group = file_group["parts"][part_key]
+            node_insert_count = len(part_group["node_inserts"])
+            node_update_count = len(part_group["node_updates"])
+            beam_insert_count = len(part_group["beam_inserts"])
+            beam_delete_count = len(part_group["beam_deletes"])
+            beam_param_update_count = len(part_group["beam_param_updates"])
+            triangle_insert_count = len(part_group["triangle_inserts"])
+            triangle_delete_count = len(part_group["triangle_deletes"])
+            triangle_param_update_count = len(part_group["triangle_param_updates"])
+            parts.append(
+                {
+                    "part": part_group["part"],
+                    "operation_count": (
+                        node_insert_count
+                        + node_update_count
+                        + beam_insert_count
+                        + beam_delete_count
+                        + beam_param_update_count
+                        + triangle_insert_count
+                        + triangle_delete_count
+                        + triangle_param_update_count
+                    ),
+                    "node_insert_count": node_insert_count,
+                    "node_update_count": node_update_count,
+                    "beam_insert_count": beam_insert_count,
+                    "beam_delete_count": beam_delete_count,
+                    "beam_param_update_count": beam_param_update_count,
+                    "triangle_insert_count": triangle_insert_count,
+                    "triangle_delete_count": triangle_delete_count,
+                    "triangle_param_update_count": triangle_param_update_count,
+                    "node_inserts": part_group["node_inserts"],
+                    "node_updates": part_group["node_updates"],
+                    "node_param_updates": part_group["node_param_updates"],
+                    "beam_inserts": part_group["beam_inserts"],
+                    "beam_deletes": part_group["beam_deletes"],
+                    "beam_param_updates": part_group["beam_param_updates"],
+                    "triangle_inserts": part_group["triangle_inserts"],
+                    "triangle_deletes": part_group["triangle_deletes"],
+                    "triangle_param_updates": part_group["triangle_param_updates"],
+                }
+            )
+        node_update_count = sum(part["node_insert_count"] + part["node_update_count"] for part in parts)
+        topology_update_count = sum(
+            part["beam_insert_count"]
+            + part["beam_delete_count"]
+            + part["triangle_insert_count"]
+            + part["triangle_delete_count"]
+            for part in parts
+        )
+        files.append(
+            {
+                "source_file": file_group["source_file"],
+                "safe_to_write": False,
+                "operation_count": node_update_count + topology_update_count,
+                "node_update_count": node_update_count,
+                "topology_update_count": topology_update_count,
+                "parts": parts,
+            }
+        )
+
+    node_update_count = sum(1 for operation in editable_operations if operation.get("section") == "nodes")
+    topology_update_count = len(editable_operations) - node_update_count
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "precision": JBEAM_POSITION_PRECISION,
+        "cache_only": True,
+        "operation_count": len(editable_operations),
+        "node_update_count": node_update_count,
+        "topology_update_count": topology_update_count,
+        "warnings": [
+            "Draft only: no vanilla, mod, or user override files were modified.",
+            "Source-preserving text patching is available for node-position-only edits; new nodes and beam/triangle topology use clean JSON fallback.",
+        ],
+        "files": files,
+    }
+
+
+def jbeam_node_patch_draft_lines(draft):
+    lines = [
+        "[BeamNG JBeam Node Patch Draft]",
+        f"Generated: {draft['generated_at']}",
+        f"Operations: {draft.get('operation_count', draft['node_update_count'])}",
+        f"Node edits: {draft['node_update_count']}",
+        f"Topology updates: {draft.get('topology_update_count', 0)}",
+        f"Precision: {draft['precision']} decimal places",
+        "Cache only: yes",
+        "",
+    ]
+    for warning in draft["warnings"]:
+        lines.append(f"Warning: {warning}")
+    lines.append("")
+
+    for file_group in draft["files"]:
+        lines.append(f"File: {file_group['source_file']}")
+        lines.append(f"Operations: {file_group.get('operation_count', file_group['node_update_count'])}")
+        lines.append(f"Node edits: {file_group['node_update_count']}")
+        lines.append(f"Topology updates: {file_group.get('topology_update_count', 0)}")
+        lines.append("Write target: not selected yet")
+        for part_group in file_group["parts"]:
+            lines.append(
+                f"  Part: {part_group['part']} "
+                f"({part_group.get('operation_count', part_group['node_update_count'])} operation(s))"
+            )
+            for update in part_group.get("node_inserts", []):
+                lines.append(
+                    "    "
+                    f"insert node {update.get('node', '')}: {update.get('new_position', '')}"
+                )
+            for update in part_group["node_updates"]:
+                lines.append(
+                    "    "
+                    f"{update.get('node', '')}: "
+                    f"{update.get('old_position', '')} -> {update.get('new_position', '')}"
+                )
+            for update in part_group.get("beam_inserts", []):
+                lines.append(f"    insert beam: {update.get('nodes', '')}")
+            for update in part_group.get("beam_deletes", []):
+                lines.append(f"    delete beam: {update.get('nodes', '')}")
+            for update in part_group.get("triangle_inserts", []):
+                lines.append(f"    insert triangle: {update.get('nodes', '')}")
+            for update in part_group.get("triangle_deletes", []):
+                lines.append(f"    delete triangle: {update.get('nodes', '')}")
+        lines.append("")
+    if not draft["files"]:
+        lines.append("No accepted JBeam edits are recorded.")
+    return lines
+
+
+def write_jbeam_node_patch_draft_report(scene):
+    history = jbeam_operation_history(scene)
+    draft = build_jbeam_node_patch_draft(history)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir = persistent_cache_dir() / "jbeam_editor"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"jbeam_node_patch_draft_{stamp}.json"
+    report_path.write_text(json.dumps(draft, indent=2), encoding="utf-8")
+
+    text = bpy.data.texts.get("BeamNG JBeam Node Patch Draft") or bpy.data.texts.new("BeamNG JBeam Node Patch Draft")
+    text.clear()
+    text.write("\n".join(jbeam_node_patch_draft_lines(draft)))
+    text.write("\n")
+
+    scene["beamng_jbeam_last_node_patch_draft_path"] = str(report_path)
+    return report_path, draft
+
+
+def virtual_jbeam_path_from_source(source_file, current_folder=None):
+    source_text = normalize_virtual_path(source_file)
+    if not source_text:
+        return ""
+
+    lower = source_text.lower()
+    marker = "/vehicles/"
+    if marker in lower:
+        start = lower.index(marker) + 1
+        return normalize_virtual_path(source_text[start:])
+    if lower.startswith("vehicles/"):
+        return normalize_virtual_path(source_text)
+
+    if current_folder is not None:
+        try:
+            relative = Path(source_file).resolve().relative_to(current_folder.resolve())
+            relative_text = normalize_virtual_path(relative)
+            if relative_text.lower().startswith("vehicles/"):
+                return relative_text
+        except (OSError, ValueError):
+            pass
+
+    return ""
+
+
+DEFAULT_JBEAM_EXPORT_MOD_NAME = "beamng_pc_importer_edits"
+
+
+def safe_mod_folder_name(value):
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    safe_name = safe_name.strip("._")
+    return safe_name or DEFAULT_JBEAM_EXPORT_MOD_NAME
+
+
+def jbeam_export_mod_name(context):
+    prefs = get_addon_preferences(context)
+    configured = getattr(prefs, "jbeam_export_mod_name", "") if prefs else ""
+    return safe_mod_folder_name(configured)
+
+
+def loose_current_vehicle_jbeam_path(current_folder, virtual_path):
+    normalized = normalize_virtual_path(virtual_path)
+    if current_folder is None or not normalized.lower().endswith(".jbeam"):
+        return None
+    if not normalized.lower().startswith("vehicles/"):
+        return None
+    return current_folder / Path(normalized)
+
+
+def safe_jbeam_mod_override_target_for_virtual_path(context, current_folder, virtual_path):
+    if current_folder is None or not virtual_path:
+        return None, "BeamNG user folder is not configured" if current_folder is None else "Could not infer vehicles/... virtual path"
+
+    normalized = normalize_virtual_path(virtual_path)
+    if not normalized.lower().startswith("vehicles/"):
+        return None, f"Refusing non-vehicle virtual path: {normalized}"
+    if not normalized.lower().endswith(".jbeam"):
+        return None, f"Refusing non-JBeam virtual path for JBeam export: {normalized}"
+
+    mod_name = jbeam_export_mod_name(context)
+    target_root = current_folder / "mods" / "unpacked" / mod_name
+    target = target_root / Path(normalized)
+    try:
+        target.resolve().relative_to((target_root / "vehicles").resolve())
+    except (OSError, ValueError):
+        return None, f"Refusing target outside user current/mods/unpacked/{mod_name}/vehicles: {target}"
+    return target, ""
+
+
+def build_jbeam_override_export_plan(context, history):
+    draft = build_jbeam_node_patch_draft(history)
+    current_folder = user_current_folder_from_preferences(context)
+    mod_name = jbeam_export_mod_name(context)
+    export_root = current_folder / "mods" / "unpacked" / mod_name if current_folder else None
+    files = []
+    warning_set = set(draft["warnings"])
+
+    for file_group in draft["files"]:
+        source_file = file_group["source_file"]
+        virtual_path = virtual_jbeam_path_from_source(source_file, current_folder=current_folder)
+        target_path, target_warning = safe_jbeam_mod_override_target_for_virtual_path(context, current_folder, virtual_path)
+        can_stage = target_path is not None
+        if target_warning:
+            warning_set.add(target_warning)
+        misplaced_path = loose_current_vehicle_jbeam_path(current_folder, virtual_path)
+        file_warnings = [target_warning] if target_warning else []
+        if misplaced_path and misplaced_path.exists():
+            misplaced_warning = (
+                f"Ignoring misplaced loose JBeam at {misplaced_path}; JBeam exports target "
+                f"current/mods/unpacked/{mod_name}/vehicles instead."
+            )
+            warning_set.add(misplaced_warning)
+            file_warnings.append(misplaced_warning)
+        files.append(
+            {
+                "source_file": source_file,
+                "virtual_path": virtual_path,
+                "planned_target_path": str(target_path) if target_path else "",
+                "can_stage_override": can_stage,
+                "operation_count": file_group.get("operation_count", file_group["node_update_count"]),
+                "node_update_count": file_group["node_update_count"],
+                "topology_update_count": file_group.get("topology_update_count", 0),
+                "parts": file_group["parts"],
+                "warnings": file_warnings,
+            }
+        )
+
+    can_stage_count = sum(1 for file_group in files if file_group["can_stage_override"])
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "precision": JBEAM_POSITION_PRECISION,
+        "cache_only": True,
+        "operation_count": draft.get("operation_count", draft["node_update_count"]),
+        "node_update_count": draft["node_update_count"],
+        "topology_update_count": draft.get("topology_update_count", 0),
+        "source_file_count": len(files),
+        "stageable_file_count": can_stage_count,
+        "user_current_folder": str(current_folder) if current_folder else "",
+        "export_mod_folder": mod_name,
+        "export_root": str(export_root) if export_root else "",
+        "warnings": sorted(warning_set),
+        "files": files,
+    }
+
+
+def jbeam_override_export_plan_lines(plan):
+    lines = [
+        "[BeamNG JBeam Override Export Plan]",
+        f"Generated: {plan['generated_at']}",
+        f"Operations: {plan.get('operation_count', plan['node_update_count'])}",
+        f"Node edits: {plan['node_update_count']}",
+        f"Topology updates: {plan.get('topology_update_count', 0)}",
+        f"Source files: {plan['source_file_count']}",
+        f"Stageable files: {plan['stageable_file_count']}",
+        f"User current folder: {plan['user_current_folder'] or '(not configured)'}",
+        f"JBeam export mod: {plan.get('export_mod_folder', '') or '(not configured)'}",
+        f"JBeam export root: {plan.get('export_root', '') or '(not configured)'}",
+        "Cache only: yes",
+        "",
+    ]
+    for warning in plan["warnings"]:
+        lines.append(f"Warning: {warning}")
+    lines.append("")
+
+    for file_group in plan["files"]:
+        lines.append(f"Source: {file_group['source_file']}")
+        lines.append(f"Virtual: {file_group['virtual_path'] or '(unknown)'}")
+        lines.append(f"Planned target: {file_group['planned_target_path'] or '(not stageable)'}")
+        lines.append(f"Can stage override: {'yes' if file_group['can_stage_override'] else 'no'}")
+        lines.append(f"Operations: {file_group.get('operation_count', file_group['node_update_count'])}")
+        lines.append(f"Node edits: {file_group['node_update_count']}")
+        lines.append(f"Topology updates: {file_group.get('topology_update_count', 0)}")
+        for warning in file_group["warnings"]:
+            lines.append(f"File warning: {warning}")
+        for part_group in file_group["parts"]:
+            lines.append(
+                f"  Part: {part_group['part']} "
+                f"({part_group.get('operation_count', part_group['node_update_count'])} operation(s))"
+            )
+            for update in part_group.get("node_inserts", []):
+                lines.append(
+                    "    "
+                    f"insert node {update.get('node', '')}: {update.get('new_position', '')}"
+                )
+            for update in part_group["node_updates"]:
+                lines.append(
+                    "    "
+                    f"{update.get('node', '')}: "
+                    f"{update.get('old_position', '')} -> {update.get('new_position', '')}"
+                )
+            for update in part_group.get("beam_inserts", []):
+                lines.append(f"    insert beam: {update.get('nodes', '')}")
+            for update in part_group.get("beam_deletes", []):
+                lines.append(f"    delete beam: {update.get('nodes', '')}")
+            for update in part_group.get("triangle_inserts", []):
+                lines.append(f"    insert triangle: {update.get('nodes', '')}")
+            for update in part_group.get("triangle_deletes", []):
+                lines.append(f"    delete triangle: {update.get('nodes', '')}")
+        lines.append("")
+    if not plan["files"]:
+        lines.append("No accepted JBeam edits are recorded.")
+    return lines
+
+
+def write_jbeam_override_export_plan_report(context):
+    history = jbeam_operation_history(context.scene)
+    plan = build_jbeam_override_export_plan(context, history)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir = persistent_cache_dir() / "jbeam_editor"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"jbeam_override_export_plan_{stamp}.json"
+    report_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+
+    text = bpy.data.texts.get("BeamNG JBeam Override Export Plan") or bpy.data.texts.new(
+        "BeamNG JBeam Override Export Plan"
+    )
+    text.clear()
+    text.write("\n".join(jbeam_override_export_plan_lines(plan)))
+    text.write("\n")
+
+    context.scene["beamng_jbeam_last_override_export_plan_path"] = str(report_path)
+    return report_path, plan
+
+
+def populate_jbeam_export_file_selection(context):
+    scene = context.scene
+    if not hasattr(scene, "beamng_jbeam_export_file_items"):
+        return []
+
+    history = jbeam_operation_history(scene)
+    plan = build_jbeam_override_export_plan(context, history)
+    items = scene.beamng_jbeam_export_file_items
+    previous_selection = {
+        item.virtual_path: bool(item.include)
+        for item in items
+        if item.virtual_path
+    }
+    items.clear()
+
+    for file_group in plan.get("files", []):
+        virtual_path = normalize_virtual_path(file_group.get("virtual_path", ""))
+        if not virtual_path:
+            continue
+        parts = [
+            part_group.get("part", "")
+            for part_group in file_group.get("parts", [])
+            if part_group.get("part", "")
+        ]
+        parts_label = ", ".join(parts[:4])
+        if len(parts) > 4:
+            parts_label += f", +{len(parts) - 4} more"
+        item = items.add()
+        item.include = previous_selection.get(virtual_path, True)
+        item.virtual_path = virtual_path
+        item.source_file = file_group.get("source_file", "")
+        item.parts_label = parts_label
+        item.planned_target_path = file_group.get("planned_target_path", "")
+        item.node_update_count = int(file_group.get("operation_count", file_group.get("node_update_count", 0)))
+        item.label = f"{Path(virtual_path).name} ({item.node_update_count} edit(s))"
+
+    scene["beamng_jbeam_export_selection_count"] = len(items)
+    return list(items)
+
+
+def selected_jbeam_export_virtual_paths(scene):
+    if not hasattr(scene, "beamng_jbeam_export_file_items"):
+        return None
+    if len(scene.beamng_jbeam_export_file_items) == 0:
+        return None
+    selected = [
+        normalize_virtual_path(item.virtual_path)
+        for item in scene.beamng_jbeam_export_file_items
+        if item.include and item.virtual_path
+    ]
+    return selected
+
+
+def draw_jbeam_export_selection(layout, context, overwrite_existing=False):
+    items = getattr(context.scene, "beamng_jbeam_export_file_items", [])
+    box = layout.box()
+    box.label(text=f"JBeam export mod: {jbeam_export_mod_name(context)}")
+    box.label(text="Target: current/mods/unpacked/<mod>/vehicles")
+    box.label(text="Changed JBeam files")
+
+    if not items:
+        box.label(text="No accepted JBeam edits are recorded.")
+        return
+
+    for item in items:
+        row = box.row(align=True)
+        row.prop(item, "include", text="")
+        col = row.column(align=True)
+        col.label(text=item.label)
+        if item.parts_label:
+            col.label(text=f"Parts: {item.parts_label}")
+        if item.planned_target_path:
+            col.label(text=f"To: {Path(item.planned_target_path).name}")
+    selected_count = sum(1 for item in items if item.include)
+    box.label(text=f"Selected: {selected_count}/{len(items)} file(s)")
+    if overwrite_existing:
+        warn = box.box()
+        warn.alert = True
+        warn.label(text="Existing unpacked mod JBeam files may be overwritten after backup.")
+
+
+def filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths):
+    if selected_virtual_paths is None:
+        return plan
+    selected = {normalize_virtual_path(path) for path in selected_virtual_paths if path}
+    filtered = dict(plan)
+    filtered_files = [
+        file_group
+        for file_group in plan.get("files", [])
+        if normalize_virtual_path(file_group.get("virtual_path", "")) in selected
+    ]
+    filtered["files"] = filtered_files
+    filtered["source_file_count"] = len(filtered_files)
+    filtered["stageable_file_count"] = sum(1 for item in filtered_files if item.get("can_stage_override"))
+    filtered["operation_count"] = sum(int(item.get("operation_count", item.get("node_update_count", 0))) for item in filtered_files)
+    filtered["node_update_count"] = sum(int(item.get("node_update_count", 0)) for item in filtered_files)
+    filtered["topology_update_count"] = sum(int(item.get("topology_update_count", 0)) for item in filtered_files)
+    if selected and not filtered_files:
+        warnings = set(filtered.get("warnings", []))
+        warnings.add("Selected export files did not match any accepted JBeam edit files.")
+        filtered["warnings"] = sorted(warnings)
+    return filtered
+
+
+def build_jbeam_export_validation(context):
+    history = jbeam_operation_history(context.scene)
+    plan = build_jbeam_override_export_plan(context, history)
+    source_index, source_warning = jbeam_asset_source_index_for_context(context)
+    warnings = set(plan.get("warnings", []))
+    errors = []
+    infos = []
+    files = []
+
+    if source_warning:
+        warnings.add(source_warning)
+    if not history:
+        warnings.add("No accepted JBeam edits are recorded.")
+    history_counts = jbeam_history_counts(history)
+    if not plan.get("user_current_folder"):
+        errors.append("BeamNG user folder/current folder is not configured.")
+    if not plan.get("export_mod_folder"):
+        errors.append("JBeam export mod folder is not configured.")
+
+    for file_group in plan.get("files", []):
+        virtual_path = normalize_virtual_path(file_group.get("virtual_path", ""))
+        file_errors = []
+        file_warnings = list(file_group.get("warnings", []))
+        file_infos = []
+        patch_mode = ""
+        source = source_index.get(virtual_path)
+        expected_node_update_count = sum(
+            len(part_group.get("node_inserts", [])) + len(part_group.get("node_updates", []))
+            for part_group in file_group.get("parts", [])
+        )
+        expected_topology_update_count = sum(
+            len(part_group.get("beam_inserts", []))
+            + len(part_group.get("beam_deletes", []))
+            + len(part_group.get("triangle_inserts", []))
+            + len(part_group.get("triangle_deletes", []))
+            for part_group in file_group.get("parts", [])
+        )
+        expected_update_count = expected_node_update_count + expected_topology_update_count
+
+        if not file_group.get("can_stage_override"):
+            file_errors.append("No safe unpacked mod target path is available.")
+        target_path = file_group.get("planned_target_path", "")
+        normalized_target = normalize_virtual_path(target_path)
+        if target_path and "/current/vehicles/" in normalized_target.lower():
+            file_errors.append("Refusing JBeam target under current/vehicles; that folder is for .pc configurations.")
+        if target_path and Path(target_path).exists():
+            file_infos.append("Target already exists; stage without overwrite will skip it, update will back it up first.")
+
+        if source is None:
+            file_errors.append("Could not find matching source JBeam asset.")
+        else:
+            try:
+                source_text = read_jbeam_asset_source_text(source)
+                _patched_text, text_changed, text_skipped = apply_node_updates_to_jbeam_text(source_text, file_group)
+                has_node_inserts = any(part_group.get("node_inserts") for part_group in file_group.get("parts", []))
+                if not has_node_inserts and expected_topology_update_count == 0 and text_changed and not text_skipped and len(text_changed) == expected_update_count:
+                    patch_mode = "source_preserving_text"
+                else:
+                    try:
+                        payload = load_jsonc_text(source_text)
+                        clean_changed, clean_skipped = apply_jbeam_updates_to_payload(payload, file_group)
+                    except Exception as exc:
+                        clean_changed = []
+                        clean_skipped = [{"reason": f"Clean JSON fallback parse failed: {exc}"}]
+                    if clean_changed and not clean_skipped and len(clean_changed) == expected_update_count:
+                        patch_mode = "clean_json_fallback"
+                        file_warnings.append("Clean JSON fallback will be used for this file.")
+                        for skipped in text_skipped:
+                            file_infos.append(
+                                f"Text patch skipped {skipped.get('part', '')}.{skipped.get('node', '')}: "
+                                f"{skipped.get('reason', '')}"
+                            )
+                    else:
+                        file_errors.append("Accepted JBeam edits could not be applied safely to source text or clean JSON.")
+                        for skipped in list(text_skipped) + list(clean_skipped):
+                            file_warnings.append(
+                                f"Skipped {skipped.get('part', '')}.{skipped.get('node', '')}: {skipped.get('reason', '')}"
+                            )
+            except Exception as exc:
+                file_errors.append(f"Could not read source JBeam: {exc}")
+
+        files.append(
+            {
+                "source_file": file_group.get("source_file", ""),
+                "virtual_path": virtual_path,
+                "planned_target_path": target_path,
+                "operation_count": file_group.get("operation_count", file_group.get("node_update_count", 0)),
+                "node_update_count": file_group.get("node_update_count", 0),
+                "topology_update_count": file_group.get("topology_update_count", 0),
+                "expected_update_count": expected_update_count,
+                "patch_mode": patch_mode,
+                "errors": file_errors,
+                "warnings": sorted(set(file_warnings)),
+                "infos": file_infos,
+            }
+        )
+        errors.extend(file_errors)
+        warnings.update(file_warnings)
+        infos.extend(file_infos)
+
+    source_preserving_count = sum(1 for item in files if item.get("patch_mode") == "source_preserving_text")
+    clean_json_count = sum(1 for item in files if item.get("patch_mode") == "clean_json_fallback")
+    status = "pass" if not errors else "fail"
+    if status == "pass" and warnings:
+        status = "warning"
+
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "status": status,
+        "precision": JBEAM_POSITION_PRECISION,
+        "operation_count": plan.get("operation_count", plan.get("node_update_count", 0)),
+        "node_update_count": plan.get("node_update_count", 0),
+        "topology_update_count": plan.get("topology_update_count", 0),
+        "source_file_count": plan.get("source_file_count", 0),
+        "stageable_file_count": plan.get("stageable_file_count", 0),
+        "source_preserving_file_count": source_preserving_count,
+        "clean_json_fallback_file_count": clean_json_count,
+        "user_current_folder": plan.get("user_current_folder", ""),
+        "export_mod_folder": plan.get("export_mod_folder", ""),
+        "export_root": plan.get("export_root", ""),
+        "errors": sorted(set(errors)),
+        "warnings": sorted(set(warnings)),
+        "infos": sorted(set(infos)),
+        "files": files,
+    }
+
+
+def jbeam_export_validation_lines(validation):
+    lines = [
+        "[BeamNG JBeam Export Validation]",
+        f"Generated: {validation['generated_at']}",
+        f"Status: {validation['status']}",
+        f"Operations: {validation.get('operation_count', validation['node_update_count'])}",
+        f"Node edits: {validation['node_update_count']}",
+        f"Topology updates: {validation.get('topology_update_count', 0)}",
+        f"Source files: {validation['source_file_count']}",
+        f"Stageable files: {validation['stageable_file_count']}",
+        f"Source-preserving files: {validation['source_preserving_file_count']}",
+        f"Clean JSON fallback files: {validation['clean_json_fallback_file_count']}",
+        f"User current folder: {validation['user_current_folder'] or '(not configured)'}",
+        f"JBeam export mod: {validation['export_mod_folder'] or '(not configured)'}",
+        f"JBeam export root: {validation['export_root'] or '(not configured)'}",
+        "",
+    ]
+    for error in validation["errors"]:
+        lines.append(f"Error: {error}")
+    for warning in validation["warnings"]:
+        lines.append(f"Warning: {warning}")
+    for info in validation["infos"]:
+        lines.append(f"Info: {info}")
+    lines.append("")
+
+    for file_group in validation["files"]:
+        lines.append(f"Virtual: {file_group['virtual_path'] or '(unknown)'}")
+        lines.append(f"Target: {file_group['planned_target_path'] or '(not stageable)'}")
+        lines.append(f"Patch mode: {file_group['patch_mode'] or '(none)'}")
+        lines.append(f"Operations: {file_group.get('operation_count', file_group['node_update_count'])}")
+        lines.append(f"Node edits: {file_group['node_update_count']}")
+        lines.append(f"Topology updates: {file_group.get('topology_update_count', 0)}")
+        for error in file_group["errors"]:
+            lines.append(f"  Error: {error}")
+        for warning in file_group["warnings"]:
+            lines.append(f"  Warning: {warning}")
+        for info in file_group["infos"]:
+            lines.append(f"  Info: {info}")
+        lines.append("")
+    if not validation["files"]:
+        lines.append("No accepted JBeam edits are recorded.")
+    return lines
+
+
+def write_jbeam_export_validation_report(context):
+    validation = build_jbeam_export_validation(context)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir = persistent_cache_dir() / "jbeam_editor"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"jbeam_export_validation_{stamp}.json"
+    report_path.write_text(json.dumps(validation, indent=2), encoding="utf-8")
+
+    text = bpy.data.texts.get("BeamNG JBeam Export Validation") or bpy.data.texts.new(
+        "BeamNG JBeam Export Validation"
+    )
+    text.clear()
+    text.write("\n".join(jbeam_export_validation_lines(validation)))
+    text.write("\n")
+
+    context.scene["beamng_jbeam_last_export_validation_path"] = str(report_path)
+    context.scene["beamng_jbeam_last_export_validation_status"] = validation["status"]
+    return report_path, validation
+
+
+def current_import_pc_path(scene):
+    source_path = scene.get("beamng_slot_editor_source_pc_path", "")
+    if source_path:
+        return Path(source_path)
+    roots = find_beamng_import_collections(scene)
+    if roots:
+        return Path(roots[0].get("beamng_pc_source_path", roots[0].get("beamng_pc_path", "")))
+    return None
+
+
+def jbeam_asset_source_index_for_context(context):
+    pc_path = current_import_pc_path(context.scene)
+    if pc_path is None or not str(pc_path):
+        return {}, "No imported .pc source path is available"
+
+    prefs = get_addon_preferences(context)
+    beamng_user_folder = prefs.beamng_user_folder if prefs else ""
+    vanilla_vehicles_folder = prefs.vanilla_vehicles_folder if prefs else ""
+    cache_asset_catalogs = prefs.cache_asset_catalogs if prefs else True
+    try:
+        jbeam_sources, _dae_sources, _virtual_vehicle_root = collect_beamng_asset_sources(
+            pc_path,
+            beamng_user_folder,
+            vanilla_vehicles_folder,
+            cache_asset_catalogs,
+        )
+    except Exception as exc:
+        return {}, f"Could not collect JBeam sources: {exc}"
+
+    source_index = {}
+    for source in sorted(jbeam_sources, key=lambda item: item.precedence):
+        source_index[normalize_virtual_path(source.virtual_path)] = source
+    return source_index, ""
+
+
+def read_jbeam_asset_source_text(source):
+    if source.asset_type == "file":
+        return Path(source.path).read_text(encoding="utf-8-sig")
+    with zipfile.ZipFile(source.zip_path, "r") as archive:
+        return archive.read(source.zip_entry).decode("utf-8", errors="ignore")
+
+
+def write_text_without_newline_translation(path, text, encoding="utf-8"):
+    with Path(path).open("w", encoding=encoding, newline="") as handle:
+        handle.write(text)
+
+
+JBEAM_NUMBER_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+
+
+def node_row_position_pattern(node_id):
+    escaped_node = re.escape(str(node_id))
+    return re.compile(
+        rf"^(?P<prefix>\s*\[\s*(?P<quote>[\"']){escaped_node}(?P=quote)\s*,\s*)"
+        rf"(?P<x>{JBEAM_NUMBER_PATTERN})(?P<after_x>\s*,\s*)"
+        rf"(?P<y>{JBEAM_NUMBER_PATTERN})(?P<after_y>\s*,\s*)"
+        rf"(?P<z>{JBEAM_NUMBER_PATTERN})(?P<suffix>.*)$"
+    )
+
+
+def apply_node_updates_to_jbeam_text(source_text, file_group):
+    lines = source_text.splitlines(keepends=True)
+    changed = []
+    skipped = []
+
+    for part_group in file_group.get("parts", []):
+        part_name = part_group.get("part", "")
+        for update in part_group.get("node_updates", []):
+            node_id = str(update.get("node", ""))
+            new_position = rounded_position_list(update.get("new_position", []))
+            if len(new_position) != 3:
+                skipped.append({"part": part_name, "node": node_id, "reason": "New position is not xyz"})
+                continue
+
+            pattern = node_row_position_pattern(node_id)
+            matches = []
+            for line_index, line in enumerate(lines):
+                stripped = line.lstrip()
+                if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+                    continue
+                line_body = line[:-1] if line.endswith("\n") else line
+                newline = "\n" if line.endswith("\n") else ""
+                if line_body.endswith("\r"):
+                    line_body = line_body[:-1]
+                    newline = "\r" + newline
+                match = pattern.match(line_body)
+                if match:
+                    matches.append((line_index, line_body, newline, match))
+
+            if not matches:
+                skipped.append({"part": part_name, "node": node_id, "reason": "Node row not found in source text"})
+                continue
+            if len(matches) > 1:
+                skipped.append({"part": part_name, "node": node_id, "reason": "Node row is ambiguous in source text"})
+                continue
+
+            line_index, _line_body, newline, match = matches[0]
+            old_position = rounded_position_list([match.group("x"), match.group("y"), match.group("z")])
+            replacement = (
+                match.group("prefix")
+                + formatted_jbeam_position_number(new_position[0])
+                + match.group("after_x")
+                + formatted_jbeam_position_number(new_position[1])
+                + match.group("after_y")
+                + formatted_jbeam_position_number(new_position[2])
+                + match.group("suffix")
+                + newline
+            )
+            lines[line_index] = replacement
+            changed.append(
+                {
+                    "part": part_name,
+                    "node": node_id,
+                    "old_position": old_position,
+                    "new_position": new_position,
+                }
+            )
+
+    return "".join(lines), changed, skipped
+
+
+def apply_node_updates_to_jbeam_payload(payload, file_group):
+    changed = []
+    skipped = []
+    if not isinstance(payload, dict):
+        return changed, [{"reason": "JBeam payload is not an object"}]
+
+    for part_group in file_group.get("parts", []):
+        part_name = part_group.get("part", "")
+        part_data = payload.get(part_name)
+        if not isinstance(part_data, dict):
+            skipped.append({"part": part_name, "reason": "Part not found in source payload"})
+            continue
+        rows = part_data.get("nodes")
+        if not isinstance(rows, list):
+            skipped.append({"part": part_name, "reason": "Part has no nodes list"})
+            continue
+
+        rows_by_node = {}
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 4:
+                rows_by_node[str(row[0])] = row
+
+        for update in part_group.get("node_inserts", []):
+            node_id = str(update.get("node", ""))
+            if not node_id:
+                skipped.append({"part": part_name, "reason": "Node insert has no id"})
+                continue
+            if node_id in rows_by_node:
+                skipped.append({"part": part_name, "node": node_id, "reason": "Node already exists"})
+                continue
+            new_position = rounded_position_list(update.get("new_position", []))
+            if len(new_position) != 3:
+                skipped.append({"part": part_name, "node": node_id, "reason": "New node position is not xyz"})
+                continue
+            row = [node_id, *new_position]
+            insert_index = len(rows)
+            if rows and isinstance(rows[-1], dict) and "group" in rows[-1]:
+                insert_index = len(rows) - 1
+            params = {
+                str(key): coerce_jbeam_param_value(value)
+                for key, value in (update.get("params") or {}).items()
+                if str(key).strip() and value is not None and value != ""
+            }
+            if params:
+                rows.insert(insert_index, params)
+                insert_index += 1
+            rows.insert(insert_index, row)
+            rows_by_node[node_id] = row
+            changed.append(
+                {
+                    "part": part_name,
+                    "section": "nodes",
+                    "operation": "insert",
+                    "node": node_id,
+                    "old": [],
+                    "new": row,
+                    "new_position": new_position,
+                }
+            )
+
+        for update in part_group.get("node_updates", []):
+            node_id = str(update.get("node", ""))
+            row = rows_by_node.get(node_id)
+            if row is None:
+                skipped.append({"part": part_name, "node": node_id, "reason": "Node row not found"})
+                continue
+            new_position = rounded_position_list(update.get("new_position", []))
+            if len(new_position) != 3:
+                skipped.append({"part": part_name, "node": node_id, "reason": "New position is not xyz"})
+                continue
+            old_position = rounded_position_list(row[1:4])
+            row[1:4] = new_position
+            changed.append(
+                {
+                    "part": part_name,
+                    "node": node_id,
+                    "old_position": old_position,
+                    "new_position": new_position,
+                }
+            )
+        for update in part_group.get("node_param_updates", []):
+            node_id = str(update.get("node", ""))
+            row = rows_by_node.get(node_id)
+            if row is None:
+                skipped.append({"part": part_name, "node": node_id, "reason": "Node row not found for params"})
+                continue
+            row_index = rows.index(row)
+            if insert_params_before_row(rows, row_index, update.get("params", {})):
+                changed.append(
+                    {
+                        "part": part_name,
+                        "section": "nodes",
+                        "operation": "update",
+                        "field": "params",
+                        "node": node_id,
+                        "new": update.get("params", {}),
+                    }
+                )
+    return changed, skipped
+
+
+def row_matches_beam_nodes(row, node_ids):
+    if not isinstance(row, list) or len(row) < 2 or len(node_ids) < 2:
+        return False
+    return set(str(value) for value in row[:2]) == set(str(value) for value in node_ids[:2])
+
+
+def row_matches_triangle_nodes(row, node_ids):
+    if not isinstance(row, list) or len(row) < 3 or len(node_ids) < 3:
+        return False
+    return [str(value) for value in row[:3]] == [str(value) for value in node_ids[:3]]
+
+
+def clean_jbeam_params(params):
+    return {
+        str(key): coerce_jbeam_param_value(value)
+        for key, value in (params or {}).items()
+        if str(key).strip() and value is not None and value != ""
+    }
+
+
+def insert_params_before_row(rows, row_index, params):
+    cleaned = clean_jbeam_params(params)
+    if not cleaned:
+        return False
+    rows.insert(row_index, cleaned)
+    return True
+
+
+def apply_topology_updates_to_jbeam_payload(payload, file_group):
+    changed = []
+    skipped = []
+    if not isinstance(payload, dict):
+        return changed, [{"reason": "JBeam payload is not an object"}]
+
+    for part_group in file_group.get("parts", []):
+        part_name = part_group.get("part", "")
+        part_data = payload.get(part_name)
+        if not isinstance(part_data, dict):
+            skipped.append({"part": part_name, "reason": "Part not found in source payload"})
+            continue
+
+        beam_deletes = list(part_group.get("beam_deletes", []))
+        beam_inserts = list(part_group.get("beam_inserts", []))
+        beam_param_updates = list(part_group.get("beam_param_updates", []))
+        triangle_deletes = list(part_group.get("triangle_deletes", []))
+        triangle_inserts = list(part_group.get("triangle_inserts", []))
+        triangle_param_updates = list(part_group.get("triangle_param_updates", []))
+
+        if beam_deletes or beam_inserts or beam_param_updates:
+            beams = part_data.setdefault("beams", [])
+            if not isinstance(beams, list):
+                skipped.append({"part": part_name, "section": "beams", "reason": "Part beams section is not a list"})
+                beams = None
+        else:
+            beams = None
+
+        if triangle_deletes or triangle_inserts or triangle_param_updates:
+            triangles = part_data.setdefault("triangles", [])
+            if not isinstance(triangles, list):
+                skipped.append({"part": part_name, "section": "triangles", "reason": "Part triangles section is not a list"})
+                triangles = None
+        else:
+            triangles = None
+
+        if beams is not None:
+            for update in beam_deletes:
+                node_ids = update.get("nodes", [])
+                matches = [index for index, row in enumerate(beams) if row_matches_beam_nodes(row, node_ids)]
+                if len(matches) != 1:
+                    skipped.append(
+                        {
+                            "part": part_name,
+                            "section": "beams",
+                            "nodes": node_ids,
+                            "reason": "Beam row not found uniquely for delete",
+                        }
+                    )
+                    continue
+                old_row = beams.pop(matches[0])
+                changed.append({"part": part_name, "section": "beams", "operation": "delete", "old": old_row, "new": []})
+            for update in beam_inserts:
+                node_ids = update.get("nodes", [])
+                if len(node_ids) != 2:
+                    skipped.append({"part": part_name, "section": "beams", "nodes": node_ids, "reason": "Beam insert is not two nodes"})
+                    continue
+                if any(row_matches_beam_nodes(row, node_ids) for row in beams):
+                    skipped.append({"part": part_name, "section": "beams", "nodes": node_ids, "reason": "Beam already exists"})
+                    continue
+                row = [str(node_ids[0]), str(node_ids[1])]
+                params = clean_jbeam_params(update.get("params", {}))
+                if params:
+                    beams.append(params)
+                beams.append(row)
+                changed.append({"part": part_name, "section": "beams", "operation": "insert", "old": [], "new": row})
+            for update in beam_param_updates:
+                node_ids = update.get("nodes", [])
+                matches = [index for index, row in enumerate(beams) if row_matches_beam_nodes(row, node_ids)]
+                if len(matches) != 1:
+                    skipped.append({"part": part_name, "section": "beams", "nodes": node_ids, "reason": "Beam row not found uniquely for params"})
+                    continue
+                if insert_params_before_row(beams, matches[0], update.get("params", {})):
+                    changed.append({"part": part_name, "section": "beams", "operation": "update", "field": "params", "nodes": node_ids, "new": update.get("params", {})})
+
+        if triangles is not None:
+            for update in triangle_deletes:
+                node_ids = update.get("nodes", [])
+                matches = [index for index, row in enumerate(triangles) if row_matches_triangle_nodes(row, node_ids)]
+                if len(matches) != 1:
+                    skipped.append(
+                        {
+                            "part": part_name,
+                            "section": "triangles",
+                            "nodes": node_ids,
+                            "reason": "Triangle row not found uniquely for delete",
+                        }
+                    )
+                    continue
+                old_row = triangles.pop(matches[0])
+                changed.append({"part": part_name, "section": "triangles", "operation": "delete", "old": old_row, "new": []})
+            for update in triangle_inserts:
+                node_ids = update.get("nodes", [])
+                if len(node_ids) != 3:
+                    skipped.append({"part": part_name, "section": "triangles", "nodes": node_ids, "reason": "Triangle insert is not three nodes"})
+                    continue
+                if any(row_matches_triangle_nodes(row, node_ids) for row in triangles):
+                    skipped.append({"part": part_name, "section": "triangles", "nodes": node_ids, "reason": "Triangle already exists"})
+                    continue
+                row = [str(node_ids[0]), str(node_ids[1]), str(node_ids[2])]
+                params = clean_jbeam_params(update.get("params", {}))
+                if params:
+                    triangles.append(params)
+                triangles.append(row)
+                changed.append({"part": part_name, "section": "triangles", "operation": "insert", "old": [], "new": row})
+            for update in triangle_param_updates:
+                node_ids = update.get("nodes", [])
+                matches = [index for index, row in enumerate(triangles) if row_matches_triangle_nodes(row, node_ids)]
+                if len(matches) != 1:
+                    skipped.append({"part": part_name, "section": "triangles", "nodes": node_ids, "reason": "Triangle row not found uniquely for params"})
+                    continue
+                if insert_params_before_row(triangles, matches[0], update.get("params", {})):
+                    changed.append({"part": part_name, "section": "triangles", "operation": "update", "field": "params", "nodes": node_ids, "new": update.get("params", {})})
+
+    return changed, skipped
+
+
+def apply_jbeam_updates_to_payload(payload, file_group):
+    node_changed, node_skipped = apply_node_updates_to_jbeam_payload(payload, file_group)
+    topology_changed, topology_skipped = apply_topology_updates_to_jbeam_payload(payload, file_group)
+    return node_changed + topology_changed, node_skipped + topology_skipped
+
+
+def build_jbeam_patched_cache_copies(context, selected_virtual_paths=None):
+    history = jbeam_operation_history(context.scene)
+    plan = build_jbeam_override_export_plan(context, history)
+    plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths)
+    source_index, source_warning = jbeam_asset_source_index_for_context(context)
+    if source_warning:
+        plan["warnings"].append(source_warning)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = persistent_cache_dir() / "jbeam_editor" / f"patched_jbeam_cache_{stamp}"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    files = []
+    for file_group in plan["files"]:
+        virtual_path = normalize_virtual_path(file_group.get("virtual_path", ""))
+        source = source_index.get(virtual_path)
+        file_result = {
+            "source_file": file_group.get("source_file", ""),
+            "virtual_path": virtual_path,
+            "planned_target_path": file_group.get("planned_target_path", ""),
+            "cache_output_path": "",
+            "patch_mode": "",
+            "accepted_operation_count": file_group.get("operation_count", file_group.get("node_update_count", 0)),
+            "accepted_node_update_count": file_group.get("node_update_count", 0),
+            "accepted_topology_update_count": file_group.get("topology_update_count", 0),
+            "changed_operation_count": 0,
+            "changed_node_count": 0,
+            "changed_topology_count": 0,
+            "skipped_update_count": 0,
+            "warnings": [],
+            "changed_operations": [],
+            "changed_nodes": [],
+            "skipped_updates": [],
+        }
+        if source is None:
+            file_result["warnings"].append("Could not find matching JBeam asset source for virtual path")
+            files.append(file_result)
+            continue
+
+        try:
+            source_text = read_jbeam_asset_source_text(source)
+        except Exception as exc:
+            file_result["warnings"].append(f"Could not read source JBeam: {exc}")
+            files.append(file_result)
+            continue
+
+        output_path = output_root / Path(virtual_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        patched_text, text_changed, text_skipped = apply_node_updates_to_jbeam_text(source_text, file_group)
+        expected_node_update_count = sum(
+            len(part_group.get("node_inserts", [])) + len(part_group.get("node_updates", []))
+            for part_group in file_group.get("parts", [])
+        )
+        expected_topology_update_count = sum(
+            len(part_group.get("beam_inserts", []))
+            + len(part_group.get("beam_deletes", []))
+            + len(part_group.get("triangle_inserts", []))
+            + len(part_group.get("triangle_deletes", []))
+            for part_group in file_group.get("parts", [])
+        )
+        expected_update_count = expected_node_update_count + expected_topology_update_count
+        has_node_inserts = any(part_group.get("node_inserts") for part_group in file_group.get("parts", []))
+        if not has_node_inserts and expected_topology_update_count == 0 and text_changed and not text_skipped and len(text_changed) == expected_update_count:
+            changed = text_changed
+            skipped = []
+            file_result["patch_mode"] = "source_preserving_text"
+            write_text_without_newline_translation(output_path, patched_text)
+        else:
+            try:
+                payload = load_jsonc_text(source_text)
+                changed, skipped = apply_jbeam_updates_to_payload(payload, file_group)
+                file_result["patch_mode"] = "clean_json_fallback"
+                output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except Exception as exc:
+                file_result["warnings"].append(f"Could not parse source JBeam for clean JSON fallback: {exc}")
+                file_result["skipped_updates"] = text_skipped
+                file_result["skipped_update_count"] = len(text_skipped)
+                files.append(file_result)
+                continue
+            if text_skipped:
+                file_result["warnings"].append("Source-preserving text patch was not safe; used clean JSON fallback")
+                file_result["source_preserving_skipped_updates"] = text_skipped
+
+        file_result["cache_output_path"] = str(output_path)
+        file_result["changed_operation_count"] = len(changed)
+        file_result["changed_node_count"] = len([item for item in changed if item.get("section", "nodes") == "nodes"])
+        file_result["changed_topology_count"] = len([item for item in changed if item.get("section") in {"beams", "triangles"}])
+        file_result["skipped_update_count"] = len(skipped)
+        file_result["changed_operations"] = changed
+        file_result["changed_nodes"] = changed
+        file_result["skipped_updates"] = skipped
+        if skipped:
+            file_result["warnings"].append("Some accepted JBeam updates could not be applied to the parsed source")
+        files.append(file_result)
+
+    manifest = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "precision": JBEAM_POSITION_PRECISION,
+        "cache_only": True,
+        "output_root": str(output_root),
+        "operation_count": plan.get("operation_count", plan["node_update_count"]),
+        "node_update_count": plan["node_update_count"],
+        "topology_update_count": plan.get("topology_update_count", 0),
+        "changed_operation_count": sum(file_group["changed_operation_count"] for file_group in files),
+        "changed_node_count": sum(file_group["changed_node_count"] for file_group in files),
+        "changed_topology_count": sum(file_group["changed_topology_count"] for file_group in files),
+        "skipped_update_count": sum(file_group["skipped_update_count"] for file_group in files),
+        "warnings": sorted(set(plan["warnings"] + [
+            "Patched cache copies prefer source-preserving text patches for node-only files; topology edits use clean JSON fallback.",
+            "No BeamNG user, mod, or vanilla files were modified.",
+        ])),
+        "files": files,
+    }
+    manifest_path = output_root / "patched_jbeam_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest_path, manifest
+
+
+def jbeam_patched_cache_copy_lines(manifest):
+    lines = [
+        "[BeamNG Patched JBeam Cache Copies]",
+        f"Generated: {manifest['generated_at']}",
+        f"Output root: {manifest['output_root']}",
+        f"Accepted operations: {manifest.get('operation_count', manifest['node_update_count'])}",
+        f"Accepted node edits: {manifest['node_update_count']}",
+        f"Accepted topology updates: {manifest.get('topology_update_count', 0)}",
+        f"Applied operations: {manifest.get('changed_operation_count', manifest['changed_node_count'])}",
+        f"Applied node edits: {manifest['changed_node_count']}",
+        f"Applied topology updates: {manifest.get('changed_topology_count', 0)}",
+        f"Skipped updates: {manifest['skipped_update_count']}",
+        "Cache only: yes",
+        "",
+    ]
+    for warning in manifest["warnings"]:
+        lines.append(f"Warning: {warning}")
+    lines.append("")
+
+    for file_group in manifest["files"]:
+        lines.append(f"Virtual: {file_group['virtual_path'] or '(unknown)'}")
+        lines.append(f"Output: {file_group['cache_output_path'] or '(not written)'}")
+        lines.append(f"Patch mode: {file_group.get('patch_mode', '') or '(none)'}")
+        lines.append(f"Accepted: {file_group.get('accepted_operation_count', file_group.get('changed_operation_count', 0))}")
+        lines.append(f"Applied: {file_group.get('changed_operation_count', file_group['changed_node_count'])}")
+        lines.append(f"Skipped: {file_group['skipped_update_count']}")
+        for warning in file_group["warnings"]:
+            lines.append(f"File warning: {warning}")
+        for skipped in file_group.get("source_preserving_skipped_updates", []):
+            lines.append(
+                "  Source-preserving skipped "
+                f"{skipped.get('part', '')}.{skipped.get('node', '')}: {skipped.get('reason', '')}"
+            )
+        for changed in file_group.get("changed_operations", file_group["changed_nodes"]):
+            lines.append(
+                "  "
+                f"{changed.get('part', '')}.{changed.get('section', 'nodes')}.{changed.get('node', '')}: "
+                f"{changed.get('old_position', '')} -> {changed.get('new_position', '')}"
+                if changed.get("section", "nodes") == "nodes"
+                else f"  {changed.get('operation', '')} {changed.get('section', '')}: {changed.get('old', '')} -> {changed.get('new', '')}"
+            )
+        for skipped in file_group["skipped_updates"]:
+            lines.append(
+                "  Skipped "
+                f"{skipped.get('part', '')}.{skipped.get('node', '')}: {skipped.get('reason', '')}"
+            )
+        lines.append("")
+    if not manifest["files"]:
+        lines.append("No accepted JBeam edits are recorded.")
+    return lines
+
+
+def write_jbeam_patched_cache_copy_report(context, selected_virtual_paths=None):
+    manifest_path, manifest = build_jbeam_patched_cache_copies(context, selected_virtual_paths=selected_virtual_paths)
+    text = bpy.data.texts.get("BeamNG Patched JBeam Cache Copies") or bpy.data.texts.new(
+        "BeamNG Patched JBeam Cache Copies"
+    )
+    text.clear()
+    text.write("\n".join(jbeam_patched_cache_copy_lines(manifest)))
+    text.write("\n")
+
+    context.scene["beamng_jbeam_last_patched_cache_manifest_path"] = str(manifest_path)
+    return manifest_path, manifest
+
+
+def stage_jbeam_patched_cache_copies_to_user_folder(context, overwrite_existing=False, selected_virtual_paths=None):
+    manifest_path, manifest = build_jbeam_patched_cache_copies(
+        context,
+        selected_virtual_paths=selected_virtual_paths,
+    )
+    staged_files = []
+    skipped_files = []
+    current_folder = user_current_folder_from_preferences(context)
+    mod_name = jbeam_export_mod_name(context)
+    export_root = current_folder / "mods" / "unpacked" / mod_name if current_folder else None
+    backup_root = Path(manifest["output_root"]) / "overwritten_mod_override_backups"
+
+    for file_group in manifest["files"]:
+        cache_output_path = Path(file_group.get("cache_output_path", ""))
+        planned_target = file_group.get("planned_target_path", "")
+        if not cache_output_path or not cache_output_path.exists():
+            skipped_files.append(
+                {
+                    "virtual_path": file_group.get("virtual_path", ""),
+                    "target_path": planned_target,
+                    "reason": "Patched cache output was not written",
+                }
+            )
+            continue
+        if int(file_group.get("skipped_update_count", 0)) != 0:
+            skipped_files.append(
+                {
+                    "virtual_path": file_group.get("virtual_path", ""),
+                    "target_path": planned_target,
+                    "reason": "Refusing to stage a partially-applied JBeam patch",
+                }
+            )
+            continue
+
+        target_path, target_warning = safe_jbeam_mod_override_target_for_virtual_path(
+            context,
+            current_folder,
+            file_group.get("virtual_path", ""),
+        )
+        if target_path is None:
+            skipped_files.append(
+                {
+                    "virtual_path": file_group.get("virtual_path", ""),
+                    "target_path": planned_target,
+                    "reason": target_warning,
+                }
+            )
+            continue
+        if target_path.exists():
+            if not overwrite_existing:
+                skipped_files.append(
+                    {
+                        "virtual_path": file_group.get("virtual_path", ""),
+                        "target_path": str(target_path),
+                        "reason": "Refusing to overwrite existing unpacked mod JBeam file",
+                    }
+                )
+                continue
+            backup_path = backup_root / Path(file_group.get("virtual_path", ""))
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.write_bytes(target_path.read_bytes())
+        else:
+            backup_path = None
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(cache_output_path.read_bytes())
+        staged_files.append(
+            {
+                "virtual_path": file_group.get("virtual_path", ""),
+                "cache_output_path": str(cache_output_path),
+                "target_path": str(target_path),
+                "backup_path": str(backup_path) if backup_path else "",
+                "overwrote_existing": backup_path is not None,
+                "patch_mode": file_group.get("patch_mode", ""),
+                "changed_operation_count": file_group.get("changed_operation_count", file_group.get("changed_node_count", 0)),
+                "changed_node_count": file_group.get("changed_node_count", 0),
+                "changed_topology_count": file_group.get("changed_topology_count", 0),
+            }
+        )
+
+    stage_manifest = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "precision": JBEAM_POSITION_PRECISION,
+        "source_cache_manifest_path": str(manifest_path),
+        "user_current_folder": str(current_folder) if current_folder else "",
+        "export_mod_folder": mod_name,
+        "export_root": str(export_root) if export_root else "",
+        "overwrite_existing": overwrite_existing,
+        "selected_virtual_paths": list(selected_virtual_paths) if selected_virtual_paths is not None else [],
+        "operation_history_checkpoint_path": "",
+        "operation_history_cleared": False,
+        "staged_file_count": len(staged_files),
+        "skipped_file_count": len(skipped_files),
+        "changed_operation_count": manifest.get("changed_operation_count", manifest["changed_node_count"]),
+        "changed_node_count": manifest["changed_node_count"],
+        "changed_topology_count": manifest.get("changed_topology_count", 0),
+        "warnings": sorted(set(manifest["warnings"] + [
+            (
+                "Experimental staging overwrote existing unpacked mod JBeam files only after backing them up."
+                if overwrite_existing
+                else "Experimental staging refused to overwrite existing unpacked mod JBeam files."
+            ),
+            "Staged files use source-preserving text patches for node-only files when safe; topology edits use clean JSON fallback.",
+            "JBeam files are staged under current/mods/unpacked; current/vehicles is reserved for .pc configurations.",
+        ])),
+        "staged_files": staged_files,
+        "skipped_files": skipped_files,
+    }
+
+    stage_manifest_path = Path(manifest["output_root"]) / "staged_mod_override_manifest.json"
+    stage_manifest_path.write_text(json.dumps(stage_manifest, indent=2), encoding="utf-8")
+    return stage_manifest_path, stage_manifest
+
+
+def jbeam_user_override_stage_lines(stage_manifest):
+    lines = [
+        "[BeamNG Staged JBeam Unpacked Mod Overrides]",
+        f"Generated: {stage_manifest['generated_at']}",
+        f"User current folder: {stage_manifest['user_current_folder'] or '(not configured)'}",
+        f"JBeam export mod: {stage_manifest.get('export_mod_folder', '') or '(not configured)'}",
+        f"JBeam export root: {stage_manifest.get('export_root', '') or '(not configured)'}",
+        f"Staged files: {stage_manifest['staged_file_count']}",
+        f"Skipped files: {stage_manifest['skipped_file_count']}",
+        f"Changed operations in source cache: {stage_manifest.get('changed_operation_count', stage_manifest['changed_node_count'])}",
+        f"Changed node edits in source cache: {stage_manifest['changed_node_count']}",
+        f"Changed topology in source cache: {stage_manifest.get('changed_topology_count', 0)}",
+        f"Operation history cleared: {'yes' if stage_manifest.get('operation_history_cleared') else 'no'}",
+        f"Remaining history operations: {stage_manifest.get('operation_history_remaining_count', 0)}",
+        "",
+    ]
+    if stage_manifest.get("operation_history_checkpoint_path"):
+        lines.append(f"Operation checkpoint: {stage_manifest['operation_history_checkpoint_path']}")
+        lines.append("")
+    for warning in stage_manifest["warnings"]:
+        lines.append(f"Warning: {warning}")
+    lines.append("")
+
+    for staged in stage_manifest["staged_files"]:
+        lines.append(f"Staged: {staged['virtual_path']}")
+        lines.append(f"  From: {staged['cache_output_path']}")
+        lines.append(f"  To: {staged['target_path']}")
+        if staged.get("backup_path"):
+            lines.append(f"  Backup: {staged['backup_path']}")
+        lines.append(f"  Overwrote existing: {'yes' if staged.get('overwrote_existing') else 'no'}")
+        lines.append(f"  Patch mode: {staged.get('patch_mode', '') or '(unknown)'}")
+        lines.append(f"  Changed operations: {staged.get('changed_operation_count', staged['changed_node_count'])}")
+        lines.append(f"  Changed node edits: {staged['changed_node_count']}")
+        lines.append(f"  Changed topology: {staged.get('changed_topology_count', 0)}")
+    if stage_manifest["staged_files"]:
+        lines.append("")
+
+    for skipped in stage_manifest["skipped_files"]:
+        lines.append(f"Skipped: {skipped.get('virtual_path', '') or '(unknown)'}")
+        lines.append(f"  Target: {skipped.get('target_path', '') or '(none)'}")
+        lines.append(f"  Reason: {skipped.get('reason', '')}")
+    if not stage_manifest["staged_files"] and not stage_manifest["skipped_files"]:
+        lines.append("No accepted JBeam edits are recorded.")
+    return lines
+
+
+def write_jbeam_user_override_stage_report(context, overwrite_existing=False, selected_virtual_paths=None):
+    stage_manifest_path, stage_manifest = stage_jbeam_patched_cache_copies_to_user_folder(
+        context,
+        overwrite_existing=overwrite_existing,
+        selected_virtual_paths=selected_virtual_paths,
+    )
+    text = bpy.data.texts.get("BeamNG Staged JBeam Mod Overrides") or bpy.data.texts.new(
+        "BeamNG Staged JBeam Mod Overrides"
+    )
+    text.clear()
+    text.write("\n".join(jbeam_user_override_stage_lines(stage_manifest)))
+    text.write("\n")
+
+    context.scene["beamng_jbeam_last_mod_override_stage_manifest_path"] = str(stage_manifest_path)
+    context.scene["beamng_jbeam_last_user_override_stage_manifest_path"] = str(stage_manifest_path)
+    return stage_manifest_path, stage_manifest
+
+
+class BEAMNG_OT_scan_experimental_jbeam_mesh_edits(Operator):
+    bl_idname = "beamng_pc_importer.scan_experimental_jbeam_mesh_edits"
+    bl_label = "Scan JBeam Mesh Edits"
+    bl_description = "Detect moved owned nodes in experimental JBeam meshes and restore moved proxy/reference nodes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    active_only: BoolProperty(
+        name="Active Mesh Only",
+        description="Scan only the active experimental JBeam mesh when possible",
+        default=False,
+    )
+
+    def execute(self, context):
+        result = scan_experimental_jbeam_mesh_edits(context.scene, active_only=self.active_only)
+        self.report(
+            {"INFO"},
+            (
+                f"Scanned {result['scanned_mesh_count']} JBeam mesh(es); "
+                f"recorded {len(result['changes'])} edit(s) "
+                f"({result['topology_change_count']} topology); "
+                f"restored {result['restored_proxy_count']} proxy node move(s)"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_accept_experimental_jbeam_node_moves(Operator):
+    bl_idname = "beamng_pc_importer.accept_experimental_jbeam_node_moves"
+    bl_label = "Accept JBeam Edits"
+    bl_description = "Accept pending experimental JBeam node/topology edits into the operation history and update mesh baselines"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        result = accept_experimental_jbeam_node_moves(context.scene)
+        if result["accepted_count"] == 0:
+            self.report({"WARNING"}, "No pending experimental JBeam edits to accept")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Accepted {result['accepted_count']} JBeam edit(s); operation history now has {result['history_count']} item(s)",
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_mark_selected_edges_as_jbeam_beams(Operator):
+    bl_idname = "beamng_pc_importer.mark_selected_edges_as_jbeam_beams"
+    bl_label = "Mark Selected Edges As Beams"
+    bl_description = "Treat selected experimental mesh edges as intentional JBeam beams when scanning topology edits"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+            self.report({"WARNING"}, "Select an experimental JBeam mesh edge first")
+            return {"CANCELLED"}
+        keys = selected_experimental_jbeam_edge_node_keys(obj)
+        if not keys:
+            self.report({"WARNING"}, "No selected JBeam mesh edges found")
+            return {"CANCELLED"}
+        existing = {
+            tuple(str(item) for item in key)
+            for key in mesh_json_list(obj.data, "beamng_explicit_beam_edge_keys_json")
+            if isinstance(key, (list, tuple)) and len(key) >= 2
+        }
+        existing.update(keys)
+        obj.data["beamng_explicit_beam_edge_keys_json"] = json.dumps([list(key) for key in sorted(existing)])
+        self.report({"INFO"}, f"Marked {len(keys)} selected edge(s) as intentional JBeam beam(s)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_report_experimental_jbeam_selection(Operator):
+    bl_idname = "beamng_pc_importer.report_experimental_jbeam_selection"
+    bl_label = "Report JBeam Mesh Selection"
+    bl_description = "Report the active experimental JBeam mesh and selected vertex/edge/face counts for UI debugging"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None:
+            self.report({"WARNING"}, active_object_debug_label(context))
+            return {"CANCELLED"}
+        vertices = selected_experimental_jbeam_vertex_indices(obj)
+        edges = selected_experimental_jbeam_edge_indices(obj)
+        faces = selected_experimental_jbeam_face_indices(obj)
+        self.report(
+            {"INFO"},
+            (
+                f"{obj.name} mode={obj.mode}; "
+                f"selected vertices={len(vertices)}, edges={len(edges)}, faces={len(faces)}"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_apply_selected_jbeam_node_properties(Operator):
+    bl_idname = "beamng_pc_importer.apply_selected_jbeam_node_properties"
+    bl_label = "Apply Selected Node Properties"
+    bl_description = "Store the panel's JBeam node option overrides on the selected experimental mesh node"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+            self.report({"WARNING"}, "Select an experimental JBeam mesh node first")
+            return {"CANCELLED"}
+        identity = ensure_experimental_mesh_identity(obj, context.scene)
+        selected_indices = selected_experimental_jbeam_vertex_indices(obj)
+        if not selected_indices:
+            self.report({"WARNING"}, "No selected JBeam mesh vertices found")
+            return {"CANCELLED"}
+        node_params = list(identity.get("node_params", []))
+        params = selected_node_params_from_scene(context.scene)
+        for index in selected_indices:
+            while index >= len(node_params):
+                node_params.append({})
+            node_params[index] = dict(params)
+        obj.data["beamng_node_params_json"] = json.dumps(node_params)
+        self.report({"INFO"}, f"Applied JBeam node properties to {len(selected_indices)} selected node(s)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_load_selected_jbeam_node_properties(Operator):
+    bl_idname = "beamng_pc_importer.load_selected_jbeam_node_properties"
+    bl_label = "Load Selected Node Properties"
+    bl_description = "Copy the first selected experimental mesh node's stored JBeam options into the panel fields"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+            self.report({"WARNING"}, "Select an experimental JBeam mesh node first")
+            return {"CANCELLED"}
+        identity = ensure_experimental_mesh_identity(obj, context.scene)
+        selected_indices = selected_experimental_jbeam_vertex_indices(obj)
+        if not selected_indices:
+            self.report({"WARNING"}, "No selected JBeam mesh vertices found")
+            return {"CANCELLED"}
+        index = selected_indices[0]
+        node_params = identity.get("node_params", [])
+        params = node_params[index] if index < len(node_params) and isinstance(node_params[index], dict) else {}
+        context.scene.beamng_jbeam_node_weight = str(params.get("nodeWeight", ""))
+        context.scene.beamng_jbeam_node_material = str(params.get("nodeMaterial", ""))
+        context.scene.beamng_jbeam_node_group = str(params.get("group", ""))
+        context.scene.beamng_jbeam_node_friction = str(params.get("frictionCoef", ""))
+        context.scene.beamng_jbeam_node_collision_override = "collision" in params
+        context.scene.beamng_jbeam_node_collision = bool(params.get("collision", True))
+        context.scene.beamng_jbeam_node_self_collision_override = "selfCollision" in params
+        context.scene.beamng_jbeam_node_self_collision = bool(params.get("selfCollision", False))
+        self.report({"INFO"}, "Loaded selected node properties into the panel")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_apply_selected_jbeam_beam_properties(Operator):
+    bl_idname = "beamng_pc_importer.apply_selected_jbeam_beam_properties"
+    bl_label = "Apply Selected Beam Properties"
+    bl_description = "Store the panel's JBeam beam option overrides on selected experimental mesh edges"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select an experimental JBeam mesh edge first")
+            return {"CANCELLED"}
+        selected_indices = selected_experimental_jbeam_edge_indices(obj)
+        if not selected_indices:
+            self.report({"WARNING"}, "No selected JBeam mesh edges found")
+            return {"CANCELLED"}
+        params = selected_beam_params_from_scene(context.scene)
+        edge_params = mesh_json_list(obj.data, "beamng_edge_params_json")
+        for index in selected_indices:
+            while index >= len(edge_params):
+                edge_params.append({})
+            edge_params[index] = dict(params)
+        obj.data["beamng_edge_params_json"] = json.dumps(edge_params)
+        self.report({"INFO"}, f"Applied beam properties to {len(selected_indices)} selected edge(s)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_load_selected_jbeam_beam_properties(Operator):
+    bl_idname = "beamng_pc_importer.load_selected_jbeam_beam_properties"
+    bl_label = "Load Selected Beam Properties"
+    bl_description = "Copy the first selected experimental mesh edge's stored JBeam options into the panel fields"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select an experimental JBeam mesh edge first")
+            return {"CANCELLED"}
+        selected_indices = selected_experimental_jbeam_edge_indices(obj)
+        if not selected_indices:
+            self.report({"WARNING"}, "No selected JBeam mesh edges found")
+            return {"CANCELLED"}
+        edge_params = mesh_json_list(obj.data, "beamng_edge_params_json")
+        index = selected_indices[0]
+        params = edge_params[index] if index < len(edge_params) and isinstance(edge_params[index], dict) else {}
+        context.scene.beamng_jbeam_beam_spring = str(params.get("beamSpring", ""))
+        context.scene.beamng_jbeam_beam_damp = str(params.get("beamDamp", ""))
+        context.scene.beamng_jbeam_beam_deform = str(params.get("beamDeform", ""))
+        context.scene.beamng_jbeam_beam_strength = str(params.get("beamStrength", ""))
+        context.scene.beamng_jbeam_beam_precompression = str(params.get("beamPrecompression", ""))
+        context.scene.beamng_jbeam_beam_type = str(params.get("beamType", ""))
+        context.scene.beamng_jbeam_beam_break_group = str(params.get("breakGroup", ""))
+        self.report({"INFO"}, "Loaded selected beam properties into the panel")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_apply_selected_jbeam_triangle_properties(Operator):
+    bl_idname = "beamng_pc_importer.apply_selected_jbeam_triangle_properties"
+    bl_label = "Apply Selected Triangle Properties"
+    bl_description = "Store the panel's JBeam triangle option overrides on selected experimental mesh faces"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select an experimental JBeam mesh face first")
+            return {"CANCELLED"}
+        selected_indices = selected_experimental_jbeam_face_indices(obj)
+        if not selected_indices:
+            self.report({"WARNING"}, "No selected JBeam mesh faces found")
+            return {"CANCELLED"}
+        params = selected_triangle_params_from_scene(context.scene)
+        face_params = mesh_json_list(obj.data, "beamng_face_params_json")
+        for index in selected_indices:
+            while index >= len(face_params):
+                face_params.append({})
+            face_params[index] = dict(params)
+        obj.data["beamng_face_params_json"] = json.dumps(face_params)
+        self.report({"INFO"}, f"Applied triangle properties to {len(selected_indices)} selected face(s)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_load_selected_jbeam_triangle_properties(Operator):
+    bl_idname = "beamng_pc_importer.load_selected_jbeam_triangle_properties"
+    bl_label = "Load Selected Triangle Properties"
+    bl_description = "Copy the first selected experimental mesh face's stored JBeam options into the panel fields"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select an experimental JBeam mesh face first")
+            return {"CANCELLED"}
+        selected_indices = selected_experimental_jbeam_face_indices(obj)
+        if not selected_indices:
+            self.report({"WARNING"}, "No selected JBeam mesh faces found")
+            return {"CANCELLED"}
+        face_params = mesh_json_list(obj.data, "beamng_face_params_json")
+        index = selected_indices[0]
+        params = face_params[index] if index < len(face_params) and isinstance(face_params[index], dict) else {}
+        context.scene.beamng_jbeam_triangle_group = str(params.get("group", ""))
+        context.scene.beamng_jbeam_triangle_drag_coef = str(params.get("dragCoef", ""))
+        context.scene.beamng_jbeam_triangle_ground_model = str(params.get("groundModel", ""))
+        context.scene.beamng_jbeam_triangle_collision_override = "collision" in params
+        context.scene.beamng_jbeam_triangle_collision = bool(params.get("collision", True))
+        self.report({"INFO"}, "Loaded selected triangle properties into the panel")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_clear_jbeam_edit_session(Operator):
+    bl_idname = "beamng_pc_importer.clear_jbeam_edit_session"
+    bl_label = "Clear Accepted JBeam Edits"
+    bl_description = "Discard pending and accepted JBeam edit operations from this Blender session without changing meshes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        previous_count = int(context.scene.get("beamng_jbeam_operation_history_count", 0))
+        pending_count = int(context.scene.get("beamng_jbeam_pending_node_move_count", 0))
+        reset_jbeam_edit_session(context.scene)
+        self.report(
+            {"INFO"},
+            f"Cleared {previous_count} accepted and {pending_count} pending JBeam edit operation(s)",
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_write_jbeam_edit_preview(Operator):
+    bl_idname = "beamng_pc_importer.write_jbeam_edit_preview"
+    bl_label = "Write JBeam Edit Preview"
+    bl_description = "Write accepted experimental JBeam edits grouped by source file and part"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        report_path, preview = write_jbeam_edit_preview_report(context.scene)
+        if preview["operation_count"] == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Wrote JBeam edit preview with {preview['operation_count']} operation(s): {report_path}")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_write_jbeam_node_patch_draft(Operator):
+    bl_idname = "beamng_pc_importer.write_jbeam_node_patch_draft"
+    bl_label = "Write JBeam Patch Draft"
+    bl_description = "Write a cache-only node/topology patch draft grouped by source JBeam file and part"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        report_path, draft = write_jbeam_node_patch_draft_report(context.scene)
+        if draft.get("operation_count", draft["node_update_count"]) == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Wrote cache-only JBeam patch draft with {draft.get('operation_count', draft['node_update_count'])} update(s): {report_path}",
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_write_jbeam_override_export_plan(Operator):
+    bl_idname = "beamng_pc_importer.write_jbeam_override_export_plan"
+    bl_label = "Write JBeam Override Export Plan"
+    bl_description = "Write a cache-only plan mapping accepted JBeam edits to safe unpacked mod override targets"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        report_path, plan = write_jbeam_override_export_plan_report(context)
+        if plan.get("operation_count", plan["node_update_count"]) == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            (
+                f"Wrote cache-only override export plan for {plan.get('operation_count', plan['node_update_count'])} update(s), "
+                f"{plan['stageable_file_count']}/{plan['source_file_count']} file(s) stageable: {report_path}"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_validate_jbeam_export(Operator):
+    bl_idname = "beamng_pc_importer.validate_jbeam_export"
+    bl_label = "Validate JBeam Export"
+    bl_description = "Preflight accepted JBeam edits, source patchability, and unpacked mod export targets without writing vehicle files"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        report_path, validation = write_jbeam_export_validation_report(context)
+        if validation.get("operation_count", validation["node_update_count"]) == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        message = (
+            f"JBeam export validation {validation['status']}: "
+            f"{validation['source_preserving_file_count']} source-preserving, "
+            f"{validation['clean_json_fallback_file_count']} fallback, "
+            f"{len(validation['errors'])} error(s), {len(validation['warnings'])} warning(s): {report_path}"
+        )
+        self.report({"ERROR"} if validation["status"] == "fail" else {"WARNING"} if validation["status"] == "warning" else {"INFO"}, message)
+        return {"CANCELLED"} if validation["status"] == "fail" else {"FINISHED"}
+
+
+class BEAMNG_OT_write_jbeam_patched_cache_copies(Operator):
+    bl_idname = "beamng_pc_importer.write_jbeam_patched_cache_copies"
+    bl_label = "Write Patched JBeam Cache Copies"
+    bl_description = "Write cache-only JBeam files with accepted node/topology edits applied for review"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        manifest_path, manifest = write_jbeam_patched_cache_copy_report(context)
+        if manifest.get("operation_count", manifest["node_update_count"]) == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            (
+                f"Wrote patched JBeam cache copies with {manifest.get('changed_operation_count', manifest['changed_node_count'])} applied "
+                f"and {manifest['skipped_update_count']} skipped update(s): {manifest_path}"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_stage_jbeam_user_override_copies(Operator):
+    bl_idname = "beamng_pc_importer.stage_jbeam_user_override_copies"
+    bl_label = "Stage JBeam Mod Override Copies"
+    bl_description = "Copy patched cache JBeam files into user current/mods/unpacked without overwriting existing files"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        populate_jbeam_export_file_selection(context)
+        return context.window_manager.invoke_props_dialog(self, width=760)
+
+    def draw(self, context):
+        draw_jbeam_export_selection(self.layout, context, overwrite_existing=False)
+
+    def execute(self, context):
+        selected_virtual_paths = selected_jbeam_export_virtual_paths(context.scene)
+        if selected_virtual_paths is not None and not selected_virtual_paths:
+            self.report({"WARNING"}, "No JBeam files selected for export")
+            return {"CANCELLED"}
+        stage_manifest_path, stage_manifest = write_jbeam_user_override_stage_report(
+            context,
+            selected_virtual_paths=selected_virtual_paths,
+        )
+        if stage_manifest.get("changed_operation_count", stage_manifest["changed_node_count"]) == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        if stage_manifest["staged_file_count"] == 0:
+            self.report(
+                {"WARNING"},
+                f"No JBeam override files were staged; skipped {stage_manifest['skipped_file_count']} file(s): {stage_manifest_path}",
+            )
+            return {"CANCELLED"}
+        checkpoint = checkpoint_exported_jbeam_operation_history(
+            context.scene,
+            stage_manifest_path,
+            stage_manifest,
+            "stage_user_override_copies",
+            selected_virtual_paths=selected_virtual_paths,
+            current_folder=user_current_folder_from_preferences(context),
+        )
+        self.report(
+            {"INFO"},
+            (
+                f"Staged {stage_manifest['staged_file_count']} JBeam override file(s); "
+                f"skipped {stage_manifest['skipped_file_count']}; "
+                f"history {'cleared' if checkpoint['cleared'] else 'kept'}: {stage_manifest_path}"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_update_jbeam_user_override_copies(Operator):
+    bl_idname = "beamng_pc_importer.update_jbeam_user_override_copies"
+    bl_label = "Update JBeam Mod Override Copies"
+    bl_description = "Overwrite existing user current/mods/unpacked JBeam override files after backing them up into the addon cache"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        populate_jbeam_export_file_selection(context)
+        return context.window_manager.invoke_props_dialog(self, width=760)
+
+    def draw(self, context):
+        draw_jbeam_export_selection(self.layout, context, overwrite_existing=True)
+
+    def execute(self, context):
+        selected_virtual_paths = selected_jbeam_export_virtual_paths(context.scene)
+        if selected_virtual_paths is not None and not selected_virtual_paths:
+            self.report({"WARNING"}, "No JBeam files selected for export")
+            return {"CANCELLED"}
+        stage_manifest_path, stage_manifest = write_jbeam_user_override_stage_report(
+            context,
+            overwrite_existing=True,
+            selected_virtual_paths=selected_virtual_paths,
+        )
+        if stage_manifest.get("changed_operation_count", stage_manifest["changed_node_count"]) == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        if stage_manifest["staged_file_count"] == 0:
+            self.report(
+                {"WARNING"},
+                f"No JBeam override files were updated; skipped {stage_manifest['skipped_file_count']} file(s): {stage_manifest_path}",
+            )
+            return {"CANCELLED"}
+        overwritten = sum(1 for item in stage_manifest["staged_files"] if item.get("overwrote_existing"))
+        checkpoint = checkpoint_exported_jbeam_operation_history(
+            context.scene,
+            stage_manifest_path,
+            stage_manifest,
+            "update_user_override_copies",
+            selected_virtual_paths=selected_virtual_paths,
+            current_folder=user_current_folder_from_preferences(context),
+        )
+        self.report(
+            {"INFO"},
+            (
+                f"Updated {stage_manifest['staged_file_count']} JBeam override file(s), "
+                f"backed up {overwritten} existing file(s), skipped {stage_manifest['skipped_file_count']}: "
+                f"history {'cleared' if checkpoint['cleared'] else 'kept'}: {stage_manifest_path}"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_quick_export_jbeam_node_moves(Operator):
+    bl_idname = "beamng_pc_importer.quick_export_jbeam_node_moves"
+    bl_label = "Quick Export JBeam Edits"
+    bl_description = "Scan all experimental JBeam meshes, accept moved owned nodes, and update unpacked mod overrides with backups"
+    bl_options = {"REGISTER", "UNDO"}
+
+    accepted_count: IntProperty(default=0)
+    scanned_mesh_count: IntProperty(default=0)
+    restored_proxy_count: IntProperty(default=0)
+
+    def invoke(self, context, event):
+        scan_result = scan_experimental_jbeam_mesh_edits(context.scene, active_only=False)
+        accept_result = accept_experimental_jbeam_node_moves(context.scene)
+        self.accepted_count = int(accept_result.get("accepted_count", 0))
+        self.scanned_mesh_count = int(scan_result.get("scanned_mesh_count", 0))
+        self.restored_proxy_count = int(scan_result.get("restored_proxy_count", 0))
+        if self.accepted_count == 0 and int(context.scene.get("beamng_jbeam_operation_history_count", 0)) == 0:
+            self.report(
+                {"WARNING"},
+                (
+                    f"No new JBeam edits found after scanning {self.scanned_mesh_count} JBeam mesh(es); "
+                    f"restored {self.restored_proxy_count} proxy move(s)"
+                ),
+            )
+            return {"CANCELLED"}
+        populate_jbeam_export_file_selection(context)
+        return context.window_manager.invoke_props_dialog(self, width=760)
+
+    def draw(self, context):
+        layout = self.layout
+        if self.accepted_count:
+            layout.label(text=f"Accepted new JBeam edits: {self.accepted_count}")
+        else:
+            layout.label(text="No new edits accepted; exporting existing accepted history.")
+        draw_jbeam_export_selection(layout, context, overwrite_existing=True)
+
+    def execute(self, context):
+        selected_virtual_paths = selected_jbeam_export_virtual_paths(context.scene)
+        if selected_virtual_paths is not None and not selected_virtual_paths:
+            self.report({"WARNING"}, "No JBeam files selected for export")
+            return {"CANCELLED"}
+
+        stage_manifest_path, stage_manifest = write_jbeam_user_override_stage_report(
+            context,
+            overwrite_existing=True,
+            selected_virtual_paths=selected_virtual_paths,
+        )
+        if stage_manifest["staged_file_count"] == 0:
+            self.report(
+                {"WARNING"},
+                (
+                    f"Accepted {self.accepted_count} new JBeam edit(s), but no override files were updated; "
+                    f"skipped {stage_manifest['skipped_file_count']} file(s): {stage_manifest_path}"
+                ),
+            )
+            return {"CANCELLED"}
+
+        overwritten = sum(1 for item in stage_manifest["staged_files"] if item.get("overwrote_existing"))
+        checkpoint = checkpoint_exported_jbeam_operation_history(
+            context.scene,
+            stage_manifest_path,
+            stage_manifest,
+            "quick_export_jbeam_node_moves",
+            selected_virtual_paths=selected_virtual_paths,
+            current_folder=user_current_folder_from_preferences(context),
+        )
+        self.report(
+            {"INFO"},
+            (
+                f"Quick exported {self.accepted_count} new JBeam edit(s); "
+                f"updated {stage_manifest['staged_file_count']} file(s), "
+                f"backed up {overwritten}, skipped {stage_manifest['skipped_file_count']}: "
+                f"history {'cleared' if checkpoint['cleared'] else 'kept'}: {stage_manifest_path}"
+            ),
+        )
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_jbeam_relationship(Operator):
     bl_idname = "beamng_pc_importer.jbeam_relationship"
     bl_label = "JBeam Relationship Action"
@@ -1185,7 +4372,7 @@ class BEAMNG_OT_jbeam_relationship(Operator):
 
     def execute(self, context):
         part_id = selected_jbeam_part_id(context)
-        root = find_jbeam_root_for_object(context, context.active_object)
+        root = find_jbeam_root_for_object(context, selected_active_object(context))
         if root is None or part_id is None:
             self.report({"WARNING"}, "No BeamNG JBeam selection found")
             return {"CANCELLED"}
@@ -1230,7 +4417,7 @@ class BEAMNG_OT_select_jbeam_body_structure(Operator):
 
     def execute(self, context):
         part_id = selected_jbeam_part_id(context)
-        root = find_jbeam_root_for_object(context, context.active_object)
+        root = find_jbeam_root_for_object(context, selected_active_object(context))
         if root is None or part_id is None:
             self.report({"WARNING"}, "No BeamNG JBeam selection found")
             return {"CANCELLED"}
@@ -1268,7 +4455,7 @@ class BEAMNG_OT_show_jbeam_part_with_references(Operator):
 
     def execute(self, context):
         part_id = selected_jbeam_part_id(context)
-        root = find_jbeam_root_for_object(context, context.active_object)
+        root = find_jbeam_root_for_object(context, selected_active_object(context))
         if root is None or part_id is None:
             self.report({"WARNING"}, "No BeamNG JBeam selection found")
             return {"CANCELLED"}
@@ -1992,6 +5179,7 @@ class BEAMNG_OT_apply_slot_configuration(Operator):
         try:
             edited_pc_path, source_pc_path = slot_editor_pc_data_from_scene(context.scene)
             context.scene["beamng_slot_editor_source_pc_path"] = str(source_pc_path)
+            include_user_overrides = bool(context.scene.get("beamng_import_include_user_overrides", True))
             result = import_beamng_pc_path(
                 context,
                 self,
@@ -2001,6 +5189,8 @@ class BEAMNG_OT_apply_slot_configuration(Operator):
                 False,
                 False,
                 f"Edited slot configuration from {source_pc_path}",
+                None,
+                include_user_overrides,
             )
             if "FINISHED" in result:
                 context.scene["beamng_slot_editor_dirty"] = True
@@ -2250,10 +5440,183 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         op.action = "hide"
 
         layout.separator()
+        box = layout.box()
+        box.label(text="Experimental JBeam Mesh Editing")
+        precision = int(context.scene.get("beamng_jbeam_position_precision", JBEAM_POSITION_PRECISION))
+        if context.scene.get("beamng_jbeam_positions_rounded_on_import", False):
+            box.label(text=f"Node positions rounded to {precision} decimals on import", icon="INFO")
+        pending_count = int(context.scene.get("beamng_jbeam_pending_node_move_count", 0))
+        pending_topology_count = int(context.scene.get("beamng_jbeam_pending_topology_change_count", 0))
+        restored_count = int(context.scene.get("beamng_jbeam_restored_proxy_move_count", 0))
+        history_count = int(context.scene.get("beamng_jbeam_operation_history_count", 0))
+        history_breakdown = jbeam_history_counts(jbeam_operation_history(context.scene))
+        checkpoint_count = int(context.scene.get("beamng_jbeam_export_checkpoint_count", 0))
+        box.label(text=f"Pending edits: {pending_count}")
+        if pending_topology_count:
+            box.label(text=f"Pending topology edits: {pending_topology_count}")
+        box.label(text=f"Accepted operations: {history_count}")
+        if history_breakdown.get("beams") or history_breakdown.get("triangles"):
+            box.label(
+                text=(
+                    f"Accepted topology: {history_breakdown.get('beams', 0)} beam, "
+                    f"{history_breakdown.get('triangles', 0)} triangle"
+                )
+            )
+        if checkpoint_count:
+            box.label(text=f"Export checkpoints: {checkpoint_count}")
+        if restored_count:
+            box.label(text=f"Proxy moves restored: {restored_count}")
+        row = box.row(align=True)
+        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan Active")
+        op.active_only = True
+        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan All")
+        op.active_only = False
+        row = box.row(align=True)
+        row.enabled = pending_count > 0
+        row.operator(BEAMNG_OT_accept_experimental_jbeam_node_moves.bl_idname, text="Accept Pending Edits")
+        row = box.row(align=True)
+        row.enabled = pending_count > 0 or history_count > 0
+        row.operator(BEAMNG_OT_clear_jbeam_edit_session.bl_idname, text="Discard Session Edits")
+
+        box.separator()
+        box.label(text=f"Export mod: {jbeam_export_mod_name(context)}")
+        box.label(text="JBeam target: current/mods/unpacked/<mod>/vehicles")
+        row = box.row(align=True)
+        row.enabled = history_count > 0
+        row.operator(BEAMNG_OT_validate_jbeam_export.bl_idname, text="Validate Export")
+        row = box.row(align=True)
+        row.enabled = history_count > 0
+        row.operator(BEAMNG_OT_stage_jbeam_user_override_copies.bl_idname, text="Stage New Files")
+        row = box.row(align=True)
+        row.operator(BEAMNG_OT_quick_export_jbeam_node_moves.bl_idname, text="Quick Export Selected")
+        last_validation_path = context.scene.get("beamng_jbeam_last_export_validation_path", "")
+        if last_validation_path:
+            status = context.scene.get("beamng_jbeam_last_export_validation_status", "")
+            box.label(text=f"Last validation: {status} / {Path(last_validation_path).name}")
+        last_stage_manifest_path = context.scene.get(
+            "beamng_jbeam_last_mod_override_stage_manifest_path",
+            context.scene.get("beamng_jbeam_last_user_override_stage_manifest_path", ""),
+        )
+        if last_stage_manifest_path:
+            box.label(text=f"Last mod stage: {Path(last_stage_manifest_path).name}")
+        last_checkpoint_path = context.scene.get("beamng_jbeam_last_export_checkpoint_path", "")
+        if last_checkpoint_path:
+            box.label(text=f"Last checkpoint: {Path(last_checkpoint_path).name}")
+
+        active_mesh = active_experimental_jbeam_mesh(context)
+        if active_mesh and active_mesh.get("beamng_visual_type") == "experimental_jbeam_mesh":
+            box.label(text=f"Active: {active_mesh.get('beamng_part_name', '')}")
+            box.label(text=f"Object: {active_mesh.name}")
+            box.label(text=f"Mode: {active_mesh.mode}")
+            box.label(text=f"Owned nodes: {active_mesh.get('beamng_owned_node_count', 0)}")
+            box.label(text=f"Proxy nodes: {active_mesh.get('beamng_proxy_node_count', 0)}")
+            row = box.row(align=True)
+            row.operator(BEAMNG_OT_mark_selected_edges_as_jbeam_beams.bl_idname, text="Mark Edges As Beams")
+            row.operator(BEAMNG_OT_report_experimental_jbeam_selection.bl_idname, text="Report Selection")
+            selected_nodes = experimental_jbeam_node_info_for_selection(context)
+            selected_edges = experimental_jbeam_edge_info_for_selection(context)
+            selected_faces = experimental_jbeam_face_info_for_selection(context)
+            if selected_nodes or selected_edges or selected_faces:
+                element_box = box.box()
+                element_box.label(text="Selected JBeam elements")
+            if selected_nodes:
+                node_box = element_box.box()
+                node_box.label(text=f"Node{'s' if len(selected_nodes) != 1 else ''}")
+                for node_info in selected_nodes:
+                    row = node_box.row(align=True)
+                    row.label(text=f"{node_info['node_id']} ({node_info['kind']})")
+                    row.label(text=f"v{node_info['vertex_index']}")
+                    if not node_info.get("committed", True):
+                        node_box.label(text="Status: new provisional node")
+                    node_box.label(text=f"Position: {node_info['current_position']}")
+                    if node_info["baseline_position"] and node_info["baseline_position"] != node_info["current_position"]:
+                        node_box.label(text=f"Baseline: {node_info['baseline_position']}")
+                    if node_info["pending_position"]:
+                        node_box.label(text=f"Pending move: {node_info['pending_position']}")
+                    if node_info["accepted_position"]:
+                        node_box.label(text=f"Accepted move: {node_info['accepted_position']}")
+                    if node_info["kind"] == "proxy":
+                        node_box.label(text=f"Owner part id: {node_info['owner_part_id']}")
+                    params = node_info.get("params", {})
+                    if params:
+                        node_box.label(text=f"Effective params: {params}")
+                    elif not node_info.get("committed", True):
+                        node_box.label(text="Params: none yet, uses surrounding JBeam context unless set below")
+                    else:
+                        node_box.label(text="Effective params: none found in source context")
+                props_box = node_box.box()
+                props_box.label(text="Selected/New Node Parameters")
+                props_box.prop(context.scene, "beamng_jbeam_node_weight")
+                props_box.prop(context.scene, "beamng_jbeam_node_material")
+                props_box.prop(context.scene, "beamng_jbeam_node_group")
+                props_box.prop(context.scene, "beamng_jbeam_node_friction")
+                props_box.prop(context.scene, "beamng_jbeam_node_collision_override")
+                if context.scene.beamng_jbeam_node_collision_override:
+                    props_box.prop(context.scene, "beamng_jbeam_node_collision")
+                props_box.prop(context.scene, "beamng_jbeam_node_self_collision_override")
+                if context.scene.beamng_jbeam_node_self_collision_override:
+                    props_box.prop(context.scene, "beamng_jbeam_node_self_collision")
+                row = props_box.row(align=True)
+                row.operator(BEAMNG_OT_load_selected_jbeam_node_properties.bl_idname, text="Load From Selected")
+                row.operator(BEAMNG_OT_apply_selected_jbeam_node_properties.bl_idname, text="Apply To Selected")
+            if selected_edges:
+                edge_box = element_box.box()
+                edge_box.label(text=f"Selected edge{'s' if len(selected_edges) != 1 else ''}")
+                for edge_info in selected_edges:
+                    edge_box.label(
+                        text=f"e{edge_info['edge_index']}: {edge_info['id1']} -> {edge_info['id2']}"
+                    )
+                    params = edge_info.get("params", {})
+                    edge_box.label(text=f"Effective params: {params if params else 'none found in source context'}")
+                edge_box.label(text="New triangle boundary edges are not beams unless marked.")
+                beam_props_box = edge_box.box()
+                beam_props_box.label(text="Selected/New Beam Parameters")
+                beam_props_box.prop(context.scene, "beamng_jbeam_beam_spring")
+                beam_props_box.prop(context.scene, "beamng_jbeam_beam_damp")
+                beam_props_box.prop(context.scene, "beamng_jbeam_beam_deform")
+                beam_props_box.prop(context.scene, "beamng_jbeam_beam_strength")
+                beam_props_box.prop(context.scene, "beamng_jbeam_beam_precompression")
+                beam_props_box.prop(context.scene, "beamng_jbeam_beam_type")
+                beam_props_box.prop(context.scene, "beamng_jbeam_beam_break_group")
+                row = beam_props_box.row(align=True)
+                row.operator(BEAMNG_OT_load_selected_jbeam_beam_properties.bl_idname, text="Load From Selected")
+                row.operator(BEAMNG_OT_apply_selected_jbeam_beam_properties.bl_idname, text="Apply To Selected")
+            if selected_faces:
+                face_box = element_box.box()
+                face_box.label(text=f"Collision triangle{'s' if len(selected_faces) != 1 else ''}")
+                for face_info in selected_faces:
+                    face_box.label(
+                        text=(
+                            f"f{face_info['face_index']}: "
+                            f"{face_info['id1']} -> {face_info['id2']} -> {face_info['id3']}"
+                        )
+                    )
+                    params = face_info.get("params", {})
+                    face_box.label(text=f"Effective params: {params if params else 'none found in source context'}")
+                face_box.label(text="Node order is collision winding; preserve unless intentional.")
+                tri_props_box = face_box.box()
+                tri_props_box.label(text="Selected/New Triangle Parameters")
+                tri_props_box.prop(context.scene, "beamng_jbeam_triangle_group")
+                tri_props_box.prop(context.scene, "beamng_jbeam_triangle_drag_coef")
+                tri_props_box.prop(context.scene, "beamng_jbeam_triangle_ground_model")
+                tri_props_box.prop(context.scene, "beamng_jbeam_triangle_collision_override")
+                if context.scene.beamng_jbeam_triangle_collision_override:
+                    tri_props_box.prop(context.scene, "beamng_jbeam_triangle_collision")
+                row = tri_props_box.row(align=True)
+                row.operator(BEAMNG_OT_load_selected_jbeam_triangle_properties.bl_idname, text="Load From Selected")
+                row.operator(BEAMNG_OT_apply_selected_jbeam_triangle_properties.bl_idname, text="Apply To Selected")
+            if not selected_nodes and not selected_edges and not selected_faces:
+                box.label(text="Select JBeam mesh vertices/edges/faces to inspect elements.")
+                box.label(text=f"Debug: {active_object_debug_label(context)}")
+        else:
+            box.label(text="No experimental JBeam mesh is active.")
+            box.label(text=f"Debug: {active_object_debug_label(context)}")
+
+        layout.separator()
         draw_vehicle_slot_editor(layout, context)
 
         layout.separator()
-        active = context.active_object
+        active = selected_active_object(context)
         if active and active.get("beamng_layer") == "jbeam":
             visual_type = active.get("beamng_visual_type", "")
             box = layout.box()
@@ -2329,6 +5692,11 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         description="Reuse parsed JBeam/DAE catalog data across imports while the add-on remains loaded",
         default=True,
     )
+    jbeam_export_mod_name: StringProperty(
+        name="JBeam Export Mod Folder",
+        description="Folder under BeamNG user current/mods/unpacked used for staged JBeam overrides",
+        default=DEFAULT_JBEAM_EXPORT_MOD_NAME,
+    )
 
     def draw(self, _context):
         layout = self.layout
@@ -2336,6 +5704,7 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         layout.prop(self, "beamng_user_folder")
         layout.prop(self, "vanilla_vehicles_folder")
         layout.prop(self, "cache_asset_catalogs")
+        layout.prop(self, "jbeam_export_mod_name")
 
 
 def get_addon_preferences(context):
@@ -2372,6 +5741,7 @@ def import_beamng_pc_path(
     create_experimental_jbeam_meshes_option=False,
     source_description="",
     source_asset=None,
+    include_user_overrides=True,
 ):
     wm = context.window_manager
     update_import_progress.last_percent = None
@@ -2386,6 +5756,9 @@ def import_beamng_pc_path(
     ]
     if source_description:
         report_lines.append(f"Selected source: {source_description}")
+    context.scene["beamng_import_include_user_overrides"] = include_user_overrides
+    reset_jbeam_edit_session(context.scene)
+    report_lines.append("JBeam edit session reset for this import.")
 
     try:
         update_import_progress(context, 1, "checking selected file")
@@ -2406,12 +5779,14 @@ def import_beamng_pc_path(
             beamng_user_folder,
             vanilla_vehicles_folder,
             cache_asset_catalogs,
+            include_user_overrides,
         )
         report_lines.extend(
             [
                 f"Vehicle folder inferred as: {pc_path.parent.name}",
                 f"User folder preference: {beamng_user_folder or '(not set)'}",
                 f"Vanilla vehicles preference: {vanilla_vehicles_folder or '(not set)'}",
+                f"User mods/overrides in resolver: {'enabled' if include_user_overrides else 'ignored'}",
                 f"JBeam sources found: {len(jbeam_sources)}",
                 f"DAE sources found: {len(dae_sources)}",
             ]
@@ -2559,6 +5934,15 @@ def import_beamng_pc_path(
                 resolved_parts,
             )
             report_lines.append(f"Experimental JBeam mesh parts: {experimental_mesh_count}")
+            report_lines.append(
+                f"Experimental JBeam mesh node positions were rounded to {JBEAM_POSITION_PRECISION} decimal places on import."
+            )
+            context.scene["beamng_jbeam_position_precision"] = JBEAM_POSITION_PRECISION
+            context.scene["beamng_jbeam_positions_rounded_on_import"] = True
+            operator.report(
+                {"INFO"},
+                f"Experimental JBeam mesh node positions rounded to {JBEAM_POSITION_PRECISION} decimal places",
+            )
         vehicle_model = str(pc_data.get("model", ""))
 
         update_import_progress(context, 35, "cataloging DAE assets")
@@ -2688,6 +6072,16 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
         description="Create one editable Blender mesh per resolved JBeam part using nodes as vertices, beams as edges, and triangles as faces",
         default=False,
     )
+    include_user_overrides: BoolProperty(
+        name="Use User Mods/Overrides",
+        description="Resolve JBeam/DAE data from BeamNG user mods as well as vanilla sources",
+        default=True,
+    )
+    vanilla_data_only: BoolProperty(
+        name="Vanilla Data Only (No Mods/Overrides)",
+        description="Ignore user mods while resolving JBeam/DAE data",
+        default=False,
+    )
 
     def draw(self, _context):
         layout = self.layout
@@ -2696,6 +6090,9 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
         layout.prop(self, "selectable_jbeam_debug")
         layout.prop(self, "show_jbeam_node_labels")
         layout.prop(self, "create_experimental_jbeam_meshes")
+        layout.prop(self, "vanilla_data_only")
+        if not self.vanilla_data_only:
+            layout.prop(self, "include_user_overrides")
 
     def execute(self, context):
         filepath = Path(self.filepath)
@@ -2705,6 +6102,8 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
         context.scene["beamng_slot_editor_source_label_prefix"] = ""
         context.scene["beamng_slot_editor_source_zip_path"] = ""
         context.scene["beamng_slot_editor_source_zip_entry"] = ""
+        include_user_overrides = bool(self.include_user_overrides and not self.vanilla_data_only)
+        context.scene["beamng_import_include_user_overrides"] = include_user_overrides
         return import_beamng_pc_path(
             context,
             self,
@@ -2716,6 +6115,7 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
             self.create_experimental_jbeam_meshes,
             str(filepath),
             None,
+            include_user_overrides,
         )
 
 
@@ -2791,6 +6191,84 @@ def pc_vehicle_updated(self, context):
         refresh_pc_source_options(context)
     keys = PC_SOURCE_KEYS_BY_VEHICLE.get(self.pc_vehicle_key, [])
     self.pc_config_key = keys[0] if keys else ""
+    source = PC_SOURCE_BY_KEY.get(self.pc_config_key)
+    if source is not None:
+        label_prefix = str(getattr(source, "label_prefix", "")).lower()
+        self.include_user_overrides = not label_prefix.startswith("vanilla")
+        self.vanilla_data_only = not self.include_user_overrides
+
+
+def pc_config_updated(self, context):
+    if not PC_VEHICLE_ENUM_ITEMS:
+        refresh_pc_source_options(context)
+    source = PC_SOURCE_BY_KEY.get(self.pc_config_key)
+    if source is None:
+        return
+    label_prefix = str(getattr(source, "label_prefix", "")).lower()
+    self.include_user_overrides = not label_prefix.startswith("vanilla")
+    self.vanilla_data_only = not self.include_user_overrides
+
+
+def source_is_vanilla_asset(source):
+    label_prefix = str(getattr(source, "label_prefix", "")).lower()
+    return label_prefix.startswith("vanilla")
+
+
+def user_override_asset_summary_for_source(context, source):
+    prefs = get_addon_preferences(context)
+    user_folder = prefs.beamng_user_folder if prefs else ""
+    cache_asset_catalogs = prefs.cache_asset_catalogs if prefs else True
+    if not user_folder or source is None:
+        return {"count": 0, "labels": []}
+
+    vehicle_name = pc_vehicle_from_virtual_path(source.virtual_path)
+    if not vehicle_name:
+        return {"count": 0, "labels": []}
+
+    current_folder = user_current_folder_from_preferences(context)
+    if current_folder is None:
+        return {"count": 0, "labels": []}
+
+    labels = []
+    total_count = 0
+    mods_folder = current_folder / "mods"
+    unpacked_folder = mods_folder / "unpacked"
+    if unpacked_folder.exists():
+        for mod_root in sorted(path for path in unpacked_folder.iterdir() if path.is_dir()):
+            mod_count = 0
+            for candidate_root in (
+                mod_root / "vehicles" / vehicle_name,
+                mod_root / "content" / "vehicles" / vehicle_name,
+            ):
+                if candidate_root.exists():
+                    mod_count += sum(
+                        1
+                        for path in candidate_root.rglob("*")
+                        if path.is_file() and path.suffix.lower() in {".jbeam", ".dae"}
+                    )
+            if mod_count:
+                total_count += mod_count
+                labels.append(f"current/mods/unpacked/{mod_root.name}: {mod_count} JBeam/DAE file(s)")
+
+    if mods_folder.exists():
+        wanted_prefixes = (
+            f"vehicles/{vehicle_name.lower()}/",
+            f"content/vehicles/{vehicle_name.lower()}/",
+        )
+        for zip_path in sorted(mods_folder.glob("*.zip")):
+            zip_count = 0
+            for entry in zip_contents_for_path(zip_path, cache_asset_catalogs):
+                entry_name = normalize_virtual_path(entry.get("filename", ""))
+                entry_lower = entry_name.lower()
+                if not entry_lower.endswith((".jbeam", ".dae")):
+                    continue
+                if entry_lower.startswith(wanted_prefixes):
+                    zip_count += 1
+            if zip_count:
+                total_count += zip_count
+                labels.append(f"current/mods/{zip_path.name}: {zip_count} JBeam/DAE file(s)")
+
+    return {"count": total_count, "labels": labels}
 
 
 class IMPORT_OT_beamng_pc_from_assets(Operator):
@@ -2808,6 +6286,7 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
         name="Configuration",
         description="A .pc configuration discovered for the selected vehicle",
         items=pc_config_enum_items,
+        update=pc_config_updated,
     )
     clear_existing: BoolProperty(
         name="Clear Existing Imported Collection",
@@ -2834,6 +6313,16 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
         description="Create one editable Blender mesh per resolved JBeam part using nodes as vertices, beams as edges, and triangles as faces",
         default=False,
     )
+    include_user_overrides: BoolProperty(
+        name="Use User Mods/Overrides",
+        description="Resolve JBeam/DAE data from BeamNG user mods as well as vanilla sources",
+        default=True,
+    )
+    vanilla_data_only: BoolProperty(
+        name="Vanilla Data Only (No Mods/Overrides)",
+        description="Ignore user mods while resolving JBeam/DAE data",
+        default=False,
+    )
 
     def invoke(self, context, _event):
         refresh_pc_source_options(context)
@@ -2846,18 +6335,38 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
         self.pc_vehicle_key = PC_VEHICLE_ENUM_ITEMS[0][0]
         keys = PC_SOURCE_KEYS_BY_VEHICLE.get(self.pc_vehicle_key, [])
         self.pc_config_key = keys[0] if keys else ""
+        source = PC_SOURCE_BY_KEY.get(self.pc_config_key)
+        if source is not None:
+            label_prefix = str(getattr(source, "label_prefix", "")).lower()
+            self.include_user_overrides = not label_prefix.startswith("vanilla")
+            self.vanilla_data_only = not self.include_user_overrides
         return context.window_manager.invoke_props_dialog(self, width=650)
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "pc_vehicle_key")
         layout.prop(self, "pc_config_key")
+        source = PC_SOURCE_BY_KEY.get(self.pc_config_key)
+        if source is not None and source_is_vanilla_asset(source):
+            summary = user_override_asset_summary_for_source(context, source)
+            if summary["count"]:
+                box = layout.box()
+                box.alert = True
+                box.label(text="User mod assets found for this vanilla vehicle", icon="ERROR")
+                box.label(text="Default: ignore them for a true vanilla import.")
+                for label in summary["labels"][:4]:
+                    box.label(text=label)
+                if len(summary["labels"]) > 4:
+                    box.label(text=f"... plus {len(summary['labels']) - 4} more source group(s)")
         layout.separator()
         layout.prop(self, "clear_existing")
         layout.prop(self, "include_jbeam_visuals")
         layout.prop(self, "selectable_jbeam_debug")
         layout.prop(self, "show_jbeam_node_labels")
         layout.prop(self, "create_experimental_jbeam_meshes")
+        layout.prop(self, "vanilla_data_only")
+        if not self.vanilla_data_only:
+            layout.prop(self, "include_user_overrides")
 
     def execute(self, context):
         source = PC_SOURCE_BY_KEY.get(self.pc_config_key)
@@ -2879,6 +6388,14 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
         context.scene["beamng_slot_editor_source_label_prefix"] = source.label_prefix
         context.scene["beamng_slot_editor_source_zip_path"] = source.zip_path
         context.scene["beamng_slot_editor_source_zip_entry"] = source.zip_entry
+        include_user_overrides = bool(self.include_user_overrides and not self.vanilla_data_only)
+        context.scene["beamng_import_include_user_overrides"] = include_user_overrides
+        if source_is_vanilla_asset(source):
+            summary = user_override_asset_summary_for_source(context, source)
+            if summary["count"] and include_user_overrides:
+                self.report({"WARNING"}, f"Vanilla import is allowing {summary['count']} user mod asset(s)")
+            elif summary["count"]:
+                self.report({"INFO"}, f"Vanilla import is ignoring {summary['count']} user mod asset(s)")
         return import_beamng_pc_path(
             context,
             self,
@@ -2890,6 +6407,7 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
             self.create_experimental_jbeam_meshes,
             source_description,
             source,
+            include_user_overrides,
         )
 
 
@@ -2955,6 +6473,7 @@ def menu_func_jbeam_context(self, context):
 
 classes = (
     BeamNGSlotEditorItem,
+    BeamNGJBeamExportFileItem,
     BeamNGPCImporterPreferences,
     BEAMNG_OT_set_visibility,
     BEAMNG_OT_jbeam_relationship,
@@ -2963,6 +6482,25 @@ classes = (
     BEAMNG_OT_show_all_jbeams,
     BEAMNG_OT_hide_selected_jbeam_items,
     BEAMNG_OT_set_jbeam_visual_visibility,
+    BEAMNG_OT_scan_experimental_jbeam_mesh_edits,
+    BEAMNG_OT_accept_experimental_jbeam_node_moves,
+    BEAMNG_OT_mark_selected_edges_as_jbeam_beams,
+    BEAMNG_OT_report_experimental_jbeam_selection,
+    BEAMNG_OT_apply_selected_jbeam_node_properties,
+    BEAMNG_OT_load_selected_jbeam_node_properties,
+    BEAMNG_OT_apply_selected_jbeam_beam_properties,
+    BEAMNG_OT_load_selected_jbeam_beam_properties,
+    BEAMNG_OT_apply_selected_jbeam_triangle_properties,
+    BEAMNG_OT_load_selected_jbeam_triangle_properties,
+    BEAMNG_OT_clear_jbeam_edit_session,
+    BEAMNG_OT_write_jbeam_edit_preview,
+    BEAMNG_OT_write_jbeam_node_patch_draft,
+    BEAMNG_OT_write_jbeam_override_export_plan,
+    BEAMNG_OT_validate_jbeam_export,
+    BEAMNG_OT_write_jbeam_patched_cache_copies,
+    BEAMNG_OT_stage_jbeam_user_override_copies,
+    BEAMNG_OT_update_jbeam_user_override_copies,
+    BEAMNG_OT_quick_export_jbeam_node_moves,
     BEAMNG_OT_setup_split_prop_flexbody_views,
     BEAMNG_OT_set_active_view_filter,
     BEAMNG_OT_exit_split_local_views,
@@ -2984,17 +6522,115 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.beamng_slot_editor_items = CollectionProperty(type=BeamNGSlotEditorItem)
+    bpy.types.Scene.beamng_jbeam_export_file_items = CollectionProperty(type=BeamNGJBeamExportFileItem)
+    bpy.types.Scene.beamng_jbeam_node_weight = StringProperty(
+        name="nodeWeight",
+        description="Optional JBeam nodeWeight to apply before inserted/new selected nodes",
+        default="",
+    )
+    bpy.types.Scene.beamng_jbeam_node_material = StringProperty(
+        name="nodeMaterial",
+        description="Optional JBeam nodeMaterial to apply before inserted/new selected nodes",
+        default="",
+    )
+    bpy.types.Scene.beamng_jbeam_node_group = StringProperty(
+        name="group",
+        description="Optional JBeam node group to apply before inserted/new selected nodes",
+        default="",
+    )
+    bpy.types.Scene.beamng_jbeam_node_friction = StringProperty(
+        name="frictionCoef",
+        description="Optional JBeam frictionCoef to apply before inserted/new selected nodes",
+        default="",
+    )
+    bpy.types.Scene.beamng_jbeam_node_collision_override = BoolProperty(
+        name="Set collision",
+        description="Write an explicit collision option for inserted/new selected nodes",
+        default=False,
+    )
+    bpy.types.Scene.beamng_jbeam_node_collision = BoolProperty(
+        name="collision",
+        description="Explicit JBeam collision value for inserted/new selected nodes",
+        default=True,
+    )
+    bpy.types.Scene.beamng_jbeam_node_self_collision_override = BoolProperty(
+        name="Set selfCollision",
+        description="Write an explicit selfCollision option for inserted/new selected nodes",
+        default=False,
+    )
+    bpy.types.Scene.beamng_jbeam_node_self_collision = BoolProperty(
+        name="selfCollision",
+        description="Explicit JBeam selfCollision value for inserted/new selected nodes",
+        default=False,
+    )
+    bpy.types.Scene.beamng_jbeam_beam_spring = StringProperty(name="beamSpring", default="")
+    bpy.types.Scene.beamng_jbeam_beam_damp = StringProperty(name="beamDamp", default="")
+    bpy.types.Scene.beamng_jbeam_beam_deform = StringProperty(name="beamDeform", default="")
+    bpy.types.Scene.beamng_jbeam_beam_strength = StringProperty(name="beamStrength", default="")
+    bpy.types.Scene.beamng_jbeam_beam_precompression = StringProperty(name="beamPrecompression", default="")
+    bpy.types.Scene.beamng_jbeam_beam_type = StringProperty(name="beamType", default="")
+    bpy.types.Scene.beamng_jbeam_beam_break_group = StringProperty(name="breakGroup", default="")
+    bpy.types.Scene.beamng_jbeam_triangle_group = StringProperty(name="group", default="")
+    bpy.types.Scene.beamng_jbeam_triangle_drag_coef = StringProperty(name="dragCoef", default="")
+    bpy.types.Scene.beamng_jbeam_triangle_ground_model = StringProperty(name="groundModel", default="")
+    bpy.types.Scene.beamng_jbeam_triangle_collision_override = BoolProperty(
+        name="Set collision",
+        description="Write an explicit collision option for inserted/new selected triangles",
+        default=False,
+    )
+    bpy.types.Scene.beamng_jbeam_triangle_collision = BoolProperty(name="collision", default=True)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.VIEW3D_MT_view.append(menu_func_view_sync)
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func_jbeam_context)
+    if clear_jbeam_edit_sessions_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(clear_jbeam_edit_sessions_on_load)
+    if not bpy.app.timers.is_registered(experimental_jbeam_panel_redraw_timer):
+        bpy.app.timers.register(experimental_jbeam_panel_redraw_timer, first_interval=0.5, persistent=True)
+# Blender 4.2 restricts bpy.data during addon registration
+try:
+    scenes = getattr(bpy.data, "scenes", [])
+    for scene in scenes:
+        reset_jbeam_edit_session(scene)
+except Exception:
+    pass
 
 
 def unregister():
+    if bpy.app.timers.is_registered(experimental_jbeam_panel_redraw_timer):
+        bpy.app.timers.unregister(experimental_jbeam_panel_redraw_timer)
+    if clear_jbeam_edit_sessions_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(clear_jbeam_edit_sessions_on_load)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func_jbeam_context)
     bpy.types.VIEW3D_MT_view.remove(menu_func_view_sync)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     if hasattr(bpy.types.Scene, "beamng_slot_editor_items"):
         del bpy.types.Scene.beamng_slot_editor_items
+    if hasattr(bpy.types.Scene, "beamng_jbeam_export_file_items"):
+        del bpy.types.Scene.beamng_jbeam_export_file_items
+    for prop_name in (
+        "beamng_jbeam_node_weight",
+        "beamng_jbeam_node_material",
+        "beamng_jbeam_node_group",
+        "beamng_jbeam_node_friction",
+        "beamng_jbeam_node_collision_override",
+        "beamng_jbeam_node_collision",
+        "beamng_jbeam_node_self_collision_override",
+        "beamng_jbeam_node_self_collision",
+        "beamng_jbeam_beam_spring",
+        "beamng_jbeam_beam_damp",
+        "beamng_jbeam_beam_deform",
+        "beamng_jbeam_beam_strength",
+        "beamng_jbeam_beam_precompression",
+        "beamng_jbeam_beam_type",
+        "beamng_jbeam_beam_break_group",
+        "beamng_jbeam_triangle_group",
+        "beamng_jbeam_triangle_drag_coef",
+        "beamng_jbeam_triangle_ground_model",
+        "beamng_jbeam_triangle_collision_override",
+        "beamng_jbeam_triangle_collision",
+    ):
+        if hasattr(bpy.types.Scene, prop_name):
+            delattr(bpy.types.Scene, prop_name)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 

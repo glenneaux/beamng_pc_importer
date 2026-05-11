@@ -69,6 +69,7 @@ class JBeamNodeSpec:
     position: Vector
     part_name: str
     resolved_part_id: int = -1
+    options: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -79,6 +80,7 @@ class JBeamBeamSpec:
     end: Vector
     part_name: str
     resolved_part_id: int = -1
+    options: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -91,6 +93,7 @@ class JBeamTriangleSpec:
     p3: Vector
     part_name: str
     resolved_part_id: int = -1
+    options: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -215,6 +218,14 @@ def persistent_cache_dir():
     cache_dir = Path(bpy.utils.user_resource("CONFIG", path="beamng_pc_importer_cache", create=True))
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
+
+def path_is_inside_plugin_cache(path: Path):
+    try:
+        path.resolve().relative_to(persistent_cache_dir().resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def persistent_cache_key(source):
@@ -833,6 +844,8 @@ def vehicle_folder_from_vehicles_root(vehicles_root: Path, vehicle_name: str):
 def add_file_asset_sources(sources, root: Path, pattern: str, virtual_prefix: str, precedence: int, asset_type: str):
     if not root or not root.exists() or not root.is_dir():
         return
+    if path_is_inside_plugin_cache(root):
+        return
     prefix = Path(virtual_prefix)
     for path in root.rglob(pattern):
         if not path.is_file():
@@ -899,6 +912,8 @@ def pc_vehicle_from_virtual_path(virtual_path: str):
 
 def add_file_pc_sources(sources, root: Path, precedence: int, label_prefix: str = ""):
     if not root or not root.exists() or not root.is_dir():
+        return
+    if path_is_inside_plugin_cache(root):
         return
     for path in sorted(root.rglob("*.pc")):
         if not path.is_file():
@@ -995,7 +1010,13 @@ def materialize_pc_asset(source: BeamNGAssetSource):
     return output_path
 
 
-def collect_beamng_asset_sources(pc_path: Path, user_folder: str = "", vanilla_folder: str = "", cache_enabled=True):
+def collect_beamng_asset_sources(
+    pc_path: Path,
+    user_folder: str = "",
+    vanilla_folder: str = "",
+    cache_enabled=True,
+    include_user_assets=True,
+):
     vehicle_name = pc_path.parent.name
     selected_vehicle_root = pc_path.parent
     current_folder = resolve_user_current_folder(user_folder, pc_path)
@@ -1004,6 +1025,15 @@ def collect_beamng_asset_sources(pc_path: Path, user_folder: str = "", vanilla_f
 
     jbeam_sources = []
     dae_sources = []
+
+    def is_loose_user_vehicle_root(root):
+        if not current_folder or not root:
+            return False
+        try:
+            root.resolve().relative_to((current_folder / "vehicles").resolve())
+            return True
+        except (OSError, ValueError):
+            return False
 
     def add_vehicle_root(root, precedence):
         if not root:
@@ -1022,7 +1052,7 @@ def collect_beamng_asset_sources(pc_path: Path, user_folder: str = "", vanilla_f
             add_zip_asset_sources(jbeam_sources, zip_path, vehicle_name, ".jbeam", 0, cache_enabled)
             add_zip_asset_sources(dae_sources, zip_path, vehicle_name, ".dae", 0, cache_enabled)
 
-    if current_folder:
+    if include_user_assets and current_folder:
         mods_folder = current_folder / "mods"
         unpacked_folder = mods_folder / "unpacked"
         if unpacked_folder.exists():
@@ -1038,9 +1068,8 @@ def collect_beamng_asset_sources(pc_path: Path, user_folder: str = "", vanilla_f
                 add_zip_asset_sources(jbeam_sources, zip_path, vehicle_name, ".jbeam", precedence, cache_enabled)
                 add_zip_asset_sources(dae_sources, zip_path, vehicle_name, ".dae", precedence, cache_enabled)
 
-        add_vehicle_root(current_folder / "vehicles" / vehicle_name, 30)
-
-    add_vehicle_root(selected_vehicle_root, 40)
+    if not is_loose_user_vehicle_root(selected_vehicle_root):
+        add_vehicle_root(selected_vehicle_root, 40)
     return jbeam_sources, dae_sources, Path(f"vehicles/{vehicle_name}")
 
 
@@ -1229,6 +1258,37 @@ def parse_nodes(part_def: PartDefinition, base_transform: Matrix, component_cont
     return nodes
 
 
+def jbeam_option_metadata(options):
+    try:
+        return json.loads(json.dumps(options or {}, default=str))
+    except (TypeError, ValueError):
+        return {str(key): str(value) for key, value in (options or {}).items()}
+
+
+def parse_node_options(part_def: PartDefinition, component_context=None):
+    node_options = {}
+    rows = part_def.data.get("nodes", [])
+    if not isinstance(rows, list):
+        return node_options
+
+    current_options = {}
+    for row in rows:
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
+        if not isinstance(row, list) or len(row) < 4:
+            continue
+        if row and row[0] == "id":
+            continue
+
+        inline_options = row[4] if len(row) > 4 and isinstance(row[4], dict) else {}
+        options = merge_options(current_options, inline_options)
+        if is_disabled(options, component_context):
+            continue
+        node_options[str(row[0])] = jbeam_option_metadata(options)
+    return node_options
+
+
 def parse_beams(
     part_def: PartDefinition,
     local_node_positions=None,
@@ -1279,6 +1339,7 @@ def parse_beams(
                 end=end,
                 part_name=part_def.name,
                 resolved_part_id=resolved_part_id,
+                options=jbeam_option_metadata(options),
             )
         )
     return beams
@@ -1338,6 +1399,7 @@ def parse_triangles(
                 p3=p3,
                 part_name=part_def.name,
                 resolved_part_id=resolved_part_id,
+                options=jbeam_option_metadata(options),
             )
         )
     return triangles

@@ -16,10 +16,13 @@ Use this as a parking place for ideas, concepts, bugs, and things to revisit.
 - PC export is experimental. Future work needs to verify that all complete .pc information survives export, including paint specs/colors and any other non-slot configuration data used by complex vehicles.
 - Continue investigating BeamNG paint data support. Future work should map how paint details are split across .pc `paints` data, JBeam paint/skin/material slots, `globalSkin`, dynamic decal materials, and `.materials.json`/`skin.materials.json` files so export/editing preserves the full visual configuration.
 - Revisit prop import logic. Props are still not importing correctly, even for visual/reference purposes, so their placement/orientation/scale pipeline needs another dedicated pass.
+- Harden identity-first topology editing. The current pass assigns provisional ids and metadata to new mesh vertices, but a later pass should move this fully onto persistent Blender vertex/edge/face custom data so ids survive arbitrary delete/merge/reorder operations instead of relying mainly on aligned mesh metadata arrays.
 
 ## Design Questions
 
 - Investigate robust synchronized 3D View navigation for independent BeamNG views. Blender Quad View supports synced zoom/pan, but it does not fit the independent Flex/Props/JBeam viewport filtering workflow because Quad View shares display settings. Current custom sync is intentionally one-way: the 3D View where sync is enabled drives all other 3D Views. Future work should consider a dedicated ViewSync-style implementation if secondary/third view manipulation should eventually drive the others too.
+- Revisit import source-loading strategy. For now, loading a vanilla configuration should warn only when user mod assets would affect it, and the importer should provide an obvious "vanilla data only / no mods or overrides" option. Longer term, source layers should be clearer: vanilla, unpacked mods, mod zips, selected external files, and user `.pc` configurations should be visible as explicit resolution layers.
+- Revisit working-mod selection. The current global working-mod folder is acceptable for now, but later the editor may need to list active/available mods and let the user select the target mod per session or export. JBeam/DAE exports should always identify or ask for the active mod folder before writing, with `.pc` output staying under `current/vehicles` and vehicle assets staying under `current/mods/unpacked/<mod name>/vehicles`.
 
 ## Later
 

@@ -18,12 +18,18 @@ Future workflows should include:
 
 Vanilla BeamNG files are read-only. The editor can inspect and resolve data from vanilla folders and archives, but must not write to them.
 
-Exports should target the BeamNG user/mod structure so BeamNG's normal override system handles modified data. If importing from mods or unpacked mod folders, overwriting mod-owned files may be allowed later with explicit confirmation.
+Exports should target the BeamNG user/mod structure so BeamNG's normal override system handles modified data. JBeam and DAE asset exports should go through a selected working mod folder, normally `current/mods/unpacked/<mod name>/vehicles/<vehicle>/...`; `current/vehicles/<vehicle>/...` is only appropriate for `.pc` configuration files. If importing from mods or unpacked mod folders, overwriting mod-owned files may be allowed later with explicit confirmation.
+
+Any export operation that writes vehicle assets should make the active/target mod folder obvious before writing. The chosen mod should be stored with export plans/manifests so staged files can be traced back to the intended BeamNG override location.
 
 Import should support a global switch:
 
 - Use mods and overrides.
 - Ignore mods and load vanilla-only data.
+
+The importer must not treat a vanilla `.pc`/zip selection as vanilla-only if user overrides are still enabled. When importing vanilla sources for comparison, user/mod/current override resolution should be disabled explicitly so previously staged user-folder JBeam files do not appear as "vanilla" data. If user mod assets exist that would affect the selected vanilla vehicle, the import dialog should warn and default to ignoring them. Configurations selected directly from the user folder do not need this warning because they intentionally represent user data.
+
+The editor should never use the add-on's own cache directories as JBeam/DAE asset roots. Cache files may hold reports, materialized picker inputs, backups, and generated review output, but they must not become normal vehicle source data during import resolution.
 
 ## Resolved Vehicle Model
 
@@ -84,6 +90,20 @@ Edit Mode:
 - Edit only the active JBeam part's owned nodes, beams, triangles, hydros, sliders, and properties.
 - Other parts may be shown as locked/reference context.
 - Cross-part references should be visible without silently changing ownership.
+- The initial experimental workflow detects moved owned vertices as pending node-position edits and restores moved proxy/reference vertices to their source positions. This is deliberately operator-driven for now rather than live-synchronized so mesh editing stays responsive.
+- The experimental workflow also detects mesh topology changes as pending beam/triangle insert/delete edits when edges or faces are added or removed. These can now flow through the export draft, validation, cache-copy, staging, and fast-path export pipeline.
+- Accepted experimental node moves and topology edits are recorded into an operation history and advance the mesh baseline, so repeated scans report only new movement/topology rather than the same accepted edit.
+- Accepted operations can be written as an edit preview grouped by source JBeam file and part before any real source/override patching is attempted.
+- Accepted node-position and beam/triangle topology operations can also be written as a cache-only patch draft grouped by source JBeam file and part. This is an export-staging artifact only; it must not modify vanilla, mod, or user override files.
+- Topology editing should be identity-first: new Blender vertices receive stable provisional node ids and node option metadata before export scanning, selected provisional nodes appear in the panel immediately, and stale provisional metadata must be trimmed so deleted test geometry does not become phantom JBeam nodes.
+- New Blender edges are not always JBeam beams. Edges that only exist as boundaries of newly created triangle faces should be treated as triangle topology unless explicitly marked as beams by the operator.
+- A cache-only override export plan can map accepted JBeam edits from source JBeam files to intended `current/mods/unpacked/<mod name>/vehicles/...` targets. The plan must clearly identify non-stageable files instead of guessing unsafe paths.
+- A cache-only patched JBeam copy can be generated for review by applying accepted node-position edits to the original source text when each node row can be found safely and uniquely. Beam/triangle topology edits currently use the parsed clean-JSON fallback because preserving comments and surrounding source layout for inserted/deleted rows needs a more deliberate text patcher.
+- Experimental staging can copy patched cache JBeam files into the selected BeamNG user `current/mods/unpacked/<mod name>/vehicles/...` override tree, but must be explicit, confirmation-gated, and refuse to overwrite existing files. Staged files should report whether they used source-preserving text patching or clean JSON fallback.
+- Experimental update can replace existing unpacked mod JBeam files only after explicit confirmation and after backing the previous override file up into the addon cache. Backup paths and overwritten targets must be recorded in the staging manifest.
+- Stage, update, and fast-path export operators should show a changed-file checklist before writing. All changed files are selected by default, but individual source JBeam files can be unticked so only part of the accepted edit history is exported.
+- A fast-path export operator can scan all experimental JBeam meshes, accept newly moved owned nodes and topology changes, open the changed-file checklist, and update selected unpacked mod overrides with backups in one confirmation-gated action. This reduces day-to-day test friction while keeping the safer staged/reporting path available.
+- Successful exports should checkpoint the exported operation history into the addon cache. Full exports clear the active history; partial exports remove only the exported file operations and keep unexported edits dirty for later.
 
 ## Blender Representation
 
@@ -159,6 +179,8 @@ Unknown parameters should remain visible and inspectable even before the editor 
 
 Use a mutable working model plus explicit change tracking.
 
+Positions for objects and nodes should generally be treated at three decimal places of precision. Scanning, comparison, display, change records, and eventual export should avoid noisy sub-millimetre churn unless a specific BeamNG field proves it needs more precision.
+
 Each meaningful edit should record:
 
 - File.
@@ -199,6 +221,7 @@ Live validation:
 Export validation:
 
 - Dependency checks across dirty parts/files.
+- Accepted JBeam edits should be preflighted before staging, including source availability, safe unpacked-mod target paths, source-preserving patchability, fallback patch mode, topology changes, and skipped updates.
 - Deleted nodes still referenced elsewhere.
 - Collision triangle winding/order preserved or explicitly acknowledged when changed.
 - Required target paths are safe mod/user paths, not vanilla.

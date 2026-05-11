@@ -12,6 +12,10 @@ try:
 except ImportError:
     from core import *
 
+
+JBEAM_POSITION_PRECISION = 3
+
+
 def link_collection(parent, name):
     collection = bpy.data.collections.new(name)
     parent.children.link(collection)
@@ -127,6 +131,10 @@ def slider_color_for_resolved_part(_resolved_part_id: int):
 
 def safe_collection_name(value: str):
     return re.sub(r"[\\/:*?\"<>|]+", "_", value).strip() or "unnamed"
+
+
+def rounded_position_tuple(position, precision=JBEAM_POSITION_PRECISION):
+    return tuple(round(float(value), precision) for value in position)
 
 
 def create_jbeam_nodes_object(nodes, collection, part_name="", resolved_part_id=-1, color=None):
@@ -669,7 +677,9 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
         vertex_node_ids = []
         vertex_kinds = []
         vertex_owner_part_ids = []
+        vertex_options = []
         vertex_index_by_node_id = {}
+        local_node_options = {node.name: dict(getattr(node, "options", {}) or {}) for node in nodes_by_part.get(resolved_part_id, [])}
 
         def ensure_vertex(node_id, position):
             node_id = str(node_id)
@@ -677,8 +687,9 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
                 return vertex_index_by_node_id[node_id]
             vertex_index = len(vertex_positions)
             vertex_index_by_node_id[node_id] = vertex_index
-            vertex_positions.append(tuple(position))
+            vertex_positions.append(rounded_position_tuple(position))
             vertex_node_ids.append(node_id)
+            vertex_options.append(dict(local_node_options.get(node_id, {})))
             if node_id in local_node_ids:
                 owner_part_id = resolved_part_id
                 vertex_kind = "owned"
@@ -695,6 +706,7 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
 
         edges = []
         edge_ids = []
+        edge_options = []
         seen_edges = set()
         for beam in beams_by_part.get(resolved_part_id, []):
             v1 = ensure_vertex(beam.id1, beam.start)
@@ -707,9 +719,11 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
             seen_edges.add(edge_key)
             edges.append((v1, v2))
             edge_ids.append((beam.id1, beam.id2))
+            edge_options.append(dict(getattr(beam, "options", {}) or {}))
 
         faces = []
         face_ids = []
+        face_options = []
         for triangle in triangles_by_part.get(resolved_part_id, []):
             face = (
                 ensure_vertex(triangle.id1, triangle.p1),
@@ -720,6 +734,7 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
                 continue
             faces.append(face)
             face_ids.append((triangle.id1, triangle.id2, triangle.id3))
+            face_options.append(dict(getattr(triangle, "options", {}) or {}))
 
         if not vertex_positions:
             continue
@@ -730,8 +745,23 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
         mesh["beamng_node_ids_json"] = json.dumps(vertex_node_ids)
         mesh["beamng_node_kinds_json"] = json.dumps(vertex_kinds)
         mesh["beamng_node_owner_part_ids_json"] = json.dumps(vertex_owner_part_ids)
+        mesh["beamng_original_node_positions_json"] = json.dumps(vertex_positions)
+        mesh["beamng_node_generated_flags_json"] = json.dumps([False for _node_id in vertex_node_ids])
+        mesh["beamng_node_committed_flags_json"] = json.dumps([True for _node_id in vertex_node_ids])
+        mesh["beamng_node_params_json"] = json.dumps(vertex_options)
+        mesh["beamng_node_committed_params_json"] = json.dumps(vertex_options)
         mesh["beamng_edge_node_ids_json"] = json.dumps(edge_ids)
+        mesh["beamng_edge_params_json"] = json.dumps(edge_options)
+        mesh["beamng_edge_committed_params_json"] = json.dumps(edge_options)
         mesh["beamng_face_node_ids_json"] = json.dumps(face_ids)
+        mesh["beamng_face_params_json"] = json.dumps(face_options)
+        mesh["beamng_face_committed_params_json"] = json.dumps(face_options)
+        mesh_edge_ids = []
+        for edge in mesh.edges:
+            indices = list(edge.vertices)
+            if len(indices) == 2 and all(0 <= index < len(vertex_node_ids) for index in indices):
+                mesh_edge_ids.append((vertex_node_ids[indices[0]], vertex_node_ids[indices[1]]))
+        mesh["beamng_mesh_edge_node_ids_json"] = json.dumps(mesh_edge_ids)
         if hasattr(mesh, "attributes"):
             owner_attr = mesh.attributes.new("beamng_owner_part_id", "INT", "POINT")
             proxy_attr = mesh.attributes.new("beamng_is_proxy_node", "BOOLEAN", "POINT")
