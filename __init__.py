@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 98
+ADDON_BUILD = 100
 
 
 def addon_version_label():
@@ -21,6 +21,7 @@ import json
 import math
 import re
 import tempfile
+import time
 import zipfile
 import colorsys
 from collections import defaultdict
@@ -992,6 +993,9 @@ def experimental_jbeam_panel_redraw_timer():
             for obj in bpy.data.objects
         )
         if has_edit_mesh:
+            prefs = get_addon_preferences(bpy.context)
+            if prefs is None or bool(getattr(prefs, "auto_sync_proxy_nodes", True)):
+                poll_experimental_jbeam_edit_mesh_proxy_sync(bpy.context.scene)
             for window in bpy.context.window_manager.windows:
                 screen = window.screen
                 for area in screen.areas:
@@ -1003,13 +1007,115 @@ def experimental_jbeam_panel_redraw_timer():
     return 1.0
 
 
+JBEAM_PROXY_SYNC_DEBOUNCE_SECONDS = 0.35
+_jbeam_proxy_sync_due_time = 0.0
+_jbeam_proxy_sync_timer_pending = False
+_jbeam_proxy_sync_last_signature = None
+_jbeam_proxy_sync_poll_due_time = 0.0
+
+
+def redraw_experimental_jbeam_viewports():
+    try:
+        for window in bpy.context.window_manager.windows:
+            screen = window.screen
+            for area in screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
+def experimental_jbeam_proxy_sync_timer():
+    global _jbeam_proxy_sync_timer_pending
+    now = time.monotonic()
+    remaining = _jbeam_proxy_sync_due_time - now
+    if remaining > 0:
+        return min(max(remaining, 0.05), 0.5)
+
+    _jbeam_proxy_sync_timer_pending = False
+    try:
+        scene = bpy.context.scene
+        if scene is not None:
+            sync_experimental_jbeam_proxy_nodes(scene)
+            redraw_experimental_jbeam_viewports()
+    except Exception:
+        pass
+    return None
+
+
+def experimental_jbeam_mesh_position_signature(scene):
+    signature = []
+    for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+        if obj.mode != "EDIT":
+            continue
+        try:
+            _edit_mesh, positions = read_experimental_mesh_vertices(obj)
+        except Exception:
+            continue
+        for index, position in enumerate(positions):
+            signature.append(
+                (
+                    obj.name,
+                    index,
+                    tuple(rounded_position_list(position)),
+                )
+            )
+    return tuple(signature)
+
+
+def poll_experimental_jbeam_edit_mesh_proxy_sync(scene):
+    global _jbeam_proxy_sync_last_signature, _jbeam_proxy_sync_poll_due_time
+    try:
+        signature = experimental_jbeam_mesh_position_signature(scene)
+    except Exception:
+        return
+    now = time.monotonic()
+    if signature != _jbeam_proxy_sync_last_signature:
+        _jbeam_proxy_sync_last_signature = signature
+        _jbeam_proxy_sync_poll_due_time = now + JBEAM_PROXY_SYNC_DEBOUNCE_SECONDS
+        return
+    if _jbeam_proxy_sync_poll_due_time and now >= _jbeam_proxy_sync_poll_due_time:
+        _jbeam_proxy_sync_poll_due_time = 0.0
+        result = sync_experimental_jbeam_proxy_nodes(scene)
+        if result.get("restored") or result.get("synced"):
+            redraw_experimental_jbeam_viewports()
+
+
+def tag_experimental_jbeam_proxy_sync():
+    prefs = get_addon_preferences(bpy.context)
+    if prefs is not None and not bool(getattr(prefs, "auto_sync_proxy_nodes", True)):
+        return
+    global _jbeam_proxy_sync_due_time, _jbeam_proxy_sync_timer_pending
+    _jbeam_proxy_sync_due_time = time.monotonic() + JBEAM_PROXY_SYNC_DEBOUNCE_SECONDS
+    if not _jbeam_proxy_sync_timer_pending:
+        _jbeam_proxy_sync_timer_pending = True
+        bpy.app.timers.register(experimental_jbeam_proxy_sync_timer, first_interval=JBEAM_PROXY_SYNC_DEBOUNCE_SECONDS)
+
+
+@persistent
+def experimental_jbeam_mesh_depsgraph_update_post(scene, depsgraph):
+    try:
+        updated_ids = {update.id for update in depsgraph.updates}
+        for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+            if obj in updated_ids or obj.data in updated_ids:
+                tag_experimental_jbeam_proxy_sync()
+                return
+    except Exception:
+        return
+
+
 def reset_jbeam_edit_session(scene):
+    global _jbeam_proxy_sync_last_signature, _jbeam_proxy_sync_poll_due_time
+    _jbeam_proxy_sync_last_signature = None
+    _jbeam_proxy_sync_poll_due_time = 0.0
     scene["beamng_jbeam_operation_history_json"] = json.dumps([])
     scene["beamng_jbeam_operation_history_count"] = 0
     scene["beamng_jbeam_pending_node_moves_json"] = json.dumps([])
     scene["beamng_jbeam_pending_node_move_count"] = 0
     scene["beamng_jbeam_pending_topology_change_count"] = 0
     scene["beamng_jbeam_restored_proxy_move_count"] = 0
+    scene["beamng_jbeam_synced_proxy_node_count"] = 0
+    scene["beamng_jbeam_last_proxy_sync_message"] = ""
     scene["beamng_jbeam_dirty"] = False
     model_json = scene.get("beamng_authoring_model_json", "")
     if model_json:
@@ -1024,6 +1130,7 @@ def reset_jbeam_edit_session(scene):
             obj.data["beamng_node_move_changes_json"] = json.dumps([])
             obj["beamng_dirty_node_move_count"] = 0
             obj["beamng_dirty_topology_change_count"] = 0
+            obj["beamng_proxy_sync_identity_ready"] = False
 
 
 @persistent
@@ -1320,6 +1427,79 @@ def set_experimental_mesh_vertex(edit_mesh, mesh, index, position):
     else:
         mesh.vertices[index].co = position
         mesh.update()
+
+
+def update_experimental_proxy_node_baseline(obj, index, position):
+    mesh = obj.data
+    target = rounded_position_list(position)
+    baselines = mesh_json_list(mesh, "beamng_original_node_positions_json")
+    if index >= len(baselines):
+        baselines.extend([[] for _ in range(index + 1 - len(baselines))])
+    baselines[index] = target
+    mesh["beamng_original_node_positions_json"] = json.dumps(baselines)
+
+    node_uids = ensure_experimental_topology_uids(obj, allow_write=True).get("nodes", [])
+    if index < len(node_uids) and int(node_uids[index]) > 0:
+        uid_to_baseline = mesh_json_dict(mesh, "beamng_node_uid_to_original_position_json")
+        uid_to_baseline[str(int(node_uids[index]))] = target
+        mesh["beamng_node_uid_to_original_position_json"] = json.dumps(uid_to_baseline)
+
+
+def sync_experimental_jbeam_proxy_nodes(scene, tolerance=0.0005):
+    owner_positions = {}
+    proxy_targets = []
+    restored_proxy_count = 0
+    synced_proxy_count = 0
+
+    for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+        materialized = bool(obj.get("beamng_proxy_sync_identity_ready", False))
+        identity = ensure_experimental_mesh_identity(obj, scene, allow_write=not materialized)
+        if not materialized:
+            obj["beamng_proxy_sync_identity_ready"] = True
+        node_ids = identity.get("node_ids", [])
+        node_kinds = identity.get("node_kinds", [])
+        baselines = identity.get("original_positions", [])
+        _edit_mesh, positions = read_experimental_mesh_vertices(obj)
+        for index, node_id in enumerate(node_ids):
+            if index >= len(positions) or index >= len(node_kinds):
+                continue
+            kind = str(node_kinds[index])
+            node_id = str(node_id)
+            current = rounded_position_list(positions[index])
+            baseline = baselines[index] if index < len(baselines) else []
+            baseline = rounded_position_list(baseline) if isinstance(baseline, (list, tuple)) and len(baseline) == 3 else current
+            if kind == "proxy":
+                proxy_targets.append((obj, index, node_id, current, baseline))
+            elif current != baseline and (Vector(current) - Vector(baseline)).length > tolerance:
+                owner_positions[node_id] = current
+            elif node_id not in owner_positions:
+                owner_positions[node_id] = current
+
+    for obj, index, node_id, current, baseline in proxy_targets:
+        target = owner_positions.get(node_id, baseline)
+        if not target:
+            continue
+        if current == target or (Vector(current) - Vector(target)).length <= tolerance:
+            continue
+        edit_mesh, _positions = read_experimental_mesh_vertices(obj)
+        set_experimental_mesh_vertex(edit_mesh, obj.data, index, Vector(target))
+        update_experimental_proxy_node_baseline(obj, index, target)
+        if current != baseline:
+            restored_proxy_count += 1
+        else:
+            synced_proxy_count += 1
+
+    if restored_proxy_count or synced_proxy_count:
+        scene["beamng_jbeam_restored_proxy_move_count"] = (
+            int(scene.get("beamng_jbeam_restored_proxy_move_count", 0)) + restored_proxy_count
+        )
+        scene["beamng_jbeam_synced_proxy_node_count"] = (
+            int(scene.get("beamng_jbeam_synced_proxy_node_count", 0)) + synced_proxy_count
+        )
+        scene["beamng_jbeam_last_proxy_sync_message"] = (
+            f"Proxy nodes restored {restored_proxy_count}, synced {synced_proxy_count}"
+        )
+    return {"restored": restored_proxy_count, "synced": synced_proxy_count}
 
 
 def selected_experimental_jbeam_vertex_indices(obj):
@@ -1725,6 +1905,28 @@ def selected_experimental_jbeam_edge_node_keys(obj):
     return keys
 
 
+def authoring_model_for_context(context):
+    try:
+        return current_authoring_model(context.scene)
+    except Exception:
+        return None
+
+
+def model_node_for_id(context, node_id):
+    model = authoring_model_for_context(context)
+    return model.node_index().get(str(node_id)) if model is not None else None
+
+
+def model_beam_for_ids(context, id1, id2):
+    model = authoring_model_for_context(context)
+    return model.beam_index().get(edge_key((id1, id2))) if model is not None else None
+
+
+def model_triangle_for_ids(context, id1, id2, id3):
+    model = authoring_model_for_context(context)
+    return model.triangle_index().get(face_key((id1, id2, id3))) if model is not None else None
+
+
 def experimental_jbeam_node_info_for_selection(context, limit=6):
     obj = active_experimental_jbeam_mesh(context)
     if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
@@ -1769,6 +1971,10 @@ def experimental_jbeam_node_info_for_selection(context, limit=6):
         current = rounded_position_list(current_positions[vertex_index])
         pending = pending_by_index.get(vertex_index)
         accepted = accepted_by_node.get(node_id)
+        model = authoring_model_for_context(context)
+        model_node = model.node_index().get(node_id) if model is not None else None
+        model_refs = model.refs_for_node(node_id) if model is not None else {"beams": [], "triangles": []}
+        model_params = dict(getattr(model_node, "options", {}) or {}) if model_node is not None else {}
         infos.append(
             {
                 "node_id": node_id,
@@ -1781,8 +1987,11 @@ def experimental_jbeam_node_info_for_selection(context, limit=6):
                 "accepted_position": accepted.get("new") if accepted else [],
                 "generated": bool(generated_flags[vertex_index]) if vertex_index < len(generated_flags) else False,
                 "committed": bool(committed_flags[vertex_index]) if vertex_index < len(committed_flags) else True,
-                "params": node_params[vertex_index] if vertex_index < len(node_params) and isinstance(node_params[vertex_index], dict) else {},
+                "params": model_params or (node_params[vertex_index] if vertex_index < len(node_params) and isinstance(node_params[vertex_index], dict) else {}),
                 "committed_params": committed_node_params[vertex_index] if vertex_index < len(committed_node_params) and isinstance(committed_node_params[vertex_index], dict) else {},
+                "model_backed": model_node is not None,
+                "model_reference_beam_count": len(model_refs.get("beams", [])),
+                "model_reference_triangle_count": len(model_refs.get("triangles", [])),
                 "source_file": obj.get("beamng_jbeam_path", ""),
                 "part": obj.get("beamng_part_name", ""),
             }
@@ -1806,13 +2015,16 @@ def experimental_jbeam_edge_info_for_selection(context, limit=6):
         ids = edge_node_ids[edge_index]
         if not isinstance(ids, (list, tuple)) or len(ids) < 2:
             continue
+        model_beam = model_beam_for_ids(context, ids[0], ids[1])
+        model_params = dict(getattr(model_beam, "options", {}) or {}) if model_beam is not None else {}
         infos.append(
             {
                 "edge_index": edge_index,
                 "id1": str(ids[0]),
                 "id2": str(ids[1]),
-                "params": edge_params[edge_index] if edge_index < len(edge_params) and isinstance(edge_params[edge_index], dict) else {},
+                "params": model_params or (edge_params[edge_index] if edge_index < len(edge_params) and isinstance(edge_params[edge_index], dict) else {}),
                 "committed_params": committed_edge_params[edge_index] if edge_index < len(committed_edge_params) and isinstance(committed_edge_params[edge_index], dict) else {},
+                "model_backed": model_beam is not None,
                 "part": obj.get("beamng_part_name", ""),
                 "source_file": obj.get("beamng_jbeam_path", ""),
             }
@@ -1845,6 +2057,8 @@ def experimental_jbeam_face_info_for_selection(context, limit=6):
         ids = face_node_ids[face_index]
         if not isinstance(ids, (list, tuple)) or len(ids) < 3:
             continue
+        model_triangle = model_triangle_for_ids(context, ids[0], ids[1], ids[2])
+        model_params = dict(getattr(model_triangle, "options", {}) or {}) if model_triangle is not None else {}
         infos.append(
             {
                 "face_index": face_index,
@@ -1852,8 +2066,9 @@ def experimental_jbeam_face_info_for_selection(context, limit=6):
                 "id2": str(ids[1]),
                 "id3": str(ids[2]),
                 "normal": face_normals[face_index] if face_index < len(face_normals) else (),
-                "params": face_params[face_index] if face_index < len(face_params) and isinstance(face_params[face_index], dict) else {},
+                "params": model_params or (face_params[face_index] if face_index < len(face_params) and isinstance(face_params[face_index], dict) else {}),
                 "committed_params": committed_face_params[face_index] if face_index < len(committed_face_params) and isinstance(committed_face_params[face_index], dict) else {},
+                "model_backed": model_triangle is not None,
                 "part": obj.get("beamng_part_name", ""),
                 "source_file": obj.get("beamng_jbeam_path", ""),
             }
@@ -1933,6 +2148,18 @@ def active_experimental_mesh_validation_summary(context, limit=6):
         messages.append(("WARN", f"Duplicate beam edge keys: {duplicate_edges[:limit]}"))
     if non_triangles:
         messages.append(("WARN", f"Non-triangle faces ignored: {non_triangles}"))
+    model = authoring_model_for_context(context)
+    if model is not None:
+        model_nodes = model.node_index()
+        missing_model_nodes = [
+            node_id
+            for node_id in node_ids
+            if node_id not in model_nodes and not node_id.startswith(str(obj.get("beamng_part_name", "")) + "_new_")
+        ]
+        if missing_model_nodes:
+            messages.append(("WARN", f"Mesh nodes not in model snapshot: {missing_model_nodes[:limit]}"))
+        if len(model.operations) != int(context.scene.get("beamng_jbeam_operation_history_count", 0)):
+            messages.append(("WARN", "Model operation count differs from legacy history mirror"))
     if not messages:
         messages.append(("OK", "Topology validation: no active-mesh issues"))
     return messages
@@ -2565,12 +2792,19 @@ def accept_experimental_jbeam_node_moves(scene):
     return {"accepted_count": len(accepted_changes), "history_count": len(history)}
 
 
-def jbeam_operation_history(scene):
+def raw_jbeam_operation_history(scene):
     try:
         history = json.loads(scene.get("beamng_jbeam_operation_history_json", "[]"))
     except (TypeError, json.JSONDecodeError):
         history = []
     return history if isinstance(history, list) else []
+
+
+def jbeam_operation_history(scene):
+    model = current_authoring_model(scene)
+    if model is not None and getattr(model, "operations", None):
+        return model.operation_dicts(status="accepted")
+    return raw_jbeam_operation_history(scene)
 
 
 def jbeam_history_counts(history):
@@ -6540,6 +6774,8 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         pending_count = int(context.scene.get("beamng_jbeam_pending_node_move_count", 0))
         pending_topology_count = int(context.scene.get("beamng_jbeam_pending_topology_change_count", 0))
         restored_count = int(context.scene.get("beamng_jbeam_restored_proxy_move_count", 0))
+        synced_proxy_count = int(context.scene.get("beamng_jbeam_synced_proxy_node_count", 0))
+        proxy_sync_message = context.scene.get("beamng_jbeam_last_proxy_sync_message", "")
         history_count = int(context.scene.get("beamng_jbeam_operation_history_count", 0))
         history_breakdown = jbeam_history_counts(jbeam_operation_history(context.scene))
         checkpoint_count = int(context.scene.get("beamng_jbeam_export_checkpoint_count", 0))
@@ -6558,6 +6794,10 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
             box.label(text=f"Export checkpoints: {checkpoint_count}")
         if restored_count:
             box.label(text=f"Proxy moves restored: {restored_count}")
+        if synced_proxy_count:
+            box.label(text=f"Proxy nodes synced: {synced_proxy_count}")
+        if proxy_sync_message:
+            box.label(text=str(proxy_sync_message), icon="INFO")
         row = box.row(align=True)
         op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan Active")
         op.active_only = True
@@ -6650,6 +6890,13 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
                     row.label(text=f"v{node_info['vertex_index']}")
                     if not node_info.get("committed", True):
                         node_box.label(text="Status: new provisional node")
+                    node_box.label(text=f"Model-backed: {'yes' if node_info.get('model_backed') else 'no'}")
+                    node_box.label(
+                        text=(
+                            f"References: {node_info.get('model_reference_beam_count', 0)} beam(s), "
+                            f"{node_info.get('model_reference_triangle_count', 0)} triangle(s)"
+                        )
+                    )
                     node_box.label(text=f"Position: {node_info['current_position']}")
                     if node_info["baseline_position"] and node_info["baseline_position"] != node_info["current_position"]:
                         node_box.label(text=f"Baseline: {node_info['baseline_position']}")
@@ -6690,6 +6937,7 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
                     edge_box.label(
                         text=f"e{edge_info['edge_index']}: {edge_info['id1']} -> {edge_info['id2']}"
                     )
+                    edge_box.label(text=f"Model-backed: {'yes' if edge_info.get('model_backed') else 'no'}")
                     params = edge_info.get("params", {})
                     param_box = edge_box.box()
                     param_box.label(text="Effective params")
@@ -6719,6 +6967,7 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
                     )
                     if face_info.get("normal"):
                         face_box.label(text=f"Normal: {face_info['normal']}")
+                    face_box.label(text=f"Model-backed: {'yes' if face_info.get('model_backed') else 'no'}")
                     params = face_info.get("params", {})
                     param_box = face_box.box()
                     param_box.label(text="Effective params")
@@ -6822,6 +7071,14 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         description="Reuse parsed JBeam/DAE catalog data across imports while the add-on remains loaded",
         default=True,
     )
+    auto_sync_proxy_nodes: BoolProperty(
+        name="Auto Restore/Sync Proxy Nodes",
+        description=(
+            "After JBeam mesh movement settles, restore moved proxy/reference nodes and sync matching proxies "
+            "when owned nodes move. Disable for very large vehicles if editing feels slow"
+        ),
+        default=True,
+    )
     jbeam_export_mod_name: StringProperty(
         name="JBeam Export Mod Folder",
         description="Folder under BeamNG user current/mods/unpacked used for staged JBeam overrides",
@@ -6834,6 +7091,7 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         layout.prop(self, "beamng_user_folder")
         layout.prop(self, "vanilla_vehicles_folder")
         layout.prop(self, "cache_asset_catalogs")
+        layout.prop(self, "auto_sync_proxy_nodes")
         layout.prop(self, "jbeam_export_mod_name")
 
 
@@ -6894,7 +7152,7 @@ def refresh_authoring_model_operations_from_history(scene):
     if model is None:
         return None
     operations = []
-    for operation in jbeam_operation_history(scene):
+    for operation in raw_jbeam_operation_history(scene):
         operations.append(
             EditOperation(
                 operation=str(operation.get("operation", "")),
@@ -6907,6 +7165,17 @@ def refresh_authoring_model_operations_from_history(scene):
                 new=operation.get("new"),
                 status=str(operation.get("status", "accepted")),
                 created_at=str(operation.get("accepted_at", "")),
+                source_object=str(operation.get("source_object", "")),
+                vertex_index=int(operation.get("vertex_index", -1)) if str(operation.get("vertex_index", "-1")).lstrip("-").isdigit() else -1,
+                resolved_part_id=int(operation.get("resolved_part_id", -1)) if str(operation.get("resolved_part_id", "-1")).lstrip("-").isdigit() else -1,
+                owner_resolved_part_id=(
+                    int(operation.get("owner_resolved_part_id", -1))
+                    if str(operation.get("owner_resolved_part_id", "-1")).lstrip("-").isdigit()
+                    else -1
+                ),
+                params=operation.get("params", {}) if isinstance(operation.get("params", {}), dict) else {},
+                nodes=list(operation.get("nodes", [])) if isinstance(operation.get("nodes", []), (list, tuple)) else [],
+                reason=str(operation.get("reason", "")),
             )
         )
     model.operations = operations
@@ -7791,6 +8060,8 @@ def register():
     bpy.types.VIEW3D_MT_object_context_menu.append(menu_func_jbeam_context)
     if clear_jbeam_edit_sessions_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(clear_jbeam_edit_sessions_on_load)
+    if experimental_jbeam_mesh_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(experimental_jbeam_mesh_depsgraph_update_post)
     if not bpy.app.timers.is_registered(experimental_jbeam_panel_redraw_timer):
         bpy.app.timers.register(experimental_jbeam_panel_redraw_timer, first_interval=0.5, persistent=True)
 # Blender 4.2 restricts bpy.data during addon registration
@@ -7805,8 +8076,12 @@ except Exception:
 def unregister():
     if bpy.app.timers.is_registered(experimental_jbeam_panel_redraw_timer):
         bpy.app.timers.unregister(experimental_jbeam_panel_redraw_timer)
+    if bpy.app.timers.is_registered(experimental_jbeam_proxy_sync_timer):
+        bpy.app.timers.unregister(experimental_jbeam_proxy_sync_timer)
     if clear_jbeam_edit_sessions_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(clear_jbeam_edit_sessions_on_load)
+    if experimental_jbeam_mesh_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(experimental_jbeam_mesh_depsgraph_update_post)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func_jbeam_context)
     bpy.types.VIEW3D_MT_view.remove(menu_func_view_sync)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)

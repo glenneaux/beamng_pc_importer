@@ -1,5 +1,5 @@
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field as dataclass_field, fields
 from datetime import datetime
 
 
@@ -10,6 +10,13 @@ def _vector_tuple(value):
         return (0.0, 0.0, 0.0)
 
 
+def _coerce(cls, item):
+    if isinstance(item, cls):
+        return item
+    allowed = {field_info.name for field_info in fields(cls)}
+    return cls(**{key: value for key, value in dict(item).items() if key in allowed})
+
+
 @dataclass
 class ResolvedNode:
     id: str
@@ -18,7 +25,7 @@ class ResolvedNode:
     resolved_part_id: int = -1
     source_file: str = ""
     kind: str = "owned"
-    options: dict = field(default_factory=dict)
+    options: dict = dataclass_field(default_factory=dict)
 
 
 @dataclass
@@ -28,7 +35,7 @@ class ResolvedBeam:
     part_name: str
     resolved_part_id: int = -1
     source_file: str = ""
-    options: dict = field(default_factory=dict)
+    options: dict = dataclass_field(default_factory=dict)
 
 
 @dataclass
@@ -39,8 +46,8 @@ class ResolvedTriangle:
     part_name: str
     resolved_part_id: int = -1
     source_file: str = ""
-    normal: tuple = field(default_factory=tuple)
-    options: dict = field(default_factory=dict)
+    normal: tuple = dataclass_field(default_factory=tuple)
+    options: dict = dataclass_field(default_factory=dict)
 
 
 @dataclass
@@ -50,10 +57,10 @@ class ResolvedPartDetail:
     source_file: str = ""
     parent_id: int = -1
     slot_name: str = ""
-    node_ids: list = field(default_factory=list)
+    node_ids: list = dataclass_field(default_factory=list)
     beam_count: int = 0
     triangle_count: int = 0
-    external_node_refs: list = field(default_factory=list)
+    external_node_refs: list = dataclass_field(default_factory=list)
 
 
 @dataclass
@@ -68,13 +75,20 @@ class EditOperation:
     new: object = None
     status: str = "pending"
     created_at: str = ""
+    source_object: str = ""
+    vertex_index: int = -1
+    resolved_part_id: int = -1
+    owner_resolved_part_id: int = -1
+    params: dict = dataclass_field(default_factory=dict)
+    nodes: list = dataclass_field(default_factory=list)
+    reason: str = ""
 
 
 @dataclass
 class ResolvedJBeamFile:
     source_file: str
     virtual_path: str = ""
-    part_names: list = field(default_factory=list)
+    part_names: list = dataclass_field(default_factory=list)
     node_count: int = 0
     beam_count: int = 0
     triangle_count: int = 0
@@ -88,13 +102,13 @@ class ResolvedVehicleAuthoringModel:
     source_description: str = ""
     vehicle_model: str = ""
     main_part: str = ""
-    files: list = field(default_factory=list)
-    parts: list = field(default_factory=list)
-    nodes: list = field(default_factory=list)
-    beams: list = field(default_factory=list)
-    triangles: list = field(default_factory=list)
-    operations: list = field(default_factory=list)
-    warnings: list = field(default_factory=list)
+    files: list = dataclass_field(default_factory=list)
+    parts: list = dataclass_field(default_factory=list)
+    nodes: list = dataclass_field(default_factory=list)
+    beams: list = dataclass_field(default_factory=list)
+    triangles: list = dataclass_field(default_factory=list)
+    operations: list = dataclass_field(default_factory=list)
+    warnings: list = dataclass_field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)
@@ -105,7 +119,58 @@ class ResolvedVehicleAuthoringModel:
     @classmethod
     def from_json(cls, text):
         data = json.loads(text) if text else {}
+        data["files"] = [_coerce(ResolvedJBeamFile, item) for item in data.get("files", [])]
+        data["parts"] = [_coerce(ResolvedPartDetail, item) for item in data.get("parts", [])]
+        data["nodes"] = [_coerce(ResolvedNode, item) for item in data.get("nodes", [])]
+        data["beams"] = [_coerce(ResolvedBeam, item) for item in data.get("beams", [])]
+        data["triangles"] = [_coerce(ResolvedTriangle, item) for item in data.get("triangles", [])]
+        data["operations"] = [_coerce(EditOperation, item) for item in data.get("operations", [])]
         return cls(**data)
+
+    def node_index(self):
+        return {node.id: node for node in self.nodes}
+
+    def part_index(self):
+        return {part.resolved_part_id: part for part in self.parts}
+
+    def file_index(self):
+        result = {}
+        for item in self.files:
+            if item.source_file:
+                result[item.source_file.replace("\\", "/").lower()] = item
+            if item.virtual_path:
+                result[item.virtual_path.replace("\\", "/").lower()] = item
+        return result
+
+    def beam_index(self):
+        return {_edge_key((beam.id1, beam.id2)): beam for beam in self.beams}
+
+    def triangle_index(self):
+        return {_face_key((tri.id1, tri.id2, tri.id3)): tri for tri in self.triangles}
+
+    def refs_for_node(self, node_id):
+        node_id = str(node_id)
+        beams = [beam for beam in self.beams if beam.id1 == node_id or beam.id2 == node_id]
+        triangles = [
+            tri
+            for tri in self.triangles
+            if tri.id1 == node_id or tri.id2 == node_id or tri.id3 == node_id
+        ]
+        return {"beams": beams, "triangles": triangles}
+
+    def operation_dicts(self, status=None):
+        operations = self.operations
+        if status is not None:
+            operations = [operation for operation in operations if operation.status == status]
+        return [asdict(operation) for operation in operations]
+
+
+def _edge_key(edge):
+    return tuple(sorted(str(node_id) for node_id in edge[:2]))
+
+
+def _face_key(face):
+    return tuple(str(node_id) for node_id in face[:3])
 
 
 def build_authoring_model_from_import(
