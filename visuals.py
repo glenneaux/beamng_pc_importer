@@ -742,6 +742,15 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
         mesh = bpy.data.meshes.new(f"Experimental_JBeam_Mesh_{safe_collection_name(label)}")
         mesh.from_pydata(vertex_positions, edges, faces)
         mesh.update()
+        node_uids = list(range(1, len(vertex_node_ids) + 1))
+        edge_uids = list(range(len(node_uids) + 1, len(node_uids) + len(edge_ids) + 1))
+        face_uids = list(
+            range(
+                len(node_uids) + len(edge_uids) + 1,
+                len(node_uids) + len(edge_uids) + len(face_ids) + 1,
+            )
+        )
+        mesh["beamng_next_topology_uid"] = len(node_uids) + len(edge_uids) + len(face_uids) + 1
         mesh["beamng_node_ids_json"] = json.dumps(vertex_node_ids)
         mesh["beamng_node_kinds_json"] = json.dumps(vertex_kinds)
         mesh["beamng_node_owner_part_ids_json"] = json.dumps(vertex_owner_part_ids)
@@ -756,6 +765,18 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
         mesh["beamng_face_node_ids_json"] = json.dumps(face_ids)
         mesh["beamng_face_params_json"] = json.dumps(face_options)
         mesh["beamng_face_committed_params_json"] = json.dumps(face_options)
+        mesh["beamng_node_uid_to_id_json"] = json.dumps({str(uid): node_id for uid, node_id in zip(node_uids, vertex_node_ids)})
+        mesh["beamng_node_uid_to_kind_json"] = json.dumps({str(uid): kind for uid, kind in zip(node_uids, vertex_kinds)})
+        mesh["beamng_node_uid_to_owner_part_id_json"] = json.dumps({str(uid): owner for uid, owner in zip(node_uids, vertex_owner_part_ids)})
+        mesh["beamng_node_uid_to_original_position_json"] = json.dumps({str(uid): position for uid, position in zip(node_uids, vertex_positions)})
+        mesh["beamng_node_uid_to_generated_json"] = json.dumps({str(uid): False for uid in node_uids})
+        mesh["beamng_node_uid_to_committed_json"] = json.dumps({str(uid): True for uid in node_uids})
+        mesh["beamng_node_uid_to_params_json"] = json.dumps({str(uid): params for uid, params in zip(node_uids, vertex_options)})
+        mesh["beamng_node_uid_to_committed_params_json"] = json.dumps({str(uid): params for uid, params in zip(node_uids, vertex_options)})
+        mesh["beamng_edge_uid_to_params_json"] = json.dumps({str(uid): params for uid, params in zip(edge_uids, edge_options)})
+        mesh["beamng_edge_uid_to_committed_params_json"] = json.dumps({str(uid): params for uid, params in zip(edge_uids, edge_options)})
+        mesh["beamng_face_uid_to_params_json"] = json.dumps({str(uid): params for uid, params in zip(face_uids, face_options)})
+        mesh["beamng_face_uid_to_committed_params_json"] = json.dumps({str(uid): params for uid, params in zip(face_uids, face_options)})
         mesh_edge_ids = []
         for edge in mesh.edges:
             indices = list(edge.vertices)
@@ -763,14 +784,29 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
                 mesh_edge_ids.append((vertex_node_ids[indices[0]], vertex_node_ids[indices[1]]))
         mesh["beamng_mesh_edge_node_ids_json"] = json.dumps(mesh_edge_ids)
         if hasattr(mesh, "attributes"):
+            node_uid_attr = mesh.attributes.new("beamng_node_uid", "INT", "POINT")
+            edge_uid_attr = mesh.attributes.new("beamng_edge_uid", "INT", "EDGE")
+            face_uid_attr = mesh.attributes.new("beamng_face_uid", "INT", "FACE")
             owner_attr = mesh.attributes.new("beamng_owner_part_id", "INT", "POINT")
             proxy_attr = mesh.attributes.new("beamng_is_proxy_node", "BOOLEAN", "POINT")
             color_attr = mesh.attributes.new("beamng_node_color", "FLOAT_COLOR", "POINT")
+            for index, uid in enumerate(node_uids):
+                if index < len(node_uid_attr.data):
+                    node_uid_attr.data[index].value = uid
+            for index, uid in enumerate(edge_uids):
+                if index < len(edge_uid_attr.data):
+                    edge_uid_attr.data[index].value = uid
+            for index, uid in enumerate(face_uids):
+                if index < len(face_uid_attr.data):
+                    face_uid_attr.data[index].value = uid
             for index, owner_part_id in enumerate(vertex_owner_part_ids):
-                owner_attr.data[index].value = owner_part_id
-                proxy_attr.data[index].value = vertex_kinds[index] == "proxy"
-                owner_color = color_for_resolved_part(owner_part_id)
-                color_attr.data[index].color = owner_color
+                if index < len(owner_attr.data):
+                    owner_attr.data[index].value = owner_part_id
+                if index < len(proxy_attr.data):
+                    proxy_attr.data[index].value = vertex_kinds[index] == "proxy"
+                if index < len(color_attr.data):
+                    owner_color = color_for_resolved_part(owner_part_id)
+                    color_attr.data[index].color = owner_color
 
         obj = bpy.data.objects.new(f"JBeam Mesh {label}", mesh)
         obj["beamng_layer"] = "jbeam_mesh"

@@ -45,6 +45,8 @@ The resolved vehicle model should contain both configuration state and JBeam str
 
 The working model can be mutable for interactive editing, but each meaningful edit must also be tracked explicitly so export can patch preserved source structures.
 
+Current implementation direction: a detailed authoring-model snapshot is now stored separately from Blender mesh custom properties. It records source files, resolved parts, nodes, beams, triangles, and accepted edit operations so Blender can become a projection of the model rather than the long-term source of truth.
+
 ## Preserve-First Editing
 
 Assume BeamNG file parameters can change over time. The editor should preserve anything it does not understand.
@@ -97,6 +99,8 @@ Edit Mode:
 - Accepted node-position and beam/triangle topology operations can also be written as a cache-only patch draft grouped by source JBeam file and part. This is an export-staging artifact only; it must not modify vanilla, mod, or user override files.
 - Topology editing should be identity-first: new Blender vertices receive stable provisional node ids and node option metadata before export scanning, selected provisional nodes appear in the panel immediately, and stale provisional metadata must be trimmed so deleted test geometry does not become phantom JBeam nodes.
 - New Blender edges are not always JBeam beams. Edges that only exist as boundaries of newly created triangle faces should be treated as triangle topology unless explicitly marked as beams by the operator.
+- Persistent Blender topology data should use per-vertex, per-edge, and per-face integer UIDs as the durable identity layer. JBeam ids, source params, committed params, and export mirrors can remain in JSON maps keyed by those UIDs until a richer Blender attribute/storage strategy is needed.
+- Deleting an owned node should cascade to any source beams or triangles that still reference that node, even if Blender has already removed the visible edge/face geometry.
 - A cache-only override export plan can map accepted JBeam edits from source JBeam files to intended `current/mods/unpacked/<mod name>/vehicles/...` targets. The plan must clearly identify non-stageable files instead of guessing unsafe paths.
 - A cache-only patched JBeam copy can be generated for review by applying accepted node-position edits to the original source text when each node row can be found safely and uniquely. Beam/triangle topology edits currently use the parsed clean-JSON fallback because preserving comments and surrounding source layout for inserted/deleted rows needs a more deliberate text patcher.
 - Experimental staging can copy patched cache JBeam files into the selected BeamNG user `current/mods/unpacked/<mod name>/vehicles/...` override tree, but must be explicit, confirmation-gated, and refuse to overwrite existing files. Staged files should report whether they used source-preserving text patching or clean JSON fallback.
@@ -117,6 +121,7 @@ The future editing representation should use Blender mesh principles:
 - Hydros, sliders, rails, special links, and external references as overlays or auxiliary reference data.
 - Rail-locked or beam/rail-constrained nodes must be represented as positional constraints along their rail/beam, not as freely editable vertices.
 - Triangle winding order is meaningful because BeamNG collision triangles only collide from one side. The editor must preserve triangle node order, make face normals/direction visible, and warn before any operation flips or normalizes winding.
+- Authoring should prefer explicit JBeam topology operators for standalone node creation, beam creation from two selected nodes, triangle creation from three selected nodes, and safe element deletion. Raw Blender mesh gestures remain useful, but tool-owned operators reduce accidental beams and ambiguous topology.
 - Mesh-native edge visibility should be preferred over separate legacy beam geometry. Duplicate Skin/Wireframe preview meshes were visually promising, but the live synchronization cost was too high during Edit Mode node movement and the approach is parked for now.
 - Experimental editable JBeam meshes should depth-test normally against flexbodies by default. X-ray/always-on-top display can be useful as an explicit inspection mode, but should not be the default authoring view because translucent collision faces appear to float over body geometry.
 
@@ -222,7 +227,9 @@ Export validation:
 
 - Dependency checks across dirty parts/files.
 - Accepted JBeam edits should be preflighted before staging, including source availability, safe unpacked-mod target paths, source-preserving patchability, fallback patch mode, topology changes, and skipped updates.
+- Export dialogs should show selected node/beam/triangle insert/update/delete counts before writing, and successful exports should advance mesh baselines so stale accepted history does not keep re-exporting.
 - Deleted nodes still referenced elsewhere.
+- Missing beam/triangle node references should block export unless the missing node is an intentional proxy/cross-part reference.
 - Collision triangle winding/order preserved or explicitly acknowledged when changed.
 - Required target paths are safe mod/user paths, not vanilla.
 - External references and tool metadata comments are coherent.
