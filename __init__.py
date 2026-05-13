@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 100
+ADDON_BUILD = 101
 
 
 def addon_version_label():
@@ -311,6 +311,7 @@ class BeamNGJBeamExportFileItem(PropertyGroup):
     parts_label: StringProperty(default="")
     planned_target_path: StringProperty(default="")
     node_update_count: IntProperty(default=0)
+    topology_update_count: IntProperty(default=0)
 
 
 def populate_vehicle_slot_editor(scene, pc_data, part_index):
@@ -3571,7 +3572,11 @@ def populate_jbeam_export_file_selection(context):
         item.parts_label = parts_label
         item.planned_target_path = file_group.get("planned_target_path", "")
         item.node_update_count = int(file_group.get("operation_count", file_group.get("node_update_count", 0)))
-        item.label = f"{Path(virtual_path).name} ({item.node_update_count} edit(s))"
+        item.topology_update_count = int(file_group.get("topology_update_count", 0))
+        item.label = (
+            f"{Path(virtual_path).name} "
+            f"({item.node_update_count} edit(s), {item.topology_update_count} topology)"
+        )
 
     scene["beamng_jbeam_export_selection_count"] = len(items)
     return list(items)
@@ -3590,6 +3595,22 @@ def selected_jbeam_export_virtual_paths(scene):
     return selected
 
 
+class BEAMNG_OT_set_jbeam_export_selection(Operator):
+    bl_idname = "beamng_pc_importer.set_jbeam_export_selection"
+    bl_label = "Set JBeam Export Selection"
+    bl_description = "Select or deselect all changed JBeam files in the export checklist"
+    bl_options = {"REGISTER", "UNDO"}
+
+    include: BoolProperty(default=True)
+
+    def execute(self, context):
+        items = getattr(context.scene, "beamng_jbeam_export_file_items", [])
+        for item in items:
+            item.include = bool(self.include)
+        self.report({"INFO"}, f"{'Selected' if self.include else 'Deselected'} {len(items)} JBeam export file(s)")
+        return {"FINISHED"}
+
+
 def draw_jbeam_export_selection(layout, context, overwrite_existing=False):
     items = getattr(context.scene, "beamng_jbeam_export_file_items", [])
     box = layout.box()
@@ -3600,6 +3621,12 @@ def draw_jbeam_export_selection(layout, context, overwrite_existing=False):
     if not items:
         box.label(text="No accepted JBeam edits are recorded.")
         return
+
+    row = box.row(align=True)
+    op = row.operator(BEAMNG_OT_set_jbeam_export_selection.bl_idname, text="All")
+    op.include = True
+    op = row.operator(BEAMNG_OT_set_jbeam_export_selection.bl_idname, text="None")
+    op.include = False
 
     selected_paths = [
         normalize_virtual_path(item.virtual_path)
@@ -3642,7 +3669,7 @@ def draw_jbeam_export_selection(layout, context, overwrite_existing=False):
         if item.parts_label:
             col.label(text=f"Parts: {item.parts_label}")
         if item.planned_target_path:
-            col.label(text=f"To: {Path(item.planned_target_path).name}")
+            col.label(text=f"To: {item.planned_target_path}")
     selected_count = sum(1 for item in items if item.include)
     box.label(text=f"Selected: {selected_count}/{len(items)} file(s)")
     if overwrite_existing:
@@ -3793,6 +3820,108 @@ def validate_experimental_mesh_topology_for_export(context, file_group):
     return errors, warnings
 
 
+def experimental_jbeam_topology_health(scene):
+    summary = {
+        "mesh_count": 0,
+        "node_count": 0,
+        "edge_count": 0,
+        "face_count": 0,
+        "proxy_count": 0,
+        "proxy_drift_count": 0,
+        "generated_uncommitted_node_count": 0,
+        "non_triangle_face_count": 0,
+        "duplicate_node_id_count": 0,
+        "duplicate_edge_key_count": 0,
+        "duplicate_face_key_count": 0,
+        "missing_reference_count": 0,
+        "dirty_param_count": 0,
+        "warnings": [],
+        "errors": [],
+    }
+    for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+        summary["mesh_count"] += 1
+        identity = ensure_experimental_mesh_identity(obj, scene, allow_write=False)
+        node_ids = [str(node_id) for node_id in identity.get("node_ids", [])]
+        node_kinds = [str(kind or "owned") for kind in identity.get("node_kinds", [])]
+        baselines = identity.get("original_positions", [])
+        current_positions = identity.get("current_positions", [])
+        generated_flags = identity.get("generated_flags", [])
+        committed_flags = identity.get("committed_flags", [])
+        node_params = identity.get("node_params", [])
+        committed_node_params = identity.get("committed_node_params", [])
+        edges, faces = read_experimental_mesh_topology(obj, allow_identity_write=False)
+        edge_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("edges", [])
+        face_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("faces", [])
+        edge_params = topology_params_for_current_elements(obj.data, edge_uids, "beamng_edge_params_json", "beamng_edge_uid_to_params_json", allow_write=False)
+        committed_edge_params = topology_params_for_current_elements(obj.data, edge_uids, "beamng_edge_committed_params_json", "beamng_edge_uid_to_committed_params_json", allow_write=False)
+        face_params = topology_params_for_current_elements(obj.data, face_uids, "beamng_face_params_json", "beamng_face_uid_to_params_json", allow_write=False)
+        committed_face_params = topology_params_for_current_elements(obj.data, face_uids, "beamng_face_committed_params_json", "beamng_face_uid_to_committed_params_json", allow_write=False)
+
+        summary["node_count"] += len(node_ids)
+        summary["edge_count"] += len(edges)
+        summary["face_count"] += len(faces)
+        non_triangles = experimental_mesh_non_triangle_face_count(obj)
+        summary["non_triangle_face_count"] += non_triangles
+        if non_triangles:
+            summary["warnings"].append(f"{obj.name}: {non_triangles} non-triangle face(s)")
+
+        duplicate_nodes = duplicate_items(node_ids)
+        duplicate_edges = duplicate_items(edge_key(edge) for edge in edges)
+        duplicate_faces = duplicate_items(face_key(face) for face in faces)
+        summary["duplicate_node_id_count"] += len(duplicate_nodes)
+        summary["duplicate_edge_key_count"] += len(duplicate_edges)
+        summary["duplicate_face_key_count"] += len(duplicate_faces)
+        if duplicate_nodes:
+            summary["errors"].append(f"{obj.name}: duplicate node ids {duplicate_nodes[:8]}")
+        if duplicate_edges:
+            summary["warnings"].append(f"{obj.name}: duplicate beam keys {duplicate_edges[:8]}")
+        if duplicate_faces:
+            summary["errors"].append(f"{obj.name}: duplicate triangle keys {duplicate_faces[:8]}")
+
+        known_node_ids = set(node_ids)
+        for label, rows, expected_count in (("edge", edges, 2), ("face", faces, 3)):
+            for row in rows:
+                ids = [str(node_id) for node_id in row]
+                if len(ids) < expected_count or any(not node_id or node_id not in known_node_ids for node_id in ids[:expected_count]):
+                    summary["missing_reference_count"] += 1
+                    summary["errors"].append(f"{obj.name}: {label} references missing node(s): {ids}")
+
+        for index, kind in enumerate(node_kinds):
+            if kind == "proxy":
+                summary["proxy_count"] += 1
+                if index < len(baselines) and index < len(current_positions):
+                    baseline = rounded_position_list(baselines[index])
+                    current = rounded_position_list(current_positions[index])
+                    if len(baseline) == 3 and len(current) == 3 and (Vector(current) - Vector(baseline)).length > 0.0005:
+                        summary["proxy_drift_count"] += 1
+            if index < len(generated_flags) and index < len(committed_flags):
+                if bool(generated_flags[index]) and not bool(committed_flags[index]):
+                    summary["generated_uncommitted_node_count"] += 1
+            params = node_params[index] if index < len(node_params) and isinstance(node_params[index], dict) else {}
+            committed_params = committed_node_params[index] if index < len(committed_node_params) and isinstance(committed_node_params[index], dict) else {}
+            if params != committed_params:
+                summary["dirty_param_count"] += 1
+        for index, params in enumerate(edge_params):
+            committed_params = committed_edge_params[index] if index < len(committed_edge_params) and isinstance(committed_edge_params[index], dict) else {}
+            if isinstance(params, dict) and params != committed_params:
+                summary["dirty_param_count"] += 1
+        for index, params in enumerate(face_params):
+            committed_params = committed_face_params[index] if index < len(committed_face_params) and isinstance(committed_face_params[index], dict) else {}
+            if isinstance(params, dict) and params != committed_params:
+                summary["dirty_param_count"] += 1
+
+    if summary["proxy_drift_count"]:
+        summary["warnings"].append(f"{summary['proxy_drift_count']} proxy node(s) are away from their stored positions")
+    return summary
+
+
+def store_experimental_jbeam_topology_health(scene, summary):
+    for key, value in summary.items():
+        if isinstance(value, int):
+            scene[f"beamng_jbeam_health_{key}"] = int(value)
+    scene["beamng_jbeam_last_topology_health_json"] = json.dumps(summary, indent=2)
+
+
 def build_jbeam_export_validation(context, selected_virtual_paths=None):
     history = jbeam_operation_history(context.scene)
     plan = build_jbeam_override_export_plan(context, history)
@@ -3802,6 +3931,8 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
     errors = []
     infos = []
     files = []
+    health = experimental_jbeam_topology_health(context.scene)
+    store_experimental_jbeam_topology_health(context.scene, health)
 
     if source_warning:
         warnings.add(source_warning)
@@ -3817,6 +3948,10 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
         warnings.add(
             f"{non_triangle_face_count} non-triangle mesh face(s) found and ignored; JBeam collision triangles require exactly 3 nodes."
         )
+    for error in health.get("errors", []):
+        errors.append(f"Topology health: {error}")
+    for warning in health.get("warnings", []):
+        warnings.add(f"Topology health: {warning}")
 
     for file_group in plan.get("files", []):
         virtual_path = normalize_virtual_path(file_group.get("virtual_path", ""))
@@ -3846,6 +3981,8 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
         normalized_target = normalize_virtual_path(target_path)
         if target_path and "/current/vehicles/" in normalized_target.lower():
             file_errors.append("Refusing JBeam target under current/vehicles; that folder is for .pc configurations.")
+        if target_path and "/current/mods/unpacked/" not in normalized_target.lower():
+            file_errors.append("Refusing JBeam target outside current/mods/unpacked/<mod>/vehicles.")
         if target_path and Path(target_path).exists():
             file_infos.append("Target already exists; stage without overwrite will skip it, update will back it up first.")
         mesh_errors, mesh_warnings = validate_experimental_mesh_topology_for_export(context, file_group)
@@ -3944,6 +4081,7 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
         "errors": sorted(set(errors)),
         "warnings": sorted(set(warnings)),
         "infos": sorted(set(infos)),
+        "topology_health": health,
         "files": files,
     }
 
@@ -3973,6 +4111,14 @@ def jbeam_export_validation_lines(validation):
         f"User current folder: {validation['user_current_folder'] or '(not configured)'}",
         f"JBeam export mod: {validation['export_mod_folder'] or '(not configured)'}",
         f"JBeam export root: {validation['export_root'] or '(not configured)'}",
+        (
+            "Topology health: "
+            f"meshes {validation.get('topology_health', {}).get('mesh_count', 0)}, "
+            f"nodes {validation.get('topology_health', {}).get('node_count', 0)}, "
+            f"proxy drift {validation.get('topology_health', {}).get('proxy_drift_count', 0)}, "
+            f"missing refs {validation.get('topology_health', {}).get('missing_reference_count', 0)}, "
+            f"dirty params {validation.get('topology_health', {}).get('dirty_param_count', 0)}"
+        ),
         "",
     ]
     for error in validation["errors"]:
@@ -4970,6 +5116,34 @@ class BEAMNG_OT_repair_experimental_jbeam_topology_uids(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_check_experimental_jbeam_topology_health(Operator):
+    bl_idname = "beamng_pc_importer.check_experimental_jbeam_topology_health"
+    bl_label = "Check JBeam Topology Health"
+    bl_description = "Summarize experimental JBeam mesh identity, proxy, topology, and parameter health"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        summary = experimental_jbeam_topology_health(context.scene)
+        store_experimental_jbeam_topology_health(context.scene, summary)
+        text = bpy.data.texts.get("BeamNG JBeam Topology Health") or bpy.data.texts.new(
+            "BeamNG JBeam Topology Health"
+        )
+        text.clear()
+        text.write(json.dumps(summary, indent=2))
+        text.write("\n")
+        level = {"ERROR"} if summary.get("errors") else {"WARNING"} if summary.get("warnings") else {"INFO"}
+        self.report(
+            level,
+            (
+                f"JBeam health: {summary['mesh_count']} mesh(es), "
+                f"{summary['proxy_drift_count']} proxy drift, "
+                f"{summary['missing_reference_count']} missing ref, "
+                f"{summary['dirty_param_count']} dirty param"
+            ),
+        )
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_add_standalone_jbeam_node(Operator):
     bl_idname = "beamng_pc_importer.add_standalone_jbeam_node"
     bl_label = "Add Standalone Node"
@@ -5237,7 +5411,10 @@ class BEAMNG_OT_load_selected_jbeam_node_properties(Operator):
             return {"CANCELLED"}
         index = selected_indices[0]
         node_params = identity.get("node_params", [])
-        params = node_params[index] if index < len(node_params) and isinstance(node_params[index], dict) else {}
+        selected_info = experimental_jbeam_node_info_for_selection(context, limit=1)
+        params = selected_info[0].get("params", {}) if selected_info else {}
+        if not params:
+            params = node_params[index] if index < len(node_params) and isinstance(node_params[index], dict) else {}
         context.scene.beamng_jbeam_node_weight = str(params.get("nodeWeight", ""))
         context.scene.beamng_jbeam_node_material = str(params.get("nodeMaterial", ""))
         context.scene.beamng_jbeam_node_group = str(params.get("group", ""))
@@ -5299,7 +5476,10 @@ class BEAMNG_OT_load_selected_jbeam_beam_properties(Operator):
         edge_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("edges", [])
         edge_params = topology_params_for_current_elements(obj.data, edge_uids, "beamng_edge_params_json", "beamng_edge_uid_to_params_json", allow_write=False)
         index = selected_indices[0]
-        params = edge_params[index] if index < len(edge_params) and isinstance(edge_params[index], dict) else {}
+        selected_info = experimental_jbeam_edge_info_for_selection(context, limit=1)
+        params = selected_info[0].get("params", {}) if selected_info else {}
+        if not params:
+            params = edge_params[index] if index < len(edge_params) and isinstance(edge_params[index], dict) else {}
         context.scene.beamng_jbeam_beam_spring = str(params.get("beamSpring", ""))
         context.scene.beamng_jbeam_beam_damp = str(params.get("beamDamp", ""))
         context.scene.beamng_jbeam_beam_deform = str(params.get("beamDeform", ""))
@@ -5360,7 +5540,10 @@ class BEAMNG_OT_load_selected_jbeam_triangle_properties(Operator):
         face_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("faces", [])
         face_params = topology_params_for_current_elements(obj.data, face_uids, "beamng_face_params_json", "beamng_face_uid_to_params_json", allow_write=False)
         index = selected_indices[0]
-        params = face_params[index] if index < len(face_params) and isinstance(face_params[index], dict) else {}
+        selected_info = experimental_jbeam_face_info_for_selection(context, limit=1)
+        params = selected_info[0].get("params", {}) if selected_info else {}
+        if not params:
+            params = face_params[index] if index < len(face_params) and isinstance(face_params[index], dict) else {}
         context.scene.beamng_jbeam_triangle_group = str(params.get("group", ""))
         context.scene.beamng_jbeam_triangle_drag_coef = str(params.get("dragCoef", ""))
         context.scene.beamng_jbeam_triangle_ground_model = str(params.get("groundModel", ""))
@@ -6776,6 +6959,10 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         restored_count = int(context.scene.get("beamng_jbeam_restored_proxy_move_count", 0))
         synced_proxy_count = int(context.scene.get("beamng_jbeam_synced_proxy_node_count", 0))
         proxy_sync_message = context.scene.get("beamng_jbeam_last_proxy_sync_message", "")
+        model_operation_count = int(context.scene.get("beamng_authoring_model_operation_count", 0))
+        health_proxy_drift = int(context.scene.get("beamng_jbeam_health_proxy_drift_count", 0))
+        health_missing_refs = int(context.scene.get("beamng_jbeam_health_missing_reference_count", 0))
+        health_dirty_params = int(context.scene.get("beamng_jbeam_health_dirty_param_count", 0))
         history_count = int(context.scene.get("beamng_jbeam_operation_history_count", 0))
         history_breakdown = jbeam_history_counts(jbeam_operation_history(context.scene))
         checkpoint_count = int(context.scene.get("beamng_jbeam_export_checkpoint_count", 0))
@@ -6783,6 +6970,8 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         if pending_topology_count:
             box.label(text=f"Pending topology edits: {pending_topology_count}")
         box.label(text=f"Accepted operations: {history_count}")
+        if model_operation_count != history_count:
+            box.label(text=f"Authoring model ops: {model_operation_count} (refresh on accept/clear)", icon="INFO")
         if history_breakdown.get("beams") or history_breakdown.get("triangles"):
             box.label(
                 text=(
@@ -6798,11 +6987,20 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
             box.label(text=f"Proxy nodes synced: {synced_proxy_count}")
         if proxy_sync_message:
             box.label(text=str(proxy_sync_message), icon="INFO")
+        if health_proxy_drift or health_missing_refs or health_dirty_params:
+            box.label(
+                text=(
+                    f"Health: proxy drift {health_proxy_drift}, "
+                    f"missing refs {health_missing_refs}, dirty params {health_dirty_params}"
+                ),
+                icon="ERROR" if health_missing_refs else "INFO",
+            )
         row = box.row(align=True)
         op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan Active")
         op.active_only = True
         op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan All")
         op.active_only = False
+        row.operator(BEAMNG_OT_check_experimental_jbeam_topology_health.bl_idname, text="Health")
         row = box.row(align=True)
         row.enabled = pending_count > 0
         row.operator(BEAMNG_OT_accept_experimental_jbeam_node_moves.bl_idname, text="Accept Pending Edits")
@@ -7956,6 +8154,7 @@ classes = (
     BEAMNG_OT_mark_selected_edges_as_jbeam_beams,
     BEAMNG_OT_report_experimental_jbeam_selection,
     BEAMNG_OT_repair_experimental_jbeam_topology_uids,
+    BEAMNG_OT_check_experimental_jbeam_topology_health,
     BEAMNG_OT_add_standalone_jbeam_node,
     BEAMNG_OT_create_jbeam_beam_from_selected_nodes,
     BEAMNG_OT_create_jbeam_triangle_from_selected_nodes,
@@ -7972,6 +8171,7 @@ classes = (
     BEAMNG_OT_write_jbeam_edit_preview,
     BEAMNG_OT_write_jbeam_node_patch_draft,
     BEAMNG_OT_write_jbeam_override_export_plan,
+    BEAMNG_OT_set_jbeam_export_selection,
     BEAMNG_OT_validate_jbeam_export,
     BEAMNG_OT_write_jbeam_patched_cache_copies,
     BEAMNG_OT_stage_jbeam_user_override_copies,

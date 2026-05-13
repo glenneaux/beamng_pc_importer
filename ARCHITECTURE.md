@@ -47,6 +47,14 @@ The working model can be mutable for interactive editing, but each meaningful ed
 
 Current implementation direction: a detailed authoring-model snapshot is now stored separately from Blender mesh custom properties. It records source files, resolved parts, nodes, beams, triangles, and accepted edit operations so Blender can become a projection of the model rather than the long-term source of truth.
 
+Near-term completion direction:
+
+- Keep the authoring-model operation count aligned with accepted edit history.
+- Treat topology health as part of export validation, not just a debug report.
+- Export dialogs should show all changed files selected by default, allow all/none toggles, and expose full target paths.
+- Refuse JBeam targets outside `current/mods/unpacked/<mod>/vehicles/...`.
+- Continue moving property panels toward model-backed load/edit/apply behaviour.
+
 ## Preserve-First Editing
 
 Assume BeamNG file parameters can change over time. The editor should preserve anything it does not understand.
