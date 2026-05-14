@@ -1,0 +1,33 @@
+{
+    // Minimal JBeam used by the boundary tests. Four nodes form a tetrahedron,
+    // four beams form a loop, one triangle is collidable. No flexbodies / DAE
+    // dependency so the resolver can run without asset materialization.
+    "tiny_main": {
+        "information": {
+            "name": "Tiny Test Vehicle",
+            "authors": "Test Suite"
+        },
+        "slotType": "main",
+        "slots2": [
+            ["type", "default", "description"]
+        ],
+        "nodes": [
+            ["id", "posX", "posY", "posZ"],
+            ["n1", 0.0, 0.0, 0.0],
+            ["n2", 1.0, 0.0, 0.0],
+            ["n3", 0.0, 1.0, 0.0],
+            ["n4", 0.0, 0.0, 1.0],
+        ],
+        "beams": [
+            ["id1:", "id2:"],
+            ["n1", "n2"],
+            ["n2", "n3"],
+            ["n3", "n4"],
+            ["n4", "n1"],
+        ],
+        "triangles": [
+            ["id1:", "id2:", "id3:"],
+            ["n1", "n2", "n3"]
+        ]
+    }
+}

@@ -1,0 +1,133 @@
+# serializer version: 1
+# name: test_to_json_snapshot
+  '''
+  {
+    "beams": [
+      {
+        "id1": "n1",
+        "id2": "n2",
+        "options": {
+          "beamSpring": 1000.0
+        },
+        "part_name": "tiny_main",
+        "resolved_part_id": 0,
+        "source_file": "vehicles/tiny/tiny.jbeam"
+      }
+    ],
+    "files": [
+      {
+        "beam_count": 4,
+        "node_count": 4,
+        "part_names": [
+          "tiny_main"
+        ],
+        "source_file": "vehicles/tiny/tiny.jbeam",
+        "triangle_count": 1,
+        "virtual_path": "vehicles/tiny/tiny.jbeam"
+      }
+    ],
+    "generated_at": "2026-05-14T10:00:00",
+    "main_part": "tiny_main",
+    "nodes": [
+      {
+        "id": "n1",
+        "kind": "owned",
+        "options": {},
+        "part_name": "tiny_main",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "resolved_part_id": 0,
+        "source_file": "vehicles/tiny/tiny.jbeam"
+      },
+      {
+        "id": "n2",
+        "kind": "owned",
+        "options": {
+          "nodeWeight": 2.5
+        },
+        "part_name": "tiny_main",
+        "position": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "resolved_part_id": 0,
+        "source_file": "vehicles/tiny/tiny.jbeam"
+      }
+    ],
+    "operations": [
+      {
+        "created_at": "2026-05-14T10:00:00",
+        "field": "position",
+        "file": "vehicles/tiny/tiny.jbeam",
+        "new": [
+          0.001,
+          0.0,
+          0.0
+        ],
+        "nodes": [],
+        "old": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "operation": "update",
+        "owner_resolved_part_id": -1,
+        "params": {},
+        "part": "tiny_main",
+        "reason": "",
+        "resolved_part_id": -1,
+        "row": "n1",
+        "section": "nodes",
+        "source_object": "",
+        "status": "pending",
+        "vertex_index": -1
+      }
+    ],
+    "parts": [
+      {
+        "beam_count": 4,
+        "external_node_refs": [],
+        "name": "tiny_main",
+        "node_ids": [
+          "n1",
+          "n2",
+          "n3",
+          "n4"
+        ],
+        "parent_id": -1,
+        "resolved_part_id": 0,
+        "slot_name": "",
+        "source_file": "vehicles/tiny/tiny.jbeam",
+        "triangle_count": 1
+      }
+    ],
+    "pc_path": "vehicles/tiny/tiny.pc",
+    "schema_version": 1,
+    "source_description": "unit test fixture",
+    "triangles": [
+      {
+        "id1": "n1",
+        "id2": "n2",
+        "id3": "n3",
+        "normal": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "options": {},
+        "part_name": "tiny_main",
+        "resolved_part_id": 0,
+        "source_file": "vehicles/tiny/tiny.jbeam"
+      }
+    ],
+    "vehicle_model": "tiny",
+    "warnings": [
+      "example warning preserved verbatim"
+    ]
+  }
+  '''
+# ---
