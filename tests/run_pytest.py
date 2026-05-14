@@ -19,12 +19,21 @@ On Windows the path is typically
 from __future__ import annotations
 
 import os
+import site
 import sys
 from pathlib import Path
 
 THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parent.parent
 REPO_PARENT = REPO_ROOT.parent
+
+# Blender disables user-site by default, so `pip install --user pytest`
+# (the default on Windows when site-packages is non-writable) leaves the
+# package invisible. Append the per-user site dir to sys.path manually.
+site.ENABLE_USER_SITE = True
+user_site = site.getusersitepackages()
+if user_site and Path(user_site).is_dir() and user_site not in sys.path:
+    sys.path.append(user_site)
 
 # Make the add-on importable both as a package (parent on path so
 # `import beamng_pc_importer` works) and as flat modules (repo root on path so

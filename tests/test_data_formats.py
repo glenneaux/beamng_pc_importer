@@ -1,8 +1,13 @@
 """Boundary tests: data files in -> resolved authoring model out.
 
-These exercise the JBeam / PC parser pipeline end-to-end without involving
-Blender's UI or scene graph. They require ``mathutils`` (Vector/Matrix), which
-Blender provides, hence they live under integration/.
+These exercise the JBeam / PC parser pipeline end-to-end without driving the
+import operator. They require ``mathutils`` (Vector/Matrix), so they run
+inside Blender like the rest of the suite.
+
+The add-on is imported as a package (``beamng_pc_importer``) because the
+top-level ``resolve_selected_parts`` lives in ``__init__.py``. All names
+re-exported from ``core`` / ``resolved_model`` are also available there
+through the existing star-imports.
 """
 
 from __future__ import annotations
@@ -11,15 +16,15 @@ import json
 
 import pytest
 
-import core
+import beamng_pc_importer as addon
 import resolved_model as rm
 
 
 @pytest.fixture
 def parsed_tiny(tiny_pc_path, tiny_vehicle_root):
     """Parse the fixture vehicle through the real resolver pipeline."""
-    pc_data = core.load_jsonc(tiny_pc_path)
-    part_index = core.parse_parts_index(tiny_vehicle_root)
+    pc_data = addon.load_jsonc(tiny_pc_path)
+    part_index = addon.parse_parts_index(tiny_vehicle_root)
     return pc_data, part_index
 
 
@@ -35,7 +40,7 @@ def test_part_index_finds_main_part(parsed_tiny):
     assert part_index["tiny_main"].data["slotType"] == "main"
 
 
-def test_resolver_produces_expected_topology(parsed_tiny, tiny_pc_path):
+def test_resolver_produces_expected_topology(parsed_tiny):
     pc_data, part_index = parsed_tiny
 
     (
@@ -47,7 +52,7 @@ def test_resolver_produces_expected_topology(parsed_tiny, tiny_pc_path):
         visual_hydros,
         visual_rails,
         visual_slidenodes,
-    ) = core.resolve_selected_parts(pc_data, part_index)
+    ) = addon.resolve_selected_parts(pc_data, part_index)
 
     assert len(resolved_parts) == 1
     assert resolved_parts[0].part_def.name == "tiny_main"
@@ -69,7 +74,7 @@ def test_resolver_produces_expected_topology(parsed_tiny, tiny_pc_path):
 
 def test_resolver_preserves_node_positions(parsed_tiny):
     pc_data, part_index = parsed_tiny
-    (_parts, _flex, nodes, *_rest) = core.resolve_selected_parts(pc_data, part_index)
+    (_parts, _flex, nodes, *_rest) = addon.resolve_selected_parts(pc_data, part_index)
 
     positions_by_id = {n.name: tuple(round(v, 6) for v in n.position) for n in nodes}
     assert positions_by_id == {
@@ -95,7 +100,7 @@ def test_authoring_model_snapshot(parsed_tiny, tiny_pc_path, snapshot):
         visual_beams,
         visual_triangles,
         *_rest,
-    ) = core.resolve_selected_parts(pc_data, part_index)
+    ) = addon.resolve_selected_parts(pc_data, part_index)
 
     model = rm.build_authoring_model_from_import(
         pc_path=tiny_pc_path,
@@ -128,10 +133,10 @@ def test_authoring_model_snapshot(parsed_tiny, tiny_pc_path, snapshot):
     assert normalized == snapshot
 
 
-def test_jsonc_handles_trailing_comma(tmp_path):
+def test_jsonc_handles_trailing_comma():
     """The .pc / .jbeam loader must tolerate trailing commas (BeamNG convention)."""
     text = '{ "a": [1, 2, 3,], "b": 4, }'
-    parsed = core.load_jsonc_text(text)
+    parsed = addon.load_jsonc_text(text)
     assert parsed == {"a": [1, 2, 3], "b": 4}
 
 
@@ -144,5 +149,5 @@ def test_jsonc_strips_line_and_block_comments():
                  line */ 2
     }
     """
-    parsed = core.load_jsonc_text(text)
+    parsed = addon.load_jsonc_text(text)
     assert parsed == {"a": 1, "b": 2}

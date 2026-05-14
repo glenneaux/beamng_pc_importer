@@ -1,0 +1,149 @@
+# serializer version: 1
+# name: test_authoring_model_snapshot
+  '''
+  {
+    "beams": [
+      {
+        "id1": "n1",
+        "id2": "n2",
+        "options": {},
+        "part_name": "tiny_main",
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      },
+      {
+        "id1": "n2",
+        "id2": "n3",
+        "options": {},
+        "part_name": "tiny_main",
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      },
+      {
+        "id1": "n3",
+        "id2": "n4",
+        "options": {},
+        "part_name": "tiny_main",
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      },
+      {
+        "id1": "n4",
+        "id2": "n1",
+        "options": {},
+        "part_name": "tiny_main",
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      }
+    ],
+    "files": [
+      {
+        "beam_count": 4,
+        "node_count": 4,
+        "part_names": [
+          "tiny_main"
+        ],
+        "source_file": "<fixture>/tiny.jbeam",
+        "triangle_count": 1,
+        "virtual_path": ""
+      }
+    ],
+    "generated_at": "<pinned>",
+    "main_part": "tiny_main",
+    "nodes": [
+      {
+        "id": "n1",
+        "kind": "owned",
+        "options": {},
+        "part_name": "tiny_main",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      },
+      {
+        "id": "n2",
+        "kind": "owned",
+        "options": {},
+        "part_name": "tiny_main",
+        "position": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      },
+      {
+        "id": "n3",
+        "kind": "owned",
+        "options": {},
+        "part_name": "tiny_main",
+        "position": [
+          0.0,
+          1.0,
+          0.0
+        ],
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      },
+      {
+        "id": "n4",
+        "kind": "owned",
+        "options": {},
+        "part_name": "tiny_main",
+        "position": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      }
+    ],
+    "operations": [],
+    "parts": [
+      {
+        "beam_count": 4,
+        "external_node_refs": [],
+        "name": "tiny_main",
+        "node_ids": [
+          "n1",
+          "n2",
+          "n3",
+          "n4"
+        ],
+        "parent_id": -1,
+        "resolved_part_id": 0,
+        "slot_name": "",
+        "source_file": "<fixture>/tiny.jbeam",
+        "triangle_count": 1
+      }
+    ],
+    "pc_path": "<fixture>/tiny.pc",
+    "schema_version": 1,
+    "source_description": "snapshot test",
+    "triangles": [
+      {
+        "id1": "n1",
+        "id2": "n2",
+        "id3": "n3",
+        "normal": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "options": {},
+        "part_name": "tiny_main",
+        "resolved_part_id": 0,
+        "source_file": "<fixture>/tiny.jbeam"
+      }
+    ],
+    "vehicle_model": "tiny",
+    "warnings": []
+  }
+  '''
+# ---
