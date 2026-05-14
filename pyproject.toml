@@ -1,0 +1,67 @@
+[project]
+name = "beamng_pc_importer"
+version = "1.0.1"
+description = "Blender add-on for importing BeamNG .pc configurations and editing JBeam structures"
+requires-python = ">=3.10"
+
+# Runtime is Blender's bundled Python; this list exists only so the package can
+# be installed in editable mode for tests and tooling.
+dependencies = []
+
+[project.optional-dependencies]
+# `dev` installs into a regular Python for the ruff toolchain.
+dev = [
+    "ruff>=0.5",
+]
+# `test` is a manifest of what tests need; install it into Blender's bundled
+# Python (see AGENTS.md §3), not into a regular venv. Tests cannot collect
+# outside Blender because the add-on imports bpy at module top.
+test = [
+    "pytest>=7.4",
+    "syrupy>=4.6",
+]
+
+# The add-on is a flat module: __init__.py + sibling .py files at the repo root.
+# Treat the repo root as the package directory.
+[tool.setuptools]
+py-modules = ["__init__", "core", "dae_assets", "resolved_model", "visuals"]
+
+# pytest is invoked from inside Blender's bundled Python via
+# tests/run_pytest.py. The launcher passes the test path explicitly, so this
+# block stays minimal and `testpaths` is intentionally absent.
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+markers = [
+    "blender: test requires Blender's bundled Python (run via tests/run_pytest.py)",
+]
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"
+# __init__.py is 9k+ lines of Blender registration code. Format new code
+# inside it, but don't reflow the whole file in one pass — apply ruff
+# format/lint per touched file rather than across the whole add-on.
+extend-exclude = [
+    ".git",
+    "__pycache__",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "W",  # pycodestyle warnings
+    "I",  # isort
+    "UP", # pyupgrade
+    "B",  # flake8-bugbear (subset)
+]
+ignore = [
+    "E501",  # line length (use formatter, don't fail builds on long lines)
+    "E731",  # lambda assigns (used in slot/enum callbacks)
+    "B008",  # function calls in defaults (Blender pattern: bl_info dicts etc.)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

@@ -1,0 +1,8 @@
+{
+    "format": 2,
+    "model": "tiny",
+    "mainPartName": "tiny_main",
+    "parts": {
+        "main": "tiny_main"
+    }
+}
