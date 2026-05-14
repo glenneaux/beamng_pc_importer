@@ -777,6 +777,16 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
         mesh["beamng_edge_uid_to_committed_params_json"] = json.dumps({str(uid): params for uid, params in zip(edge_uids, edge_options)})
         mesh["beamng_face_uid_to_params_json"] = json.dumps({str(uid): params for uid, params in zip(face_uids, face_options)})
         mesh["beamng_face_uid_to_committed_params_json"] = json.dumps({str(uid): params for uid, params in zip(face_uids, face_options)})
+        mesh["beamng_edge_uid_to_semantic_type_json"] = json.dumps({str(uid): "beam" for uid in edge_uids})
+        mesh["beamng_edge_uid_to_semantic_state_json"] = json.dumps({str(uid): "valid" for uid in edge_uids})
+        mesh["beamng_face_uid_to_semantic_type_json"] = json.dumps({str(uid): "triangle" for uid in face_uids})
+        mesh["beamng_face_uid_to_semantic_state_json"] = json.dumps({str(uid): "valid" for uid in face_uids})
+        mesh["beamng_topology_revision"] = 0
+        mesh["beamng_topology_signature_json"] = json.dumps({})
+        mesh["beamng_semantic_topology_json"] = json.dumps({})
+        mesh["beamng_previous_semantic_topology_json"] = json.dumps({})
+        mesh["beamng_semantic_topology_delta_json"] = json.dumps({})
+        mesh["beamng_semantic_topology_delta_count"] = 0
         mesh_edge_ids = []
         for edge in mesh.edges:
             indices = list(edge.vertices)

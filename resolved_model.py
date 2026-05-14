@@ -51,6 +51,51 @@ class ResolvedTriangle:
 
 
 @dataclass
+class TopologyVertex:
+    uid: int
+    node_id: str = ""
+    position: tuple = dataclass_field(default_factory=tuple)
+    semantic_type: str = "node"
+    semantic_state: str = "valid"
+    ownership_mode: str = "owned"
+    owner_part_id: int = -1
+
+
+@dataclass
+class TopologyEdge:
+    uid: int
+    vertex_uids: list = dataclass_field(default_factory=list)
+    node_ids: list = dataclass_field(default_factory=list)
+    semantic_type: str = "relationship"
+    semantic_state: str = "valid"
+    ownership_mode: str = "owned"
+
+
+@dataclass
+class TopologyFace:
+    uid: int
+    vertex_uids: list = dataclass_field(default_factory=list)
+    node_ids: list = dataclass_field(default_factory=list)
+    semantic_type: str = "triangle"
+    semantic_state: str = "valid"
+    ownership_mode: str = "owned"
+    winding: list = dataclass_field(default_factory=list)
+
+
+@dataclass
+class SemanticTopologySnapshot:
+    schema_version: int = 1
+    topology_revision: int = 0
+    object_name: str = ""
+    part_name: str = ""
+    source_file: str = ""
+    vertices: list = dataclass_field(default_factory=list)
+    edges: list = dataclass_field(default_factory=list)
+    faces: list = dataclass_field(default_factory=list)
+    warnings: list = dataclass_field(default_factory=list)
+
+
+@dataclass
 class ResolvedPartDetail:
     name: str
     resolved_part_id: int
@@ -171,6 +216,14 @@ def _edge_key(edge):
 
 def _face_key(face):
     return tuple(str(node_id) for node_id in face[:3])
+
+
+def semantic_topology_snapshot_from_dict(data):
+    data = dict(data or {})
+    data["vertices"] = [_coerce(TopologyVertex, item) for item in data.get("vertices", [])]
+    data["edges"] = [_coerce(TopologyEdge, item) for item in data.get("edges", [])]
+    data["faces"] = [_coerce(TopologyFace, item) for item in data.get("faces", [])]
+    return SemanticTopologySnapshot(**{key: value for key, value in data.items() if key in {field_info.name for field_info in fields(SemanticTopologySnapshot)}})
 
 
 def build_authoring_model_from_import(
