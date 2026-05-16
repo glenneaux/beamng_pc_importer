@@ -6580,8 +6580,8 @@ class BEAMNG_OT_repair_experimental_jbeam_topology_uids(Operator):
         return {"FINISHED"}
 
 
-class BEAMNG_OT_repair_experimental_jbeam_semantic_topology(Operator):
-    bl_idname = "beamng_pc_importer.repair_experimental_jbeam_semantic_topology"
+class BEAMNG_OT_repair_experimental_jbeamzzz(Operator):
+    bl_idname = "beamng_pc_importer.repair_experimental_jbeamzzz"
     bl_label = "Repair Semantic Topology"
     bl_description = "Rebuild semantic topology snapshots and remove stale UID-keyed metadata for experimental JBeam meshes"
     bl_options = {"REGISTER", "UNDO"}
@@ -8831,7 +8831,7 @@ def draw_jbeam_topology_tools(layout, context, active_mesh):
     row = box.row(align=True)
     row.operator(BEAMNG_OT_flip_selected_jbeam_triangles.bl_idname, text="Flip Tri")
     row.operator(BEAMNG_OT_repair_experimental_jbeam_topology_uids.bl_idname, text="Repair UIDs")
-    op = row.operator(BEAMNG_OT_repair_experimental_jbeam_semantic_topology.bl_idname, text="Repair Semantic")
+    op = row.operator(BEAMNG_OT_repair_experimental_jbeamzzz.bl_idname, text="Repair Semantic")
     op.active_only = False
     box.operator(BEAMNG_OT_write_semantic_topology_snapshot.bl_idname, text="Write Semantic Snapshot")
 
@@ -10296,7 +10296,7 @@ classes = (
     BEAMNG_OT_report_experimental_jbeam_selection,
     BEAMNG_OT_write_semantic_topology_snapshot,
     BEAMNG_OT_repair_experimental_jbeam_topology_uids,
-    BEAMNG_OT_repair_experimental_jbeam_semantic_topology,
+    BEAMNG_OT_repair_experimental_jbeamzzz,
     BEAMNG_OT_check_experimental_jbeam_topology_health,
     BEAMNG_OT_create_jbeam_part_file,
     BEAMNG_OT_write_active_jbeam_slot_metadata,
