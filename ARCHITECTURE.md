@@ -137,6 +137,8 @@ The future editing representation should use Blender mesh principles:
 
 This lets the editor use Blender's native selection and editing concepts while the internal resolved model remains authoritative.
 
+Stable Blender element GUIDs should be treated as the editor's primary topology identity for vertices, edges, and faces. BeamNG-facing aliases such as node ids, beam endpoint ids, part ownership, proxy/source relationships, and future exported comments should map onto those GUIDs rather than replace them. Optional JBeam comments may later preserve these aliases across text round-trips, but Blender GUIDs remain the local authoring identity.
+
 Recommended approach:
 
 - Keep current visual/debug mode intact.

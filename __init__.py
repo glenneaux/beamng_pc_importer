@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 114
+ADDON_BUILD = 117
 
 
 def addon_version_label():
@@ -22,6 +22,7 @@ import math
 import re
 import tempfile
 import time
+import uuid
 import zipfile
 import colorsys
 from collections import defaultdict
@@ -1210,6 +1211,20 @@ def experimental_jbeam_mesh_depsgraph_update_post(scene, depsgraph):
         return
 
 
+@persistent
+def experimental_jbeam_mesh_topology_update_post(mesh):
+    try:
+        attributes = getattr(mesh, "attributes", None)
+        if attributes is None or JBEAM_NODE_UID_ATTR not in attributes:
+            return
+        scene = bpy.context.scene
+        if scene is not None:
+            sync_experimental_jbeam_proxy_nodes(scene)
+        tag_experimental_jbeam_auto_scan()
+    except Exception:
+        return
+
+
 def reset_jbeam_edit_session(scene):
     global _jbeam_proxy_sync_last_signature, _jbeam_proxy_sync_poll_due_time
     global _jbeam_auto_scan_last_signature, _jbeam_auto_scan_poll_due_time
@@ -1530,6 +1545,86 @@ def read_experimental_mesh_vertices(obj):
     return None, [vertex.co.copy() for vertex in mesh.vertices]
 
 
+def proxy_node_world_positions_for_overlay(obj):
+    mesh = obj.data
+    positions = []
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        layer = edit_mesh.verts.layers.int.get(JBEAM_NODE_IS_PROXY_ATTR)
+        if layer is None:
+            return []
+        for vertex in edit_mesh.verts:
+            if int(vertex[layer]) != 0:
+                positions.append(obj.matrix_world @ vertex.co)
+        return positions
+
+    attr = mesh.attributes.get(JBEAM_NODE_IS_PROXY_ATTR) if hasattr(mesh, "attributes") else None
+    if attr is None:
+        return []
+    for index, vertex in enumerate(mesh.vertices):
+        if index < len(attr.data) and int(attr.data[index].value) != 0:
+            positions.append(obj.matrix_world @ vertex.co)
+    return positions
+
+
+def draw_experimental_jbeam_proxy_node_overlay():
+    context = bpy.context
+    scene = context.scene
+    region_data = getattr(context, "region_data", None)
+    if scene is None or region_data is None:
+        return
+    prefs = get_addon_preferences(context)
+    if prefs is not None and not bool(getattr(prefs, "show_proxy_node_overlay", True)):
+        return
+
+    line_positions = []
+    view_right = region_data.view_rotation @ Vector((1.0, 0.0, 0.0))
+    view_up = region_data.view_rotation @ Vector((0.0, 1.0, 0.0))
+    for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+        for position in proxy_node_world_positions_for_overlay(obj):
+            size = max(0.025, (position - region_data.view_location).length * 0.004)
+            line_positions.extend(
+                [
+                    position - view_right * size,
+                    position + view_right * size,
+                    position - view_up * size,
+                    position + view_up * size,
+                ]
+            )
+    if not line_positions:
+        return
+
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        batch = batch_for_shader(shader, "LINES", {"pos": line_positions})
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.62, 0.05, 1.0))
+        batch.draw(shader)
+    except Exception:
+        return
+
+
+def register_experimental_jbeam_proxy_overlay():
+    global _jbeam_proxy_overlay_draw_handle
+    if _jbeam_proxy_overlay_draw_handle is None:
+        _jbeam_proxy_overlay_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            draw_experimental_jbeam_proxy_node_overlay, (), "WINDOW", "POST_VIEW"
+        )
+
+
+def unregister_experimental_jbeam_proxy_overlay():
+    global _jbeam_proxy_overlay_draw_handle
+    if _jbeam_proxy_overlay_draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_jbeam_proxy_overlay_draw_handle, "WINDOW")
+        _jbeam_proxy_overlay_draw_handle = None
+
+
 def set_experimental_mesh_vertex(edit_mesh, mesh, index, position):
     if edit_mesh is not None:
         edit_mesh.verts[index].co = position
@@ -1551,9 +1646,10 @@ def update_experimental_proxy_node_baseline(obj, index, position):
     mesh["beamng_original_node_positions_json"] = json.dumps(baselines)
 
     node_uids = ensure_experimental_topology_uids(obj, allow_write=True).get("nodes", [])
-    if index < len(node_uids) and int(node_uids[index]) > 0:
+    uid_key = topology_uid_key(node_uids[index]) if index < len(node_uids) else ""
+    if uid_key:
         uid_to_baseline = mesh_json_dict(mesh, "beamng_node_uid_to_original_position_json")
-        uid_to_baseline[str(int(node_uids[index]))] = target
+        uid_to_baseline[uid_key] = target
         mesh["beamng_node_uid_to_original_position_json"] = json.dumps(uid_to_baseline)
 
 
@@ -1799,9 +1895,9 @@ def add_proxy_nodes_to_experimental_mesh(context, target_obj, sources):
     uid_to_committed_params = mesh_json_dict(mesh, "beamng_node_uid_to_committed_params_json")
     for offset, source in enumerate(sources_to_add):
         index = old_vertex_count + offset
-        if index >= len(node_uids) or int(node_uids[index]) <= 0:
+        uid_key = topology_uid_key(node_uids[index]) if index < len(node_uids) else ""
+        if not uid_key:
             continue
-        uid_key = str(int(node_uids[index]))
         uid_to_node_id[uid_key] = str(source.get("node_id", ""))
         uid_to_kind[uid_key] = "proxy"
         uid_to_owner[uid_key] = int(source.get("owner_part_id", -1) or -1)
@@ -1850,15 +1946,101 @@ JBEAM_EDGE_SEMANTIC_TRIANGLE_BOUNDARY = "triangle_boundary"
 JBEAM_EDGE_SEMANTIC_RELATIONSHIP = "relationship"
 JBEAM_FACE_SEMANTIC_TRIANGLE = "triangle"
 JBEAM_FACE_SEMANTIC_INVALID = "invalid_face"
+_jbeam_proxy_overlay_draw_handle = None
 
 
-def next_mesh_topology_uid(mesh, used_uids):
+def new_mesh_topology_guid(used_uids):
+    uid = str(uuid.uuid4())
+    while uid in used_uids:
+        uid = str(uuid.uuid4())
+    used_uids.add(uid)
+    return uid
+
+
+def new_mesh_legacy_topology_uid(mesh, used_uids):
     next_uid = int(mesh.get("beamng_next_topology_uid", 1) or 1)
-    while next_uid in used_uids or next_uid <= 0:
+    while str(next_uid) in used_uids or next_uid <= 0:
         next_uid += 1
-    used_uids.add(next_uid)
     mesh["beamng_next_topology_uid"] = next_uid + 1
-    return next_uid
+    uid = str(next_uid)
+    used_uids.add(uid)
+    return uid
+
+
+def topology_uid_key(uid):
+    value = str(uid or "").strip()
+    if value in {"", "0", "0.0", "None", "none", "null"}:
+        return ""
+    return value
+
+
+def topology_uid_is_valid(uid):
+    return bool(topology_uid_key(uid))
+
+
+def topology_uid_sort_key(uid):
+    value = topology_uid_key(uid)
+    return (0, int(value)) if value.isdigit() else (1, value)
+
+
+def bmesh_string_value(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore").strip("\x00")
+    return str(value or "").strip("\x00")
+
+
+def set_bmesh_string_value(element, layer, value):
+    text = str(value or "")
+    try:
+        element[layer] = text.encode("utf-8")
+    except TypeError:
+        element[layer] = text
+
+
+def object_mode_string_attribute_values(mesh, attr_name, domain, count, allow_write=True):
+    if not hasattr(mesh, "attributes"):
+        return ["" for _index in range(count)]
+    attr = mesh.attributes.get(attr_name)
+    if attr is not None and getattr(attr, "data_type", "") != "STRING" and allow_write:
+        try:
+            mesh.attributes.remove(attr)
+            attr = None
+        except Exception:
+            pass
+    if attr is None:
+        if not allow_write:
+            return ["" for _index in range(count)]
+        try:
+            attr = mesh.attributes.new(attr_name, "STRING", domain)
+        except Exception:
+            return [str(value) if value else "" for value in object_mode_int_attribute_values(mesh, attr_name, domain, count, allow_write)]
+    values = []
+    for index in range(count):
+        if index >= len(attr.data):
+            values.append("")
+            continue
+        values.append(topology_uid_key(getattr(attr.data[index], "value", "")))
+    return values
+
+
+def set_object_mode_string_attribute_values(mesh, attr_name, domain, values):
+    if not hasattr(mesh, "attributes"):
+        return
+    attr = mesh.attributes.get(attr_name)
+    if attr is not None and getattr(attr, "data_type", "") != "STRING":
+        try:
+            mesh.attributes.remove(attr)
+            attr = None
+        except Exception:
+            return
+    if attr is None:
+        try:
+            attr = mesh.attributes.new(attr_name, "STRING", domain)
+        except Exception:
+            return
+    for index, value in enumerate(values):
+        if index < len(attr.data):
+            attr.data[index].value = str(value or "")
 
 
 def object_mode_int_attribute_values(mesh, attr_name, domain, count, allow_write=True):
@@ -1916,29 +2098,48 @@ def ensure_experimental_topology_uids(obj, allow_write=True):
         edit_mesh.faces.index_update()
 
         layers = {}
+        layer_kinds = {}
         for domain, collection, attr_name in (
             ("verts", edit_mesh.verts, JBEAM_NODE_UID_ATTR),
             ("edges", edit_mesh.edges, JBEAM_EDGE_UID_ATTR),
             ("faces", edit_mesh.faces, JBEAM_FACE_UID_ATTR),
         ):
-            layer = getattr(collection.layers, "int").get(attr_name)
-            if layer is None and allow_write:
-                layer = getattr(collection.layers, "int").new(attr_name)
+            string_layers = getattr(collection.layers, "string", None)
+            int_layers = getattr(collection.layers, "int", None)
+            layer = string_layers.get(attr_name) if string_layers is not None else None
+            kind = "string" if layer is not None else ""
+            if layer is None and string_layers is not None and allow_write:
+                layer = string_layers.new(attr_name)
+                kind = "string"
+            if layer is None and int_layers is not None:
+                layer = int_layers.get(attr_name)
+                kind = "int" if layer is not None else ""
             layers[domain] = layer
+            layer_kinds[domain] = kind
 
         results = {}
         global_used = set()
         changed = False
         for domain, elements in (("verts", edit_mesh.verts), ("edges", edit_mesh.edges), ("faces", edit_mesh.faces)):
             layer = layers[domain]
+            layer_kind = layer_kinds.get(domain, "")
             values = []
             for element in elements:
-                uid = int(element[layer]) if layer is not None else 0
-                if allow_write and (uid <= 0 or uid in global_used):
-                    uid = next_mesh_topology_uid(mesh, global_used)
-                    element[layer] = uid
+                if layer is None:
+                    uid = ""
+                elif layer_kind == "string":
+                    uid = topology_uid_key(bmesh_string_value(element[layer]))
+                else:
+                    uid = topology_uid_key(element[layer])
+                if allow_write and (not uid or uid in global_used):
+                    uid = new_mesh_topology_guid(global_used) if layer_kind == "string" else new_mesh_legacy_topology_uid(mesh, global_used)
+                    if layer is not None:
+                        if layer_kind == "string":
+                            set_bmesh_string_value(element, layer, uid)
+                        else:
+                            element[layer] = int(uid)
                     changed = True
-                elif uid > 0:
+                elif uid:
                     global_used.add(uid)
                 values.append(uid)
             results[domain] = values
@@ -1956,9 +2157,9 @@ def ensure_experimental_topology_uids(obj, allow_write=True):
         "faces": len(mesh.polygons),
     }
     values_by_domain = {
-        "nodes": object_mode_int_attribute_values(mesh, JBEAM_NODE_UID_ATTR, "POINT", counts["nodes"], allow_write),
-        "edges": object_mode_int_attribute_values(mesh, JBEAM_EDGE_UID_ATTR, "EDGE", counts["edges"], allow_write),
-        "faces": object_mode_int_attribute_values(mesh, JBEAM_FACE_UID_ATTR, "FACE", counts["faces"], allow_write),
+        "nodes": object_mode_string_attribute_values(mesh, JBEAM_NODE_UID_ATTR, "POINT", counts["nodes"], allow_write),
+        "edges": object_mode_string_attribute_values(mesh, JBEAM_EDGE_UID_ATTR, "EDGE", counts["edges"], allow_write),
+        "faces": object_mode_string_attribute_values(mesh, JBEAM_FACE_UID_ATTR, "FACE", counts["faces"], allow_write),
     }
     if allow_write:
         global_used = set()
@@ -1970,13 +2171,15 @@ def ensure_experimental_topology_uids(obj, allow_write=True):
             changed = False
             values = list(values_by_domain[key])
             for index, uid in enumerate(values):
-                if uid <= 0 or uid in global_used:
-                    values[index] = next_mesh_topology_uid(mesh, global_used)
+                uid = topology_uid_key(uid)
+                if not uid or uid in global_used:
+                    values[index] = new_mesh_topology_guid(global_used)
                     changed = True
                 else:
                     global_used.add(uid)
+                    values[index] = uid
             if changed:
-                set_object_mode_int_attribute_values(mesh, attr_name, domain, values)
+                set_object_mode_string_attribute_values(mesh, attr_name, domain, values)
             values_by_domain[key] = values
     return values_by_domain
 
@@ -1984,7 +2187,7 @@ def ensure_experimental_topology_uids(obj, allow_write=True):
 def bootstrap_uid_map_from_array(mesh, map_key, uid_values, array_values):
     uid_map = mesh_json_dict(mesh, map_key)
     changed = False
-    current_uid_keys = {str(uid) for uid in uid_values if int(uid) > 0}
+    current_uid_keys = {topology_uid_key(uid) for uid in uid_values if topology_uid_key(uid)}
     if (
         uid_map
         and current_uid_keys
@@ -1996,9 +2199,9 @@ def bootstrap_uid_map_from_array(mesh, map_key, uid_values, array_values):
         uid_map = {}
         changed = True
     for index, uid in enumerate(uid_values):
-        if uid <= 0 or index >= len(array_values):
+        key = topology_uid_key(uid)
+        if not key or index >= len(array_values):
             continue
-        key = str(uid)
         if key not in uid_map:
             uid_map[key] = array_values[index]
             changed = True
@@ -2013,7 +2216,10 @@ def topology_params_for_current_elements(mesh, uid_values, array_key, map_key, a
     params = []
     changed = False
     for index, uid in enumerate(uid_values):
-        uid_key = str(uid)
+        uid_key = topology_uid_key(uid)
+        if not uid_key:
+            params.append({})
+            continue
         value = uid_map.get(uid_key)
         if value is None:
             value = array_values[index] if index < len(array_values) and isinstance(array_values[index], dict) else {}
@@ -2029,7 +2235,7 @@ def topology_params_for_current_elements(mesh, uid_values, array_key, map_key, a
 
 def prune_uid_keyed_map(mesh, key, live_uids):
     data = mesh_json_dict(mesh, key)
-    live = {str(int(uid)) for uid in live_uids if int(uid) > 0}
+    live = {topology_uid_key(uid) for uid in live_uids if topology_uid_key(uid)}
     pruned = {str(uid): value for uid, value in data.items() if str(uid) in live}
     if pruned != data:
         mesh[key] = json.dumps(pruned)
@@ -2139,8 +2345,8 @@ def ensure_experimental_mesh_identity(obj, scene=None, allow_write=True):
     uid_maps_changed = False
     for index in range(vertex_count):
         uid = node_uids[index] if index < len(node_uids) else 0
-        uid_key = str(uid)
-        if uid <= 0:
+        uid_key = topology_uid_key(uid)
+        if not uid_key:
             continue
         if uid_key not in uid_to_node_id:
             node_id = generated_jbeam_node_id(obj.get("beamng_part_name", ""), index, existing_ids)
@@ -2312,7 +2518,7 @@ def experimental_jbeam_node_info_for_selection(context, limit=6):
         infos.append(
             {
                 "node_id": node_id,
-                "topology_uid": int(node_uids[vertex_index]) if vertex_index < len(node_uids) else 0,
+                "topology_uid": topology_uid_key(node_uids[vertex_index]) if vertex_index < len(node_uids) else "",
                 "kind": kind,
                 "owner_part_id": owner_part_id,
                 "vertex_index": vertex_index,
@@ -2357,7 +2563,7 @@ def experimental_jbeam_edge_info_for_selection(context, limit=6):
         infos.append(
             {
                 "edge_index": edge_index,
-                "topology_uid": int(edge_uids[edge_index]) if edge_index < len(edge_uids) else 0,
+                "topology_uid": topology_uid_key(edge_uids[edge_index]) if edge_index < len(edge_uids) else "",
                 "id1": str(ids[0]),
                 "id2": str(ids[1]),
                 "semantic_type": semantic_by_key.get(edge_key(ids), JBEAM_EDGE_SEMANTIC_RELATIONSHIP),
@@ -2407,7 +2613,7 @@ def experimental_jbeam_face_info_for_selection(context, limit=6):
         infos.append(
             {
                 "face_index": face_index,
-                "topology_uid": int(face_uids[face_index]) if face_index < len(face_uids) else 0,
+                "topology_uid": topology_uid_key(face_uids[face_index]) if face_index < len(face_uids) else "",
                 "id1": str(ids[0]),
                 "id2": str(ids[1]),
                 "id3": str(ids[2]),
@@ -2537,13 +2743,13 @@ def face_identity_key(face):
 def topology_signature_for_snapshot(snapshot):
     return {
         "vertices": [
-            [int(item.get("uid", 0)), str(item.get("node_id", ""))]
+            [topology_uid_key(item.get("uid", "")), str(item.get("node_id", ""))]
             for item in snapshot.get("vertices", [])
         ],
         "edges": [
             [
-                int(item.get("uid", 0)),
-                [int(uid) for uid in item.get("vertex_uids", [])],
+                topology_uid_key(item.get("uid", "")),
+                [topology_uid_key(uid) for uid in item.get("vertex_uids", [])],
                 [str(node_id) for node_id in item.get("node_ids", [])],
                 str(item.get("semantic_type", "")),
             ]
@@ -2551,8 +2757,8 @@ def topology_signature_for_snapshot(snapshot):
         ],
         "faces": [
             [
-                int(item.get("uid", 0)),
-                [int(uid) for uid in item.get("vertex_uids", [])],
+                topology_uid_key(item.get("uid", "")),
+                [topology_uid_key(uid) for uid in item.get("vertex_uids", [])],
                 [str(node_id) for node_id in item.get("node_ids", [])],
                 str(item.get("semantic_type", "")),
                 [str(node_id) for node_id in item.get("winding", [])],
@@ -2569,18 +2775,15 @@ def semantic_topology_items_by_uid(snapshot, key):
     for item in snapshot.get(key, []):
         if not isinstance(item, dict):
             continue
-        try:
-            uid = int(item.get("uid", 0))
-        except (TypeError, ValueError):
-            uid = 0
-        if uid > 0:
-            result[str(uid)] = item
+        uid = topology_uid_key(item.get("uid", ""))
+        if uid:
+            result[uid] = item
     return result
 
 
 def semantic_topology_item_summary(item):
     return {
-        "uid": int(item.get("uid", 0) or 0),
+        "uid": topology_uid_key(item.get("uid", "")),
         "index": int(item.get("index", -1) or -1),
         "node_id": str(item.get("node_id", "")),
         "node_ids": list(item.get("node_ids", [])) if isinstance(item.get("node_ids", []), (list, tuple)) else [],
@@ -2620,11 +2823,11 @@ def semantic_topology_delta(previous_snapshot, current_snapshot):
     ):
         previous = semantic_topology_items_by_uid(previous_snapshot, section)
         current = semantic_topology_items_by_uid(current_snapshot, section)
-        for uid in sorted(set(current) - set(previous), key=lambda value: int(value)):
+        for uid in sorted(set(current) - set(previous), key=topology_uid_sort_key):
             delta[created_key].append(semantic_topology_item_summary(current[uid]))
-        for uid in sorted(set(previous) - set(current), key=lambda value: int(value)):
+        for uid in sorted(set(previous) - set(current), key=topology_uid_sort_key):
             delta[deleted_key].append(semantic_topology_item_summary(previous[uid]))
-        for uid in sorted(set(previous) & set(current), key=lambda value: int(value)):
+        for uid in sorted(set(previous) & set(current), key=topology_uid_sort_key):
             old = semantic_topology_item_summary(previous[uid])
             new = semantic_topology_item_summary(current[uid])
             changes = {}
@@ -2632,7 +2835,7 @@ def semantic_topology_delta(previous_snapshot, current_snapshot):
                 if old.get(field) != new.get(field):
                     changes[field] = {"old": old.get(field), "new": new.get(field)}
             if changes:
-                delta[changed_key].append({"uid": int(uid), "changes": changes, "current": new})
+                delta[changed_key].append({"uid": uid, "changes": changes, "current": new})
     delta["created_count"] = sum(len(delta[key]) for key in ("created_vertices", "created_edges", "created_faces"))
     delta["deleted_count"] = sum(len(delta[key]) for key in ("deleted_vertices", "deleted_edges", "deleted_faces"))
     delta["changed_count"] = sum(len(delta[key]) for key in ("changed_vertices", "changed_edges", "changed_faces"))
@@ -2713,12 +2916,13 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
 
     vertices = []
     for index, uid in enumerate(node_uids):
-        if int(uid) <= 0 or index >= len(node_ids):
+        uid_key = topology_uid_key(uid)
+        if not uid_key or index >= len(node_ids):
             continue
         kind = node_kinds[index] if index < len(node_kinds) else "owned"
         vertices.append(
             {
-                "uid": int(uid),
+                "uid": uid_key,
                 "index": index,
                 "node_id": node_ids[index],
                 "position": rounded_position_list(positions[index]) if index < len(positions) else [],
@@ -2735,12 +2939,11 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
             continue
         if not all(0 <= index < len(node_ids) and index < len(node_uids) for index in indices):
             continue
-        uid = int(edge_uids[edge_index])
-        if uid <= 0:
+        uid_key = topology_uid_key(edge_uids[edge_index])
+        if not uid_key:
             continue
         ids = [node_ids[indices[0]], node_ids[indices[1]]]
         key = edge_key(ids)
-        uid_key = str(uid)
         semantic_type = edge_type_map.get(uid_key)
         inferred_type = semantic_edge_type_for_key(key, original_beam_keys, explicit_beam_keys, triangle_boundary_keys)
         if semantic_type in {"", None, JBEAM_EDGE_SEMANTIC_RELATIONSHIP}:
@@ -2753,9 +2956,9 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
             edge_maps_changed = True
         edges.append(
             {
-                "uid": uid,
+                "uid": uid_key,
                 "index": edge_index,
-                "vertex_uids": [int(node_uids[indices[0]]), int(node_uids[indices[1]])],
+                "vertex_uids": [topology_uid_key(node_uids[indices[0]]), topology_uid_key(node_uids[indices[1]])],
                 "node_ids": ids,
                 "semantic_type": semantic_type,
                 "semantic_state": semantic_state,
@@ -2768,10 +2971,9 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
     for face_index, indices in raw_faces:
         if face_index >= len(face_uids):
             continue
-        uid = int(face_uids[face_index])
-        if uid <= 0:
+        uid_key = topology_uid_key(face_uids[face_index])
+        if not uid_key:
             continue
-        uid_key = str(uid)
         valid_triangle = len(indices) == 3 and all(0 <= index < len(node_ids) and index < len(node_uids) for index in indices)
         semantic_type = JBEAM_FACE_SEMANTIC_TRIANGLE if valid_triangle else JBEAM_FACE_SEMANTIC_INVALID
         semantic_state = "valid" if valid_triangle else "invalid"
@@ -2782,12 +2984,12 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
             face_state_map[uid_key] = semantic_state
             face_maps_changed = True
         if not valid_triangle:
-            warnings.append(f"Face UID {uid} has {len(indices)} vertices; BeamNG triangles require 3.")
+            warnings.append(f"Face UID {uid_key} has {len(indices)} vertices; BeamNG triangles require 3.")
         faces.append(
             {
-                "uid": uid,
+                "uid": uid_key,
                 "index": face_index,
-                "vertex_uids": [int(node_uids[index]) for index in indices if 0 <= index < len(node_uids)],
+                "vertex_uids": [topology_uid_key(node_uids[index]) for index in indices if 0 <= index < len(node_uids)],
                 "node_ids": [node_ids[index] for index in indices if 0 <= index < len(node_ids)],
                 "semantic_type": semantic_type,
                 "semantic_state": semantic_state,
@@ -2850,8 +3052,8 @@ def selected_experimental_edge_uid_and_keys(obj):
     for edge_index in selected_experimental_jbeam_edge_indices(obj):
         if edge_index < 0 or edge_index >= len(edge_uids):
             continue
-        uid = int(edge_uids[edge_index])
-        if uid <= 0:
+        uid = topology_uid_key(edge_uids[edge_index])
+        if not uid:
             continue
         ids = None
         if obj.mode == "EDIT":
@@ -3268,9 +3470,9 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
             for index, node_id in enumerate(node_ids)
         }
         current_node_uids = {
-            str(uid)
+            topology_uid_key(uid)
             for uid in ensure_experimental_topology_uids(obj, allow_write=True).get("nodes", [])
-            if int(uid) > 0
+            if topology_uid_key(uid)
         }
         uid_to_node_id = mesh_json_dict(mesh, "beamng_node_uid_to_id_json")
         uid_to_kind = mesh_json_dict(mesh, "beamng_node_uid_to_kind_json")
@@ -3305,7 +3507,7 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
                         "owner_resolved_part_id": uid_to_owner.get(uid, resolved_part_id),
                         "source_object": obj.name,
                         "vertex_index": -1,
-                        "topology_uid": int(uid) if str(uid).isdigit() else uid,
+                        "topology_uid": uid,
                     }
                 )
 
@@ -3717,9 +3919,10 @@ def accept_experimental_jbeam_node_moves(scene):
             while vertex_index >= len(committed_flags):
                 committed_flags.append(True)
             committed_flags[vertex_index] = True
-            if vertex_index < len(node_uids) and node_uids[vertex_index] > 0:
-                uid_to_baseline[str(node_uids[vertex_index])] = change.get("new", original_positions[vertex_index])
-                uid_to_committed[str(node_uids[vertex_index])] = True
+            uid_key = topology_uid_key(node_uids[vertex_index]) if vertex_index < len(node_uids) else ""
+            if uid_key:
+                uid_to_baseline[uid_key] = change.get("new", original_positions[vertex_index])
+                uid_to_committed[uid_key] = True
         if original_positions:
             mesh["beamng_original_node_positions_json"] = json.dumps(original_positions)
         if committed_flags:
@@ -3729,7 +3932,7 @@ def accept_experimental_jbeam_node_moves(scene):
         if node_params:
             mesh["beamng_node_committed_params_json"] = json.dumps(node_params)
             mesh["beamng_node_uid_to_committed_params_json"] = json.dumps(
-                {str(uid): params for uid, params in zip(node_uids, node_params) if uid > 0}
+                {topology_uid_key(uid): params for uid, params in zip(node_uids, node_params) if topology_uid_key(uid)}
             )
         current_edges, current_faces = read_experimental_mesh_topology(obj)
         if any(change.get("section") in {"beams", "triangles"} for change in object_changes):
@@ -3749,14 +3952,14 @@ def accept_experimental_jbeam_node_moves(scene):
             mesh["beamng_edge_committed_params_json"] = json.dumps(edge_params)
             edge_uids = ensure_experimental_topology_uids(obj, allow_write=True).get("edges", [])
             mesh["beamng_edge_uid_to_committed_params_json"] = json.dumps(
-                {str(uid): params for uid, params in zip(edge_uids, edge_params) if uid > 0}
+                {topology_uid_key(uid): params for uid, params in zip(edge_uids, edge_params) if topology_uid_key(uid)}
             )
         if any(change.get("section") == "triangles" for change in object_changes):
             mesh["beamng_face_node_ids_json"] = json.dumps([list(face) for face in current_faces])
             mesh["beamng_face_committed_params_json"] = json.dumps(face_params)
             face_uids = ensure_experimental_topology_uids(obj, allow_write=True).get("faces", [])
             mesh["beamng_face_uid_to_committed_params_json"] = json.dumps(
-                {str(uid): params for uid, params in zip(face_uids, face_params) if uid > 0}
+                {topology_uid_key(uid): params for uid, params in zip(face_uids, face_params) if topology_uid_key(uid)}
             )
         semantic_topology_snapshot_for_object(obj, scene, allow_write=True)
         mesh["beamng_node_move_changes_json"] = json.dumps([])
@@ -3864,9 +4067,9 @@ def commit_exported_jbeam_mesh_baselines(scene, exported_history):
         uid_to_committed = mesh_json_dict(mesh, "beamng_node_uid_to_committed_json")
         uid_to_committed_params = mesh_json_dict(mesh, "beamng_node_uid_to_committed_params_json")
         for index, uid in enumerate(node_uids):
-            if uid <= 0:
+            key = topology_uid_key(uid)
+            if not key:
                 continue
-            key = str(uid)
             if index < len(current_positions):
                 uid_to_baseline[key] = rounded_position_list(current_positions[index])
             uid_to_committed[key] = True
@@ -3879,10 +4082,10 @@ def commit_exported_jbeam_mesh_baselines(scene, exported_history):
         edge_uids = ensure_experimental_topology_uids(obj, allow_write=True).get("edges", [])
         face_uids = ensure_experimental_topology_uids(obj, allow_write=True).get("faces", [])
         mesh["beamng_edge_uid_to_committed_params_json"] = json.dumps(
-            {str(uid): params for uid, params in zip(edge_uids, edge_params) if uid > 0}
+            {topology_uid_key(uid): params for uid, params in zip(edge_uids, edge_params) if topology_uid_key(uid)}
         )
         mesh["beamng_face_uid_to_committed_params_json"] = json.dumps(
-            {str(uid): params for uid, params in zip(face_uids, face_params) if uid > 0}
+            {topology_uid_key(uid): params for uid, params in zip(face_uids, face_params) if topology_uid_key(uid)}
         )
         mesh["beamng_node_move_changes_json"] = json.dumps([])
         obj["beamng_dirty_node_move_count"] = 0
@@ -6557,7 +6760,7 @@ class BEAMNG_OT_repair_experimental_jbeam_topology_uids(Operator):
         semantic_snapshot = semantic_topology_snapshot_for_object(obj, context.scene, allow_write=True)
 
         def health(values):
-            nonzero = [uid for uid in values if int(uid) > 0]
+            nonzero = [topology_uid_key(uid) for uid in values if topology_uid_key(uid)]
             return len(nonzero), len(set(nonzero))
 
         node_count, node_unique = health(topology_uids.get("nodes", []))
@@ -7227,8 +7430,9 @@ class BEAMNG_OT_apply_selected_jbeam_node_properties(Operator):
             while index >= len(node_params):
                 node_params.append({})
             node_params[index] = dict(params)
-            if index < len(node_uids) and node_uids[index] > 0:
-                uid_to_params[str(node_uids[index])] = dict(params)
+            uid_key = topology_uid_key(node_uids[index]) if index < len(node_uids) else ""
+            if uid_key:
+                uid_to_params[uid_key] = dict(params)
         obj.data["beamng_node_params_json"] = json.dumps(node_params)
         obj.data["beamng_node_uid_to_params_json"] = json.dumps(uid_to_params)
         self.report({"INFO"}, f"Applied JBeam node properties to {len(selected_indices)} selected node(s)")
@@ -7292,8 +7496,9 @@ class BEAMNG_OT_apply_selected_jbeam_beam_properties(Operator):
             while index >= len(edge_params):
                 edge_params.append({})
             edge_params[index] = dict(params)
-            if index < len(edge_uids) and edge_uids[index] > 0:
-                uid_to_params[str(edge_uids[index])] = dict(params)
+            uid_key = topology_uid_key(edge_uids[index]) if index < len(edge_uids) else ""
+            if uid_key:
+                uid_to_params[uid_key] = dict(params)
         obj.data["beamng_edge_params_json"] = json.dumps(edge_params)
         obj.data["beamng_edge_uid_to_params_json"] = json.dumps(uid_to_params)
         self.report({"INFO"}, f"Applied beam properties to {len(selected_indices)} selected edge(s)")
@@ -7356,8 +7561,9 @@ class BEAMNG_OT_apply_selected_jbeam_triangle_properties(Operator):
             while index >= len(face_params):
                 face_params.append({})
             face_params[index] = dict(params)
-            if index < len(face_uids) and face_uids[index] > 0:
-                uid_to_params[str(face_uids[index])] = dict(params)
+            uid_key = topology_uid_key(face_uids[index]) if index < len(face_uids) else ""
+            if uid_key:
+                uid_to_params[uid_key] = dict(params)
         obj.data["beamng_face_params_json"] = json.dumps(face_params)
         obj.data["beamng_face_uid_to_params_json"] = json.dumps(uid_to_params)
         self.report({"INFO"}, f"Applied triangle properties to {len(selected_indices)} selected face(s)")
@@ -9416,6 +9622,11 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         ),
         default=True,
     )
+    show_proxy_node_overlay: BoolProperty(
+        name="Show Proxy Node Crosses",
+        description="Draw proxy/reference JBeam nodes as orange crosses in the 3D View",
+        default=True,
+    )
     jbeam_export_mod_name: StringProperty(
         name="JBeam Export Mod Folder",
         description="Folder under BeamNG user current/mods/unpacked used for staged JBeam overrides",
@@ -9430,6 +9641,7 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         layout.prop(self, "cache_asset_catalogs")
         layout.prop(self, "auto_sync_proxy_nodes")
         layout.prop(self, "auto_scan_jbeam_edits")
+        layout.prop(self, "show_proxy_node_overlay")
         layout.prop(self, "jbeam_export_mod_name")
 
 
@@ -10417,6 +10629,10 @@ def register():
         bpy.app.handlers.load_post.append(clear_jbeam_edit_sessions_on_load)
     if experimental_jbeam_mesh_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(experimental_jbeam_mesh_depsgraph_update_post)
+    mesh_topology_handlers = getattr(bpy.app.handlers, "mesh_topology_update_post", None)
+    if mesh_topology_handlers is not None and experimental_jbeam_mesh_topology_update_post not in mesh_topology_handlers:
+        mesh_topology_handlers.append(experimental_jbeam_mesh_topology_update_post)
+    register_experimental_jbeam_proxy_overlay()
     if not bpy.app.timers.is_registered(experimental_jbeam_panel_redraw_timer):
         bpy.app.timers.register(experimental_jbeam_panel_redraw_timer, first_interval=0.5, persistent=True)
 # Blender 4.2 restricts bpy.data during addon registration
@@ -10435,10 +10651,14 @@ def unregister():
         bpy.app.timers.unregister(experimental_jbeam_proxy_sync_timer)
     if bpy.app.timers.is_registered(experimental_jbeam_auto_scan_timer):
         bpy.app.timers.unregister(experimental_jbeam_auto_scan_timer)
+    unregister_experimental_jbeam_proxy_overlay()
     if clear_jbeam_edit_sessions_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(clear_jbeam_edit_sessions_on_load)
     if experimental_jbeam_mesh_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(experimental_jbeam_mesh_depsgraph_update_post)
+    mesh_topology_handlers = getattr(bpy.app.handlers, "mesh_topology_update_post", None)
+    if mesh_topology_handlers is not None and experimental_jbeam_mesh_topology_update_post in mesh_topology_handlers:
+        mesh_topology_handlers.remove(experimental_jbeam_mesh_topology_update_post)
     bpy.types.VIEW3D_MT_object_context_menu.remove(menu_func_jbeam_context)
     bpy.types.VIEW3D_MT_view.remove(menu_func_view_sync)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
