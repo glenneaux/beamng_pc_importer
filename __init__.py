@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 117
+ADDON_BUILD = 121
 
 
 def addon_version_label():
@@ -1548,26 +1548,134 @@ def read_experimental_mesh_vertices(obj):
 def proxy_node_world_positions_for_overlay(obj):
     mesh = obj.data
     positions = []
+    uid_to_kind = mesh_json_dict(mesh, "beamng_node_uid_to_kind_json")
+    legacy_kinds = [str(kind or "owned") for kind in mesh_json_list(mesh, "beamng_node_kinds_json")]
     if obj.mode == "EDIT":
         import bmesh
 
         edit_mesh = bmesh.from_edit_mesh(mesh)
         edit_mesh.verts.ensure_lookup_table()
         layer = edit_mesh.verts.layers.int.get(JBEAM_NODE_IS_PROXY_ATTR)
-        if layer is None:
-            return []
+        topology_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("nodes", []) if uid_to_kind else []
         for vertex in edit_mesh.verts:
-            if int(vertex[layer]) != 0:
+            is_proxy = False
+            if layer is not None and int(vertex[layer]) != 0:
+                is_proxy = True
+            elif vertex.index < len(topology_uids):
+                is_proxy = str(uid_to_kind.get(topology_uid_key(topology_uids[vertex.index]), "")) == "proxy"
+            elif vertex.index < len(legacy_kinds):
+                is_proxy = legacy_kinds[vertex.index] == "proxy"
+            if is_proxy:
                 positions.append(obj.matrix_world @ vertex.co)
         return positions
 
     attr = mesh.attributes.get(JBEAM_NODE_IS_PROXY_ATTR) if hasattr(mesh, "attributes") else None
+    topology_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("nodes", []) if uid_to_kind else []
     if attr is None:
-        return []
+        attr_data = []
+    else:
+        attr_data = attr.data
     for index, vertex in enumerate(mesh.vertices):
-        if index < len(attr.data) and int(attr.data[index].value) != 0:
+        is_proxy = False
+        if index < len(attr_data) and int(attr_data[index].value) != 0:
+            is_proxy = True
+        elif index < len(topology_uids):
+            is_proxy = str(uid_to_kind.get(topology_uid_key(topology_uids[index]), "")) == "proxy"
+        elif index < len(legacy_kinds):
+            is_proxy = legacy_kinds[index] == "proxy"
+        if is_proxy:
             positions.append(obj.matrix_world @ vertex.co)
     return positions
+
+
+def experimental_jbeam_topology_overlay_geometry(obj):
+    mesh = obj.data
+    identity = ensure_experimental_mesh_identity(obj, bpy.context.scene, allow_write=False)
+    node_ids = [str(node_id) for node_id in identity.get("node_ids", [])]
+    node_kinds = [str(kind or "owned") for kind in identity.get("node_kinds", [])]
+    semantic_snapshot = semantic_topology_snapshot_for_object(obj, bpy.context.scene, allow_write=False)
+    semantic_by_key = semantic_edge_types_by_key(semantic_snapshot)
+    owned_points = []
+    proxy_points = []
+    beam_lines = []
+    boundary_lines = []
+    relation_lines = []
+
+    if obj.mode == "EDIT":
+        import bmesh
+
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.verts.index_update()
+        edit_mesh.edges.ensure_lookup_table()
+        edit_mesh.edges.index_update()
+        world_positions = [obj.matrix_world @ vertex.co for vertex in edit_mesh.verts]
+        raw_edges = [(edge.index, [vertex.index for vertex in edge.verts]) for edge in edit_mesh.edges]
+    else:
+        world_positions = [obj.matrix_world @ vertex.co for vertex in mesh.vertices]
+        raw_edges = [(edge.index, list(edge.vertices)) for edge in mesh.edges]
+
+    for index, position in enumerate(world_positions):
+        if index < len(node_kinds) and node_kinds[index] == "proxy":
+            proxy_points.append(position)
+        else:
+            owned_points.append(position)
+
+    for _edge_index, indices in raw_edges:
+        if len(indices) != 2 or not all(0 <= index < len(world_positions) for index in indices):
+            continue
+        if not all(index < len(node_ids) for index in indices):
+            relation_lines.extend([world_positions[indices[0]], world_positions[indices[1]]])
+            continue
+        semantic_type = semantic_by_key.get(edge_key((node_ids[indices[0]], node_ids[indices[1]])), JBEAM_EDGE_SEMANTIC_RELATIONSHIP)
+        target = (
+            beam_lines
+            if semantic_type == JBEAM_EDGE_SEMANTIC_BEAM
+            else boundary_lines
+            if semantic_type == JBEAM_EDGE_SEMANTIC_TRIANGLE_BOUNDARY
+            else relation_lines
+        )
+        target.extend([world_positions[indices[0]], world_positions[indices[1]]])
+
+    return {
+        "owned_points": owned_points,
+        "proxy_points": proxy_points,
+        "beam_lines": beam_lines,
+        "boundary_lines": boundary_lines,
+        "relation_lines": relation_lines,
+    }
+
+
+def draw_gpu_lines(shader, line_positions, color):
+    if not line_positions:
+        return
+    from gpu_extras.batch import batch_for_shader
+
+    batch = batch_for_shader(shader, "LINES", {"pos": line_positions})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def draw_gpu_points(shader, point_positions, color, size=6.0):
+    if not point_positions:
+        return
+    import gpu
+    from gpu_extras.batch import batch_for_shader
+
+    previous_size = 1.0
+    try:
+        gpu.state.point_size_set(size)
+    except Exception:
+        pass
+    batch = batch_for_shader(shader, "POINTS", {"pos": point_positions})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+    try:
+        gpu.state.point_size_set(previous_size)
+    except Exception:
+        pass
 
 
 def draw_experimental_jbeam_proxy_node_overlay():
@@ -1577,7 +1685,28 @@ def draw_experimental_jbeam_proxy_node_overlay():
     if scene is None or region_data is None:
         return
     prefs = get_addon_preferences(context)
-    if prefs is not None and not bool(getattr(prefs, "show_proxy_node_overlay", True)):
+    show_proxy_overlay = prefs is None or bool(getattr(prefs, "show_proxy_node_overlay", True))
+    # Native patched Blender renders semantic colors from compact mesh attributes.
+    show_topology_overlay = False
+    if not show_proxy_overlay and not show_topology_overlay:
+        return
+
+    if show_topology_overlay:
+        try:
+            import gpu
+
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+                geometry = experimental_jbeam_topology_overlay_geometry(obj)
+                draw_gpu_lines(shader, geometry["relation_lines"], (0.55, 0.55, 0.55, 0.85))
+                draw_gpu_lines(shader, geometry["boundary_lines"], (1.0, 0.82, 0.12, 0.95))
+                draw_gpu_lines(shader, geometry["beam_lines"], (0.1, 0.95, 0.32, 1.0))
+                draw_gpu_points(shader, geometry["owned_points"], (0.15, 0.55, 1.0, 1.0), 5.5)
+                draw_gpu_points(shader, geometry["proxy_points"], (1.0, 0.62, 0.05, 1.0), 7.0)
+        except Exception:
+            pass
+
+    if not show_proxy_overlay:
         return
 
     line_positions = []
@@ -1859,8 +1988,8 @@ def add_proxy_nodes_to_experimental_mesh(context, target_obj, sources):
 
     mesh = target_obj.data
     was_edit = target_obj.mode == "EDIT"
-    old_vertex_count = len(identity.get("node_ids", []))
     local_positions = [target_obj.matrix_world.inverted() @ source["world_position"] for source in sources_to_add]
+    added_indices = []
     if was_edit:
         edit_mesh = bmesh.from_edit_mesh(mesh)
         edit_mesh.verts.ensure_lookup_table()
@@ -1869,6 +1998,10 @@ def add_proxy_nodes_to_experimental_mesh(context, target_obj, sources):
         for local_position in local_positions:
             vertex = edit_mesh.verts.new(local_position)
             vertex.select = True
+            added_indices.append(vertex)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.verts.index_update()
+        added_indices = [vertex.index for vertex in added_indices]
         bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
     else:
         edit_mesh = bmesh.new()
@@ -1879,6 +2012,10 @@ def add_proxy_nodes_to_experimental_mesh(context, target_obj, sources):
         for local_position in local_positions:
             vertex = edit_mesh.verts.new(local_position)
             vertex.select = True
+            added_indices.append(vertex)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.verts.index_update()
+        added_indices = [vertex.index for vertex in added_indices]
         edit_mesh.to_mesh(mesh)
         edit_mesh.free()
         mesh.update()
@@ -1893,8 +2030,7 @@ def add_proxy_nodes_to_experimental_mesh(context, target_obj, sources):
     uid_to_committed = mesh_json_dict(mesh, "beamng_node_uid_to_committed_json")
     uid_to_params = mesh_json_dict(mesh, "beamng_node_uid_to_params_json")
     uid_to_committed_params = mesh_json_dict(mesh, "beamng_node_uid_to_committed_params_json")
-    for offset, source in enumerate(sources_to_add):
-        index = old_vertex_count + offset
+    for offset, (index, source) in enumerate(zip(added_indices, sources_to_add)):
         uid_key = topology_uid_key(node_uids[index]) if index < len(node_uids) else ""
         if not uid_key:
             continue
@@ -1941,11 +2077,22 @@ JBEAM_EDGE_UID_ATTR = "beamng_edge_uid"
 JBEAM_FACE_UID_ATTR = "beamng_face_uid"
 JBEAM_NODE_OWNER_PART_ATTR = "beamng_node_owner_part_id"
 JBEAM_NODE_IS_PROXY_ATTR = "beamng_node_is_proxy"
+JBEAM_EDGE_SEMANTIC_ATTR = "beamng_edge_semantic_type"
+JBEAM_FACE_SEMANTIC_ATTR = "beamng_face_semantic_type"
 JBEAM_EDGE_SEMANTIC_BEAM = "beam"
 JBEAM_EDGE_SEMANTIC_TRIANGLE_BOUNDARY = "triangle_boundary"
 JBEAM_EDGE_SEMANTIC_RELATIONSHIP = "relationship"
 JBEAM_FACE_SEMANTIC_TRIANGLE = "triangle"
 JBEAM_FACE_SEMANTIC_INVALID = "invalid_face"
+JBEAM_EDGE_SEMANTIC_CODES = {
+    JBEAM_EDGE_SEMANTIC_BEAM: 1,
+    JBEAM_EDGE_SEMANTIC_TRIANGLE_BOUNDARY: 2,
+    JBEAM_EDGE_SEMANTIC_RELATIONSHIP: 3,
+}
+JBEAM_FACE_SEMANTIC_CODES = {
+    JBEAM_FACE_SEMANTIC_TRIANGLE: 1,
+    JBEAM_FACE_SEMANTIC_INVALID: 2,
+}
 _jbeam_proxy_overlay_draw_handle = None
 
 
@@ -2067,21 +2214,30 @@ def set_object_mode_int_attribute_values(mesh, attr_name, domain, values):
 
 
 def set_point_int_attribute_values(obj, attr_name, values):
+    set_element_int_attribute_values(obj, attr_name, "POINT", values)
+
+
+def set_element_int_attribute_values(obj, attr_name, domain, values):
     mesh = obj.data
     if obj.mode == "EDIT":
         import bmesh
 
         edit_mesh = bmesh.from_edit_mesh(mesh)
-        edit_mesh.verts.ensure_lookup_table()
-        layer = edit_mesh.verts.layers.int.get(attr_name)
+        collection = {
+            "POINT": edit_mesh.verts,
+            "EDGE": edit_mesh.edges,
+            "FACE": edit_mesh.faces,
+        }.get(domain, edit_mesh.verts)
+        collection.ensure_lookup_table()
+        layer = collection.layers.int.get(attr_name)
         if layer is None:
-            layer = edit_mesh.verts.layers.int.new(attr_name)
+            layer = collection.layers.int.new(attr_name)
         for index, value in enumerate(values):
-            if index < len(edit_mesh.verts):
-                edit_mesh.verts[index][layer] = int(value)
+            if index < len(collection):
+                collection[index][layer] = int(value)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         return
-    set_object_mode_int_attribute_values(mesh, attr_name, "POINT", values)
+    set_object_mode_int_attribute_values(mesh, attr_name, domain, values)
 
 
 def ensure_experimental_topology_uids(obj, allow_write=True):
@@ -2911,6 +3067,8 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
     face_type_map = mesh_json_dict(mesh, "beamng_face_uid_to_semantic_type_json")
     edge_state_map = mesh_json_dict(mesh, "beamng_edge_uid_to_semantic_state_json")
     face_state_map = mesh_json_dict(mesh, "beamng_face_uid_to_semantic_state_json")
+    edge_semantic_codes = [JBEAM_EDGE_SEMANTIC_CODES[JBEAM_EDGE_SEMANTIC_RELATIONSHIP] for _edge in raw_edges]
+    face_semantic_codes = [JBEAM_FACE_SEMANTIC_CODES[JBEAM_FACE_SEMANTIC_INVALID] for _face in raw_faces]
     edge_maps_changed = False
     face_maps_changed = False
 
@@ -2954,6 +3112,10 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
         if uid_key not in edge_state_map:
             edge_state_map[uid_key] = semantic_state
             edge_maps_changed = True
+        if 0 <= edge_index < len(edge_semantic_codes):
+            edge_semantic_codes[edge_index] = JBEAM_EDGE_SEMANTIC_CODES.get(
+                semantic_type, JBEAM_EDGE_SEMANTIC_CODES[JBEAM_EDGE_SEMANTIC_RELATIONSHIP]
+            )
         edges.append(
             {
                 "uid": uid_key,
@@ -2985,6 +3147,10 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
             face_maps_changed = True
         if not valid_triangle:
             warnings.append(f"Face UID {uid_key} has {len(indices)} vertices; BeamNG triangles require 3.")
+        if 0 <= face_index < len(face_semantic_codes):
+            face_semantic_codes[face_index] = JBEAM_FACE_SEMANTIC_CODES.get(
+                semantic_type, JBEAM_FACE_SEMANTIC_CODES[JBEAM_FACE_SEMANTIC_INVALID]
+            )
         faces.append(
             {
                 "uid": uid_key,
@@ -3026,6 +3192,8 @@ def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
         if face_maps_changed:
             mesh["beamng_face_uid_to_semantic_type_json"] = json.dumps(face_type_map)
             mesh["beamng_face_uid_to_semantic_state_json"] = json.dumps(face_state_map)
+        set_element_int_attribute_values(obj, JBEAM_EDGE_SEMANTIC_ATTR, "EDGE", edge_semantic_codes)
+        set_element_int_attribute_values(obj, JBEAM_FACE_SEMANTIC_ATTR, "FACE", face_semantic_codes)
         mesh["beamng_previous_semantic_topology_json"] = json.dumps(previous_snapshot if isinstance(previous_snapshot, dict) else {})
         mesh["beamng_semantic_topology_delta_json"] = json.dumps(delta)
         mesh["beamng_semantic_topology_delta_count"] = int(delta.get("change_count", 0))
@@ -9120,6 +9288,100 @@ def draw_jbeam_selected_elements(layout, context):
         row.operator(BEAMNG_OT_apply_selected_jbeam_triangle_properties.bl_idname, text="Apply")
 
 
+def guid_display_text(uid, limit=36):
+    value = topology_uid_key(uid)
+    if not value:
+        return "(none)"
+    return value if len(value) <= limit else f"{value[:limit - 3]}..."
+
+
+def draw_guid_map_inspector(layout, context):
+    active_mesh = active_experimental_jbeam_mesh(context)
+    box = layout.box()
+    box.label(text="GUID Map Inspector")
+    if active_mesh is None or active_mesh.type != "MESH" or active_mesh.get("beamng_visual_type") != "experimental_jbeam_mesh":
+        box.label(text="Activate an experimental JBeam mesh.")
+        return
+
+    mesh = active_mesh.data
+    identity = ensure_experimental_mesh_identity(active_mesh, context.scene, allow_write=False)
+    topology_uids = ensure_experimental_topology_uids(active_mesh, allow_write=False)
+    node_uids = topology_uids.get("nodes", [])
+    edge_uids = topology_uids.get("edges", [])
+    face_uids = topology_uids.get("faces", [])
+    node_id_map = mesh_json_dict(mesh, "beamng_node_uid_to_id_json")
+    node_kind_map = mesh_json_dict(mesh, "beamng_node_uid_to_kind_json")
+    node_owner_map = mesh_json_dict(mesh, "beamng_node_uid_to_owner_part_id_json")
+    edge_type_map = mesh_json_dict(mesh, "beamng_edge_uid_to_semantic_type_json")
+    edge_state_map = mesh_json_dict(mesh, "beamng_edge_uid_to_semantic_state_json")
+    face_type_map = mesh_json_dict(mesh, "beamng_face_uid_to_semantic_type_json")
+    face_state_map = mesh_json_dict(mesh, "beamng_face_uid_to_semantic_state_json")
+
+    summary = box.box()
+    summary.label(text=f"Object: {active_mesh.name}")
+    summary.label(text=f"Part: {active_mesh.get('beamng_part_name', '')}")
+    node_guid_count = len([uid for uid in node_uids if topology_uid_key(uid)])
+    edge_guid_count = len([uid for uid in edge_uids if topology_uid_key(uid)])
+    face_guid_count = len([uid for uid in face_uids if topology_uid_key(uid)])
+    summary.label(text=f"Node GUIDs/maps: {node_guid_count}/{len(node_id_map)}")
+    summary.label(text=f"Edge GUIDs/maps: {edge_guid_count}/{len(edge_type_map)}")
+    summary.label(text=f"Face GUIDs/maps: {face_guid_count}/{len(face_type_map)}")
+    if node_guid_count == 0 or edge_guid_count == 0 and len(mesh.edges) > 0 or face_guid_count == 0 and len(mesh.polygons) > 0:
+        warn = summary.row()
+        warn.alert = True
+        warn.label(text="Missing GUID attrs: use Repair UIDs / reload patched Blender.", icon="ERROR")
+
+    selected_nodes = experimental_jbeam_node_info_for_selection(context)
+    selected_edges = experimental_jbeam_edge_info_for_selection(context)
+    selected_faces = experimental_jbeam_face_info_for_selection(context)
+    if not selected_nodes and not selected_edges and not selected_faces:
+        box.label(text="Select a vertex, edge, or face to inspect mapping.")
+        return
+
+    if selected_nodes:
+        node_box = box.box()
+        node_box.label(text="Selected Vertex GUID Aliases")
+        for info in selected_nodes:
+            uid = topology_uid_key(info.get("topology_uid", ""))
+            vertex_index = int(info.get("vertex_index", -1))
+            node_ids = identity.get("node_ids", [])
+            node_kinds = identity.get("node_kinds", [])
+            owner_part_ids = identity.get("owner_part_ids", [])
+            node_box.label(text=f"GUID: {guid_display_text(uid)}")
+            node_alias = node_id_map.get(uid) or (node_ids[vertex_index] if 0 <= vertex_index < len(node_ids) else info.get("node_id", ""))
+            node_kind = node_kind_map.get(uid) or (node_kinds[vertex_index] if 0 <= vertex_index < len(node_kinds) else info.get("kind", ""))
+            node_owner = node_owner_map.get(uid) if uid in node_owner_map else (owner_part_ids[vertex_index] if 0 <= vertex_index < len(owner_part_ids) else info.get("owner_part_id", -1))
+            node_box.label(text=f"Node alias: {node_alias}")
+            node_box.label(text=f"Kind/owner: {node_kind} / {node_owner}")
+            params = info.get("params", {})
+            if params:
+                draw_param_summary(node_box, params, "no params")
+
+    if selected_edges:
+        edge_box = box.box()
+        edge_box.label(text="Selected Edge GUID Aliases")
+        for info in selected_edges:
+            uid = topology_uid_key(info.get("topology_uid", ""))
+            edge_box.label(text=f"GUID: {guid_display_text(uid)}")
+            edge_box.label(text=f"Nodes: {info.get('id1', '')} -> {info.get('id2', '')}")
+            edge_box.label(text=f"Semantic: {edge_type_map.get(uid, info.get('semantic_type', ''))} ({edge_state_map.get(uid, '')})")
+            params = info.get("params", {})
+            if params:
+                draw_param_summary(edge_box, params, "no params")
+
+    if selected_faces:
+        face_box = box.box()
+        face_box.label(text="Selected Face GUID Aliases")
+        for info in selected_faces:
+            uid = topology_uid_key(info.get("topology_uid", ""))
+            face_box.label(text=f"GUID: {guid_display_text(uid)}")
+            face_box.label(text=f"Winding: {info.get('id1', '')} -> {info.get('id2', '')} -> {info.get('id3', '')}")
+            face_box.label(text=f"Semantic: {face_type_map.get(uid, info.get('semantic_type', ''))} ({face_state_map.get(uid, info.get('semantic_state', ''))})")
+            params = info.get("params", {})
+            if params:
+                draw_param_summary(face_box, params, "no params")
+
+
 def draw_selected_jbeam_legacy_info(layout, context):
     active = selected_active_object(context)
     if not active or active.get("beamng_layer") != "jbeam":
@@ -9176,6 +9438,7 @@ class VIEW3D_PT_beamng_jbeam_edit(Panel):
         draw_jbeam_edit_status(layout, context)
         draw_jbeam_topology_tools(layout, context, active_mesh)
         draw_jbeam_selected_elements(layout, context)
+        draw_guid_map_inspector(layout, context)
 
 
 class VIEW3D_PT_beamng_jbeam_health(Panel):
@@ -9627,6 +9890,11 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         description="Draw proxy/reference JBeam nodes as orange crosses in the 3D View",
         default=True,
     )
+    show_jbeam_semantic_overlay: BoolProperty(
+        name="Show JBeam Semantic Colors",
+        description="Draw colored overlay points/edges for owned nodes, proxy nodes, beams, triangle boundaries, and relationship edges",
+        default=True,
+    )
     jbeam_export_mod_name: StringProperty(
         name="JBeam Export Mod Folder",
         description="Folder under BeamNG user current/mods/unpacked used for staged JBeam overrides",
@@ -9642,6 +9910,7 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         layout.prop(self, "auto_sync_proxy_nodes")
         layout.prop(self, "auto_scan_jbeam_edits")
         layout.prop(self, "show_proxy_node_overlay")
+        layout.prop(self, "show_jbeam_semantic_overlay")
         layout.prop(self, "jbeam_export_mod_name")
 
 
