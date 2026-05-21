@@ -859,6 +859,205 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
     return created
 
 
+def create_imported_jbeam_topology_meshes(imported_jbeam, parent_collection):
+    """Materialize the first topology-subset import as editable Blender meshes."""
+    mesh_collection = link_collection(parent_collection, "Imported JBeam Topology")
+    mesh_collection["beamng_layer"] = "jbeam_mesh"
+    mesh_collection["beamng_visual_type"] = "imported_jbeam_topology_meshes"
+    mesh_collection["beamng_source_path"] = imported_jbeam.source_path
+    mesh_collection["beamng_source_sha256"] = imported_jbeam.cached_source.get("sha256", "")
+
+    created = 0
+    for part_index, part in enumerate(imported_jbeam.parts):
+        if not part.nodes:
+            continue
+        color = color_for_resolved_part(part_index)
+        obj = create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_index, color)
+        if obj is not None:
+            created += 1
+    return created
+
+
+def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_index, color):
+    vertex_positions = [rounded_position_tuple(node.position) for node in part.nodes]
+    vertex_node_ids = [node.node_id for node in part.nodes]
+    vertex_index_by_node_id = {node_id: index for index, node_id in enumerate(vertex_node_ids)}
+
+    beam_edges = []
+    beam_edge_keys = {}
+    beam_options_by_key = {}
+    for beam in part.beams:
+        if beam.missing_nodes:
+            continue
+        if beam.id1 not in vertex_index_by_node_id or beam.id2 not in vertex_index_by_node_id:
+            continue
+        edge = (vertex_index_by_node_id[beam.id1], vertex_index_by_node_id[beam.id2])
+        if edge[0] == edge[1]:
+            continue
+        edge_key = tuple(sorted(edge))
+        if edge_key in beam_edge_keys:
+            continue
+        beam_edges.append(edge)
+        beam_edge_keys[edge_key] = beam
+        beam_options_by_key[edge_key] = dict(beam.options or {})
+
+    faces = []
+    face_records = []
+    for triangle in part.triangles:
+        if triangle.missing_nodes:
+            continue
+        if any(node_id not in vertex_index_by_node_id for node_id in (triangle.id1, triangle.id2, triangle.id3)):
+            continue
+        face = (
+            vertex_index_by_node_id[triangle.id1],
+            vertex_index_by_node_id[triangle.id2],
+            vertex_index_by_node_id[triangle.id3],
+        )
+        if len(set(face)) < 3:
+            continue
+        faces.append(face)
+        face_records.append(triangle)
+
+    mesh = bpy.data.meshes.new(f"Imported_JBeam_Topology_{safe_collection_name(part.part_name)}")
+    mesh.from_pydata(vertex_positions, beam_edges, faces)
+    mesh.update()
+
+    node_uids = list(range(1, len(vertex_node_ids) + 1))
+    edge_uids = list(range(len(node_uids) + 1, len(node_uids) + len(mesh.edges) + 1))
+    face_uids = list(
+        range(
+            len(node_uids) + len(edge_uids) + 1,
+            len(node_uids) + len(edge_uids) + len(mesh.polygons) + 1,
+        )
+    )
+    mesh["beamng_next_topology_uid"] = len(node_uids) + len(edge_uids) + len(face_uids) + 1
+
+    node_uid_to_id = {str(uid): node.node_id for uid, node in zip(node_uids, part.nodes)}
+    node_uid_to_guid = {str(uid): node.topology_guid for uid, node in zip(node_uids, part.nodes)}
+    node_uid_to_params = {str(uid): dict(node.options or {}) for uid, node in zip(node_uids, part.nodes)}
+    edge_uid_to_type = {}
+    edge_uid_to_state = {}
+    edge_uid_to_params = {}
+    edge_uid_to_guid = {}
+    non_exportable_topology_uids = []
+    edge_node_ids = []
+    for edge, uid in zip(mesh.edges, edge_uids):
+        indices = tuple(edge.vertices)
+        edge_key = tuple(sorted(indices))
+        node_pair = [vertex_node_ids[index] for index in indices]
+        edge_node_ids.append(node_pair)
+        beam = beam_edge_keys.get(edge_key)
+        if beam is not None:
+            edge_uid_to_type[str(uid)] = "beam"
+            edge_uid_to_params[str(uid)] = beam_options_by_key.get(edge_key, {})
+            edge_uid_to_guid[str(uid)] = beam.topology_guid
+        else:
+            edge_uid_to_type[str(uid)] = "triangle_boundary"
+            edge_uid_to_params[str(uid)] = {}
+            non_exportable_topology_uids.append(uid)
+        edge_uid_to_state[str(uid)] = "valid"
+
+    face_uid_to_type = {str(uid): "triangle" for uid in face_uids}
+    face_uid_to_state = {str(uid): "valid" for uid in face_uids}
+    face_uid_to_params = {str(uid): dict(triangle.options or {}) for uid, triangle in zip(face_uids, face_records)}
+    face_uid_to_guid = {str(uid): triangle.topology_guid for uid, triangle in zip(face_uids, face_records)}
+    face_node_ids = [[triangle.id1, triangle.id2, triangle.id3] for triangle in face_records]
+
+    mesh["beamng_node_ids_json"] = json.dumps(vertex_node_ids)
+    mesh["beamng_node_kinds_json"] = json.dumps(["owned" for _node in part.nodes])
+    mesh["beamng_node_owner_part_ids_json"] = json.dumps([part_index for _node in part.nodes])
+    mesh["beamng_original_node_positions_json"] = json.dumps(vertex_positions)
+    mesh["beamng_node_generated_flags_json"] = json.dumps([False for _node in part.nodes])
+    mesh["beamng_node_committed_flags_json"] = json.dumps([True for _node in part.nodes])
+    mesh["beamng_node_params_json"] = json.dumps([dict(node.options or {}) for node in part.nodes])
+    mesh["beamng_node_committed_params_json"] = json.dumps([dict(node.options or {}) for node in part.nodes])
+    mesh["beamng_mesh_edge_node_ids_json"] = json.dumps(edge_node_ids)
+    mesh["beamng_edge_node_ids_json"] = json.dumps([[beam.id1, beam.id2] for beam in part.beams if not beam.missing_nodes])
+    mesh["beamng_edge_params_json"] = json.dumps([dict(beam.options or {}) for beam in part.beams if not beam.missing_nodes])
+    mesh["beamng_face_node_ids_json"] = json.dumps(face_node_ids)
+    mesh["beamng_face_params_json"] = json.dumps([dict(triangle.options or {}) for triangle in face_records])
+    mesh["beamng_face_committed_params_json"] = mesh["beamng_face_params_json"]
+    mesh["beamng_node_uid_to_id_json"] = json.dumps(node_uid_to_id)
+    mesh["beamng_node_uid_to_kind_json"] = json.dumps({str(uid): "owned" for uid in node_uids})
+    mesh["beamng_node_uid_to_owner_part_id_json"] = json.dumps({str(uid): part_index for uid in node_uids})
+    mesh["beamng_node_uid_to_original_position_json"] = json.dumps({str(uid): pos for uid, pos in zip(node_uids, vertex_positions)})
+    mesh["beamng_node_uid_to_generated_json"] = json.dumps({str(uid): False for uid in node_uids})
+    mesh["beamng_node_uid_to_committed_json"] = json.dumps({str(uid): True for uid in node_uids})
+    mesh["beamng_node_uid_to_params_json"] = json.dumps(node_uid_to_params)
+    mesh["beamng_node_uid_to_committed_params_json"] = json.dumps(node_uid_to_params)
+    mesh["beamng_node_uid_to_topology_guid_json"] = json.dumps(node_uid_to_guid)
+    mesh["beamng_edge_uid_to_params_json"] = json.dumps(edge_uid_to_params)
+    mesh["beamng_edge_uid_to_committed_params_json"] = json.dumps(edge_uid_to_params)
+    mesh["beamng_edge_uid_to_semantic_type_json"] = json.dumps(edge_uid_to_type)
+    mesh["beamng_edge_uid_to_semantic_state_json"] = json.dumps(edge_uid_to_state)
+    mesh["beamng_edge_uid_to_topology_guid_json"] = json.dumps(edge_uid_to_guid)
+    mesh["beamng_face_uid_to_params_json"] = json.dumps(face_uid_to_params)
+    mesh["beamng_face_uid_to_committed_params_json"] = json.dumps(face_uid_to_params)
+    mesh["beamng_face_uid_to_semantic_type_json"] = json.dumps(face_uid_to_type)
+    mesh["beamng_face_uid_to_semantic_state_json"] = json.dumps(face_uid_to_state)
+    mesh["beamng_face_uid_to_topology_guid_json"] = json.dumps(face_uid_to_guid)
+    mesh["beamng_helper_topology_uids_json"] = json.dumps([])
+    mesh["beamng_non_exportable_topology_uids_json"] = json.dumps(non_exportable_topology_uids)
+    mesh["beamng_import_identity_map_json"] = json.dumps(imported_jbeam.import_identity_map)
+    mesh["beamng_source_map_json"] = json.dumps(imported_jbeam.source_map)
+    mesh["beamng_source_sha256"] = imported_jbeam.cached_source.get("sha256", "")
+    mesh["beamng_topology_revision"] = 0
+    mesh["beamng_topology_signature_json"] = json.dumps({})
+    mesh["beamng_semantic_topology_json"] = json.dumps({})
+    mesh["beamng_previous_semantic_topology_json"] = json.dumps({})
+    mesh["beamng_semantic_topology_delta_json"] = json.dumps({})
+    mesh["beamng_semantic_topology_delta_count"] = 0
+
+    if hasattr(mesh, "attributes"):
+        _write_imported_jbeam_mesh_attributes(mesh, node_uids, edge_uids, face_uids, part_index)
+
+    obj = bpy.data.objects.new(f"Imported JBeam {part.part_name}", mesh)
+    obj["beamng_layer"] = "jbeam_mesh"
+    obj["beamng_visual_type"] = "experimental_jbeam_mesh"
+    obj["beamng_imported_topology_subset"] = True
+    obj["beamng_part_name"] = part.part_name
+    obj["beamng_part_guid"] = part.part_guid
+    obj["beamng_resolved_part_id"] = part_index
+    obj["beamng_jbeam_path"] = part.source_path
+    obj["beamng_owned_node_count"] = len(part.nodes)
+    obj["beamng_proxy_node_count"] = 0
+    obj["beamng_beam_edge_count"] = len([beam for beam in part.beams if not beam.missing_nodes])
+    obj["beamng_triangle_face_count"] = len(face_records)
+    obj["beamng_object_transform_locked"] = True
+    obj.display_type = "TEXTURED"
+    obj.show_wire = True
+    obj.color = color
+    mesh.materials.append(get_or_create_jbeam_mesh_material(f"Imported JBeam Mesh Part {part_index:03d}", color))
+    mesh.materials.append(
+        get_or_create_jbeam_edge_material(f"Imported JBeam Mesh Part {part_index:03d} Edges", color)
+    )
+    mesh_collection.objects.link(obj)
+    owned_group = obj.vertex_groups.new(name="Owned Nodes")
+    owned_group.add(list(range(len(part.nodes))), 1.0, "ADD")
+    return obj
+
+
+def _write_imported_jbeam_mesh_attributes(mesh, node_uids, edge_uids, face_uids, part_index):
+    node_uid_attr = mesh.attributes.new("beamng_node_uid", "INT", "POINT")
+    edge_uid_attr = mesh.attributes.new("beamng_edge_uid", "INT", "EDGE")
+    face_uid_attr = mesh.attributes.new("beamng_face_uid", "INT", "FACE")
+    owner_attr = mesh.attributes.new("beamng_owner_part_id", "INT", "POINT")
+    proxy_attr = mesh.attributes.new("beamng_is_proxy_node", "BOOLEAN", "POINT")
+    for index, uid in enumerate(node_uids):
+        if index < len(node_uid_attr.data):
+            node_uid_attr.data[index].value = uid
+        if index < len(owner_attr.data):
+            owner_attr.data[index].value = part_index
+        if index < len(proxy_attr.data):
+            proxy_attr.data[index].value = False
+    for index, uid in enumerate(edge_uids):
+        if index < len(edge_uid_attr.data):
+            edge_uid_attr.data[index].value = uid
+    for index, uid in enumerate(face_uids):
+        if index < len(face_uid_attr.data):
+            face_uid_attr.data[index].value = uid
+
+
 def tag_mesh_data(mesh_data, part_name: str, jbeam_path: Path, vehicle_model: str, editing_enabled: bool):
     for legacy_key in ("mesh_editing_enabled", "vehicle_model", "jbeam_part", "jbeam_file_path"):
         if legacy_key in mesh_data:
