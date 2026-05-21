@@ -53,6 +53,63 @@ class PartDefinition:
 
 
 @dataclass
+class JBeamImportDiagnostic:
+    level: str
+    code: str
+    message: str
+    part_name: str = ""
+    section: str = ""
+
+
+@dataclass
+class ImportedJBeamNode:
+    node_id: str
+    position: tuple
+    options: dict = field(default_factory=dict)
+    row_index: int = -1
+
+
+@dataclass
+class ImportedJBeamBeam:
+    id1: str
+    id2: str
+    options: dict = field(default_factory=dict)
+    row_index: int = -1
+    missing_nodes: tuple = field(default_factory=tuple)
+
+
+@dataclass
+class ImportedJBeamTriangle:
+    id1: str
+    id2: str
+    id3: str
+    options: dict = field(default_factory=dict)
+    row_index: int = -1
+    missing_nodes: tuple = field(default_factory=tuple)
+
+
+@dataclass
+class ImportedJBeamPart:
+    part_name: str
+    source_path: str = ""
+    information: dict = field(default_factory=dict)
+    slot_type: object = ""
+    slots: list = field(default_factory=list)
+    nodes: list = field(default_factory=list)
+    beams: list = field(default_factory=list)
+    triangles: list = field(default_factory=list)
+    unknown_preserved_sections: dict = field(default_factory=dict)
+    diagnostics: list = field(default_factory=list)
+
+
+@dataclass
+class JBeamTopologySubsetImport:
+    source_path: str = ""
+    parts: list = field(default_factory=list)
+    diagnostics: list = field(default_factory=list)
+
+
+@dataclass
 class ResolvedPart:
     id: int
     part_def: PartDefinition
@@ -1134,6 +1191,318 @@ def parse_parts_index(vehicle_root: Path, asset_sources=None, cache_enabled=True
                     source_path=jbeam_path,
                 )
     return part_index
+
+
+TOPOLOGY_SUBSET_PART_KEYS = {
+    "information",
+    "slotType",
+    "slots",
+    "slots2",
+    "nodes",
+    "beams",
+    "triangles",
+}
+
+
+def import_jbeam_topology_subset(source, source_path=""):
+    """Import the first supported topology subset from one external JBeam source.
+
+    This path is intentionally separate from the vehicle resolver. It gives the
+    new authoring pipeline a small, preservation-aware parse result without
+    changing the existing slot/configuration workflow.
+    """
+    path = _existing_source_path(source)
+    source_label = str(source_path or path or "")
+    text = path.read_text(encoding="utf-8") if path else str(source)
+    diagnostics = []
+    try:
+        payload = load_jsonc_text(text)
+    except Exception as exc:
+        return JBeamTopologySubsetImport(
+            source_path=source_label,
+            diagnostics=[
+                JBeamImportDiagnostic(
+                    level="error",
+                    code="parse_failed",
+                    message=f"Could not parse JBeam source: {exc}",
+                )
+            ],
+        )
+
+    if not isinstance(payload, dict):
+        return JBeamTopologySubsetImport(
+            source_path=source_label,
+            diagnostics=[
+                JBeamImportDiagnostic(
+                    level="error",
+                    code="top_level_not_object",
+                    message="JBeam source must be a top-level object mapping part names to part objects",
+                )
+            ],
+        )
+
+    parts = []
+    for part_name, part_data in payload.items():
+        if not isinstance(part_data, dict):
+            diagnostic = JBeamImportDiagnostic(
+                level="error",
+                code="part_not_object",
+                message=f"Skipping part '{part_name}' because its value is not an object",
+                part_name=str(part_name),
+            )
+            diagnostics.append(diagnostic)
+            continue
+        part = import_jbeam_topology_subset_part(str(part_name), part_data, source_label)
+        parts.append(part)
+        diagnostics.extend(part.diagnostics)
+    return JBeamTopologySubsetImport(source_path=source_label, parts=parts, diagnostics=diagnostics)
+
+
+def _existing_source_path(source):
+    if not isinstance(source, (str, Path)):
+        return None
+    try:
+        path = Path(source)
+        return path if path.exists() else None
+    except (OSError, ValueError):
+        return None
+
+
+def import_jbeam_topology_subset_part(part_name, part_data, source_path=""):
+    diagnostics = []
+    unknown_sections = {key: value for key, value in part_data.items() if key not in TOPOLOGY_SUBSET_PART_KEYS}
+    for key in unknown_sections:
+        diagnostics.append(
+            JBeamImportDiagnostic(
+                level="info",
+                code="unsupported_preserved",
+                message=f"Preserved unsupported section or field '{key}'",
+                part_name=part_name,
+                section=str(key),
+            )
+        )
+
+    nodes = _import_topology_subset_nodes(part_name, part_data.get("nodes"), diagnostics)
+    node_ids = {node.node_id for node in nodes}
+    beams = _import_topology_subset_beams(part_name, part_data.get("beams"), node_ids, diagnostics)
+    triangles = _import_topology_subset_triangles(part_name, part_data.get("triangles"), node_ids, diagnostics)
+
+    information = part_data.get("information", {})
+    if information is not None and not isinstance(information, dict):
+        diagnostics.append(
+            JBeamImportDiagnostic(
+                level="warning",
+                code="information_not_object",
+                message="Part information is not an object and was not imported as metadata",
+                part_name=part_name,
+                section="information",
+            )
+        )
+        information = {}
+
+    slots = []
+    for section_name in ("slots2", "slots"):
+        section = part_data.get(section_name)
+        if section is None:
+            continue
+        if isinstance(section, list):
+            slots.append({"section": section_name, "rows": section})
+        else:
+            diagnostics.append(
+                JBeamImportDiagnostic(
+                    level="warning",
+                    code="slots_not_list",
+                    message=f"{section_name} is not a list and was preserved but not imported",
+                    part_name=part_name,
+                    section=section_name,
+                )
+            )
+
+    return ImportedJBeamPart(
+        part_name=part_name,
+        source_path=str(source_path or ""),
+        information=jbeam_option_metadata(information),
+        slot_type=part_data.get("slotType", ""),
+        slots=slots,
+        nodes=nodes,
+        beams=beams,
+        triangles=triangles,
+        unknown_preserved_sections=unknown_sections,
+        diagnostics=diagnostics,
+    )
+
+
+def _import_topology_subset_nodes(part_name, rows, diagnostics):
+    nodes = []
+    if rows is None:
+        diagnostics.append(
+            JBeamImportDiagnostic(
+                level="warning",
+                code="nodes_missing",
+                message="Part has no nodes section",
+                part_name=part_name,
+                section="nodes",
+            )
+        )
+        return nodes
+    if not isinstance(rows, list):
+        diagnostics.append(
+            JBeamImportDiagnostic(
+                level="error",
+                code="nodes_not_list",
+                message="Nodes section is not a list; topology editing is blocked for this part",
+                part_name=part_name,
+                section="nodes",
+            )
+        )
+        return nodes
+
+    current_options = {}
+    for row_index, row in enumerate(rows):
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
+        if not isinstance(row, list):
+            diagnostics.append(_unsupported_row_diagnostic(part_name, "nodes", row_index, "node_row_not_list"))
+            continue
+        if row and str(row[0]).lower() == "id":
+            continue
+        if len(row) < 4:
+            diagnostics.append(_unsupported_row_diagnostic(part_name, "nodes", row_index, "node_row_too_short"))
+            continue
+        inline_options = row[4] if len(row) > 4 and isinstance(row[4], dict) else {}
+        options = merge_options(current_options, inline_options)
+        nodes.append(
+            ImportedJBeamNode(
+                node_id=str(row[0]),
+                position=(coerce_number(row[1], 0.0), coerce_number(row[2], 0.0), coerce_number(row[3], 0.0)),
+                options=jbeam_option_metadata(options),
+                row_index=row_index,
+            )
+        )
+    return nodes
+
+
+def _import_topology_subset_beams(part_name, rows, node_ids, diagnostics):
+    beams = []
+    if rows is None:
+        return beams
+    if not isinstance(rows, list):
+        diagnostics.append(
+            JBeamImportDiagnostic(
+                level="error",
+                code="beams_not_list",
+                message="Beams section is not a list; beam editing is blocked for this part",
+                part_name=part_name,
+                section="beams",
+            )
+        )
+        return beams
+
+    current_options = {}
+    for row_index, row in enumerate(rows):
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
+        if not isinstance(row, list):
+            diagnostics.append(_unsupported_row_diagnostic(part_name, "beams", row_index, "beam_row_not_list"))
+            continue
+        if row and str(row[0]).lower().startswith("id"):
+            continue
+        if len(row) < 2:
+            diagnostics.append(_unsupported_row_diagnostic(part_name, "beams", row_index, "beam_row_too_short"))
+            continue
+        inline_options = row[2] if len(row) > 2 and isinstance(row[2], dict) else {}
+        options = merge_options(current_options, inline_options)
+        id1 = str(row[0])
+        id2 = str(row[1])
+        missing = tuple(node_id for node_id in (id1, id2) if node_id not in node_ids)
+        if missing:
+            diagnostics.append(
+                JBeamImportDiagnostic(
+                    level="warning",
+                    code="beam_missing_local_node",
+                    message=f"Beam references node(s) not owned by this imported part: {', '.join(missing)}",
+                    part_name=part_name,
+                    section="beams",
+                )
+            )
+        beams.append(
+            ImportedJBeamBeam(
+                id1=id1,
+                id2=id2,
+                options=jbeam_option_metadata(options),
+                row_index=row_index,
+                missing_nodes=missing,
+            )
+        )
+    return beams
+
+
+def _import_topology_subset_triangles(part_name, rows, node_ids, diagnostics):
+    triangles = []
+    if rows is None:
+        return triangles
+    if not isinstance(rows, list):
+        diagnostics.append(
+            JBeamImportDiagnostic(
+                level="error",
+                code="triangles_not_list",
+                message="Triangles section is not a list; triangle editing is blocked for this part",
+                part_name=part_name,
+                section="triangles",
+            )
+        )
+        return triangles
+
+    current_options = {}
+    for row_index, row in enumerate(rows):
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
+        if not isinstance(row, list):
+            diagnostics.append(_unsupported_row_diagnostic(part_name, "triangles", row_index, "triangle_row_not_list"))
+            continue
+        if row and str(row[0]).lower().startswith("id"):
+            continue
+        if len(row) < 3:
+            diagnostics.append(_unsupported_row_diagnostic(part_name, "triangles", row_index, "triangle_row_too_short"))
+            continue
+        inline_options = row[3] if len(row) > 3 and isinstance(row[3], dict) else {}
+        options = merge_options(current_options, inline_options)
+        ids = (str(row[0]), str(row[1]), str(row[2]))
+        missing = tuple(node_id for node_id in ids if node_id not in node_ids)
+        if missing:
+            diagnostics.append(
+                JBeamImportDiagnostic(
+                    level="warning",
+                    code="triangle_missing_local_node",
+                    message=f"Triangle references node(s) not owned by this imported part: {', '.join(missing)}",
+                    part_name=part_name,
+                    section="triangles",
+                )
+            )
+        triangles.append(
+            ImportedJBeamTriangle(
+                id1=ids[0],
+                id2=ids[1],
+                id3=ids[2],
+                options=jbeam_option_metadata(options),
+                row_index=row_index,
+                missing_nodes=missing,
+            )
+        )
+    return triangles
+
+
+def _unsupported_row_diagnostic(part_name, section, row_index, code):
+    return JBeamImportDiagnostic(
+        level="warning",
+        code=code,
+        message=f"Skipped unsupported {section} row at index {row_index}",
+        part_name=part_name,
+        section=section,
+    )
 
 
 def parse_slots(part_data):

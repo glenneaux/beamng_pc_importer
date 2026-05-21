@@ -1,0 +1,42 @@
+{
+    // Fixture for the first topology import/export prototype. It deliberately
+    // includes inherited row options and an unsupported section to prove the
+    // importer can separate editable topology from preserved data.
+    "subset_main": {
+        "information": {
+            "name": "Topology Subset Fixture",
+            "authors": "Test Suite"
+        },
+        "slotType": "main",
+        "slots2": [
+            ["type", "default", "description"],
+            ["subset_accessory", ["subset_accessory"], [], "", "Accessory"]
+        ],
+        "nodes": [
+            ["id", "posX", "posY", "posZ"],
+            {"nodeWeight": 5.5, "group": "body"},
+            ["a", 0, 0, 0],
+            ["b", 1, 0, 0, {"nodeWeight": 4.25}],
+            ["c", 0, 1, 0],
+        ],
+        "beams": [
+            ["id1:", "id2:"],
+            {"beamSpring": 100000, "beamDamp": 120},
+            ["a", "b"],
+            ["b", "c", {"beamSpring": 90000}],
+            ["c", "external_ref"],
+        ],
+        "triangles": [
+            ["id1:", "id2:", "id3:"],
+            {"dragCoef": 9},
+            ["a", "b", "c", {"groundModel": "metal"}]
+        ],
+        "hydros": [
+            ["id1:", "id2:"],
+            ["a", "b"]
+        ],
+        "customUnknown": {
+            "keep": true
+        }
+    }
+}
