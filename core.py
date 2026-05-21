@@ -67,6 +67,7 @@ class JBeamImportDiagnostic:
 class ImportedJBeamNode:
     node_id: str
     position: tuple
+    original_position: tuple = field(default_factory=tuple)
     topology_guid: str = ""
     options: dict = field(default_factory=dict)
     row_index: int = -1
@@ -111,6 +112,7 @@ class ImportedJBeamPart:
 @dataclass
 class JBeamTopologySubsetImport:
     source_path: str = ""
+    coordinate_precision: int = 3
     cached_source: dict = field(default_factory=dict)
     source_map: dict = field(default_factory=dict)
     import_identity_map: dict = field(default_factory=dict)
@@ -1212,9 +1214,10 @@ TOPOLOGY_SUBSET_PART_KEYS = {
     "beams",
     "triangles",
 }
+JBEAM_TOPOLOGY_DEFAULT_PRECISION = 3
 
 
-def import_jbeam_topology_subset(source, source_path=""):
+def import_jbeam_topology_subset(source, source_path="", coordinate_precision=JBEAM_TOPOLOGY_DEFAULT_PRECISION):
     """Import the first supported topology subset from one external JBeam source.
 
     This path is intentionally separate from the vehicle resolver. It gives the
@@ -1268,13 +1271,14 @@ def import_jbeam_topology_subset(source, source_path=""):
             )
             diagnostics.append(diagnostic)
             continue
-        part = import_jbeam_topology_subset_part(str(part_name), part_data, source_label)
+        part = import_jbeam_topology_subset_part(str(part_name), part_data, source_label, coordinate_precision)
         parts.append(part)
         diagnostics.extend(part.diagnostics)
     source_map = build_jbeam_topology_subset_source_map(text, payload, parts)
     import_identity_map = build_jbeam_topology_import_identity_map(parts, source_map)
     return JBeamTopologySubsetImport(
         source_path=source_label,
+        coordinate_precision=coordinate_precision,
         cached_source=cached_source,
         source_map=source_map,
         import_identity_map=import_identity_map,
@@ -1521,7 +1525,12 @@ def _row_spans_for_section(text, lines, line_ranges, section_span):
     return rows
 
 
-def import_jbeam_topology_subset_part(part_name, part_data, source_path=""):
+def import_jbeam_topology_subset_part(
+    part_name,
+    part_data,
+    source_path="",
+    coordinate_precision=JBEAM_TOPOLOGY_DEFAULT_PRECISION,
+):
     diagnostics = []
     unknown_sections = {key: value for key, value in part_data.items() if key not in TOPOLOGY_SUBSET_PART_KEYS}
     for key in unknown_sections:
@@ -1535,7 +1544,7 @@ def import_jbeam_topology_subset_part(part_name, part_data, source_path=""):
             )
         )
 
-    nodes = _import_topology_subset_nodes(part_name, part_data.get("nodes"), diagnostics)
+    nodes = _import_topology_subset_nodes(part_name, part_data.get("nodes"), diagnostics, coordinate_precision)
     node_ids = {node.node_id for node in nodes}
     beams = _import_topology_subset_beams(part_name, part_data.get("beams"), node_ids, diagnostics)
     triangles = _import_topology_subset_triangles(part_name, part_data.get("triangles"), node_ids, diagnostics)
@@ -1586,7 +1595,7 @@ def import_jbeam_topology_subset_part(part_name, part_data, source_path=""):
     )
 
 
-def _import_topology_subset_nodes(part_name, rows, diagnostics):
+def _import_topology_subset_nodes(part_name, rows, diagnostics, coordinate_precision=JBEAM_TOPOLOGY_DEFAULT_PRECISION):
     nodes = []
     if rows is None:
         diagnostics.append(
@@ -1626,16 +1635,51 @@ def _import_topology_subset_nodes(part_name, rows, diagnostics):
             continue
         inline_options = row[4] if len(row) > 4 and isinstance(row[4], dict) else {}
         options = merge_options(current_options, inline_options)
+        original_position = (
+            coerce_number(row[1], 0.0),
+            coerce_number(row[2], 0.0),
+            coerce_number(row[3], 0.0),
+        )
+        rounded_position = rounded_jbeam_import_position(original_position, coordinate_precision)
+        if rounded_position != original_position:
+            diagnostics.append(
+                JBeamImportDiagnostic(
+                    level="info",
+                    code="node_position_normalized",
+                    message=(
+                        f"Node '{row[0]}' coordinates normalized to "
+                        f"{coordinate_precision} decimal place(s)"
+                    ),
+                    part_name=part_name,
+                    section="nodes",
+                )
+            )
         nodes.append(
             ImportedJBeamNode(
                 node_id=str(row[0]),
-                position=(coerce_number(row[1], 0.0), coerce_number(row[2], 0.0), coerce_number(row[3], 0.0)),
+                position=rounded_position,
+                original_position=original_position,
                 topology_guid=_new_internal_guid(),
                 options=jbeam_option_metadata(options),
                 row_index=row_index,
             )
         )
     return nodes
+
+
+def rounded_jbeam_import_position(position, precision=JBEAM_TOPOLOGY_DEFAULT_PRECISION):
+    return tuple(round(float(value), int(precision)) for value in position[:3])
+
+
+def formatted_jbeam_import_position(position, precision=JBEAM_TOPOLOGY_DEFAULT_PRECISION):
+    return [formatted_jbeam_import_number(value, precision) for value in position[:3]]
+
+
+def formatted_jbeam_import_number(value, precision=JBEAM_TOPOLOGY_DEFAULT_PRECISION):
+    rounded = round(float(value), int(precision))
+    if rounded == 0:
+        rounded = 0
+    return f"{rounded:.{int(precision)}f}".rstrip("0").rstrip(".") or "0"
 
 
 def _import_topology_subset_beams(part_name, rows, node_ids, diagnostics):

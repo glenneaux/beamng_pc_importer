@@ -137,3 +137,27 @@ def test_topology_subset_does_not_inject_guids_into_cached_source(topology_subse
 
     assert part.part_guid not in imported.cached_source["decoded_text"]
     assert part.nodes[0].topology_guid not in imported.cached_source["decoded_text"]
+
+
+def test_topology_subset_normalizes_editable_coordinates_at_project_precision():
+    source = """
+    {
+        "precision_part": {
+            "slotType": "main",
+            "nodes": [
+                ["id", "posX", "posY", "posZ"],
+                ["p1", 1.23456, -0.0004, 2.0]
+            ],
+            "beams": [["id1:", "id2:"]],
+            "triangles": [["id1:", "id2:", "id3:"]]
+        }
+    }
+    """
+    imported = addon.import_jbeam_topology_subset(source, "memory://precision.jbeam")
+    node = imported.parts[0].nodes[0]
+
+    assert imported.coordinate_precision == 3
+    assert node.original_position == (1.23456, -0.0004, 2.0)
+    assert node.position == (1.235, -0.0, 2.0)
+    assert addon.formatted_jbeam_import_position(node.position) == ["1.235", "0", "2"]
+    assert any(diagnostic.code == "node_position_normalized" for diagnostic in imported.diagnostics)
