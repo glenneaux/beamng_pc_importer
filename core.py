@@ -3,6 +3,7 @@ import json
 import math
 import re
 import tempfile
+import uuid
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ class JBeamImportDiagnostic:
 class ImportedJBeamNode:
     node_id: str
     position: tuple
+    topology_guid: str = ""
     options: dict = field(default_factory=dict)
     row_index: int = -1
 
@@ -74,6 +76,7 @@ class ImportedJBeamNode:
 class ImportedJBeamBeam:
     id1: str
     id2: str
+    topology_guid: str = ""
     options: dict = field(default_factory=dict)
     row_index: int = -1
     missing_nodes: tuple = field(default_factory=tuple)
@@ -84,6 +87,7 @@ class ImportedJBeamTriangle:
     id1: str
     id2: str
     id3: str
+    topology_guid: str = ""
     options: dict = field(default_factory=dict)
     row_index: int = -1
     missing_nodes: tuple = field(default_factory=tuple)
@@ -92,6 +96,7 @@ class ImportedJBeamTriangle:
 @dataclass
 class ImportedJBeamPart:
     part_name: str
+    part_guid: str = ""
     source_path: str = ""
     information: dict = field(default_factory=dict)
     slot_type: object = ""
@@ -108,6 +113,8 @@ class JBeamTopologySubsetImport:
     source_path: str = ""
     cached_source: dict = field(default_factory=dict)
     source_map: dict = field(default_factory=dict)
+    import_identity_map: dict = field(default_factory=dict)
+    export_metadata_mode: str = "none"
     parts: list = field(default_factory=list)
     diagnostics: list = field(default_factory=list)
 
@@ -1265,10 +1272,13 @@ def import_jbeam_topology_subset(source, source_path=""):
         parts.append(part)
         diagnostics.extend(part.diagnostics)
     source_map = build_jbeam_topology_subset_source_map(text, payload, parts)
+    import_identity_map = build_jbeam_topology_import_identity_map(parts, source_map)
     return JBeamTopologySubsetImport(
         source_path=source_label,
         cached_source=cached_source,
         source_map=source_map,
+        import_identity_map=import_identity_map,
+        export_metadata_mode="none",
         parts=parts,
         diagnostics=diagnostics,
     )
@@ -1563,6 +1573,7 @@ def import_jbeam_topology_subset_part(part_name, part_data, source_path=""):
 
     return ImportedJBeamPart(
         part_name=part_name,
+        part_guid=_new_internal_guid(),
         source_path=str(source_path or ""),
         information=jbeam_option_metadata(information),
         slot_type=part_data.get("slotType", ""),
@@ -1619,6 +1630,7 @@ def _import_topology_subset_nodes(part_name, rows, diagnostics):
             ImportedJBeamNode(
                 node_id=str(row[0]),
                 position=(coerce_number(row[1], 0.0), coerce_number(row[2], 0.0), coerce_number(row[3], 0.0)),
+                topology_guid=_new_internal_guid(),
                 options=jbeam_option_metadata(options),
                 row_index=row_index,
             )
@@ -1674,6 +1686,7 @@ def _import_topology_subset_beams(part_name, rows, node_ids, diagnostics):
             ImportedJBeamBeam(
                 id1=id1,
                 id2=id2,
+                topology_guid=_new_internal_guid(),
                 options=jbeam_option_metadata(options),
                 row_index=row_index,
                 missing_nodes=missing,
@@ -1730,6 +1743,7 @@ def _import_topology_subset_triangles(part_name, rows, node_ids, diagnostics):
                 id1=ids[0],
                 id2=ids[1],
                 id3=ids[2],
+                topology_guid=_new_internal_guid(),
                 options=jbeam_option_metadata(options),
                 row_index=row_index,
                 missing_nodes=missing,
@@ -1746,6 +1760,93 @@ def _unsupported_row_diagnostic(part_name, section, row_index, code):
         part_name=part_name,
         section=section,
     )
+
+
+def _new_internal_guid():
+    return str(uuid.uuid4())
+
+
+def build_jbeam_topology_import_identity_map(parts, source_map):
+    identity = {
+        "schema_version": 1,
+        "parts": {},
+        "topology": {},
+    }
+    source_parts = source_map.get("parts", {}) if isinstance(source_map, dict) else {}
+    for part in parts:
+        part_source_map = source_parts.get(part.part_name, {})
+        identity["parts"][part.part_guid] = {
+            "part_name": part.part_name,
+            "source_path": part.source_path,
+            "source_span": part_source_map.get("span", {}),
+            "evidence": {
+                "type": "part_name",
+                "value": part.part_name,
+            },
+        }
+        sections = part_source_map.get("sections", {})
+        _add_node_identity(identity, part, sections.get("nodes", {}).get("rows", []))
+        _add_beam_identity(identity, part, sections.get("beams", {}).get("rows", []))
+        _add_triangle_identity(identity, part, sections.get("triangles", {}).get("rows", []))
+    return identity
+
+
+def _data_row_spans(rows):
+    return [row.get("span", {}) for row in rows if row.get("kind") == "row"]
+
+
+def _add_node_identity(identity, part, rows):
+    row_spans = _data_row_spans(rows)
+    for index, node in enumerate(part.nodes):
+        identity["topology"][node.topology_guid] = {
+            "kind": "node",
+            "part_guid": part.part_guid,
+            "part_name": part.part_name,
+            "external_id": node.node_id,
+            "source_path": part.source_path,
+            "source_row_index": node.row_index,
+            "source_span": row_spans[index] if index < len(row_spans) else {},
+            "evidence": {
+                "type": "node_id",
+                "value": node.node_id,
+            },
+        }
+
+
+def _add_beam_identity(identity, part, rows):
+    row_spans = _data_row_spans(rows)
+    for index, beam in enumerate(part.beams):
+        identity["topology"][beam.topology_guid] = {
+            "kind": "beam",
+            "part_guid": part.part_guid,
+            "part_name": part.part_name,
+            "external_id": [beam.id1, beam.id2],
+            "source_path": part.source_path,
+            "source_row_index": beam.row_index,
+            "source_span": row_spans[index] if index < len(row_spans) else {},
+            "evidence": {
+                "type": "beam_endpoints",
+                "value": [beam.id1, beam.id2],
+            },
+        }
+
+
+def _add_triangle_identity(identity, part, rows):
+    row_spans = _data_row_spans(rows)
+    for index, triangle in enumerate(part.triangles):
+        identity["topology"][triangle.topology_guid] = {
+            "kind": "triangle",
+            "part_guid": part.part_guid,
+            "part_name": part.part_name,
+            "external_id": [triangle.id1, triangle.id2, triangle.id3],
+            "source_path": part.source_path,
+            "source_row_index": triangle.row_index,
+            "source_span": row_spans[index] if index < len(row_spans) else {},
+            "evidence": {
+                "type": "triangle_nodes",
+                "value": [triangle.id1, triangle.id2, triangle.id3],
+            },
+        }
 
 
 def parse_slots(part_data):

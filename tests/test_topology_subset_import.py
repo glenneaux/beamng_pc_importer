@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from pathlib import Path
 
 import pytest
@@ -100,3 +101,39 @@ def test_topology_subset_builds_source_map_for_supported_rows(topology_subset_pa
     assert [row["kind"] for row in beam_rows] == ["row", "options", "row", "row", "row"]
     assert [row["kind"] for row in triangle_rows] == ["row", "options", "row"]
     assert node_rows[2]["span"]["start_line"] < node_rows[-1]["span"]["start_line"]
+
+
+def test_topology_subset_assigns_internal_guids_and_identity_map(topology_subset_path):
+    imported = addon.import_jbeam_topology_subset(topology_subset_path)
+    part = imported.parts[0]
+
+    uuid.UUID(part.part_guid)
+    for entity in [*part.nodes, *part.beams, *part.triangles]:
+        uuid.UUID(entity.topology_guid)
+
+    assert imported.export_metadata_mode == "none"
+    assert part.part_guid in imported.import_identity_map["parts"]
+    assert imported.import_identity_map["parts"][part.part_guid]["evidence"] == {
+        "type": "part_name",
+        "value": "subset_main",
+    }
+
+    node_identity = imported.import_identity_map["topology"][part.nodes[0].topology_guid]
+    assert node_identity["kind"] == "node"
+    assert node_identity["part_guid"] == part.part_guid
+    assert node_identity["external_id"] == "a"
+    assert node_identity["source_span"]["start_line"] > 0
+
+    beam_identity = imported.import_identity_map["topology"][part.beams[0].topology_guid]
+    assert beam_identity["evidence"] == {"type": "beam_endpoints", "value": ["a", "b"]}
+
+    triangle_identity = imported.import_identity_map["topology"][part.triangles[0].topology_guid]
+    assert triangle_identity["evidence"] == {"type": "triangle_nodes", "value": ["a", "b", "c"]}
+
+
+def test_topology_subset_does_not_inject_guids_into_cached_source(topology_subset_path):
+    imported = addon.import_jbeam_topology_subset(topology_subset_path)
+    part = imported.parts[0]
+
+    assert part.part_guid not in imported.cached_source["decoded_text"]
+    assert part.nodes[0].topology_guid not in imported.cached_source["decoded_text"]
