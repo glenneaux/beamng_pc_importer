@@ -4629,7 +4629,7 @@ def build_jbeam_node_patch_draft(history):
         "topology_update_count": topology_update_count,
         "warnings": [
             "Draft only: no vanilla, mod, or user override files were modified.",
-            "Source-preserving text patching is available for node-position-only edits; new nodes and beam/triangle topology use clean JSON fallback.",
+            "Source-preserving text patching is available for node positions and Beam insert/delete edits; other topology edits use clean JSON fallback.",
         ],
         "files": files,
     }
@@ -5662,12 +5662,12 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
         else:
             try:
                 source_text = read_jbeam_asset_source_text(source)
-                _patched_text, text_changed, text_skipped = apply_node_updates_to_jbeam_text(source_text, file_group)
+                _patched_text, text_changed, text_skipped = apply_jbeam_updates_to_source_text(source_text, file_group)
                 has_node_structural_changes = any(
                     part_group.get("node_inserts") or part_group.get("node_deletes")
                     for part_group in file_group.get("parts", [])
                 )
-                if not has_node_structural_changes and expected_topology_update_count == 0 and text_changed and not text_skipped and len(text_changed) == expected_update_count:
+                if not has_node_structural_changes and text_changed and not text_skipped and len(text_changed) == expected_update_count:
                     patch_mode = "source_preserving_text"
                 else:
                     try:
@@ -6025,6 +6025,232 @@ def apply_node_updates_to_jbeam_text(source_text, file_group):
             )
 
     return "".join(lines), changed, skipped
+
+
+def find_jsonc_value_for_key_in_range(text, key, start, end, expected_open=None):
+    index = start
+    while index < end:
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2, end)
+            index = end if newline == -1 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            close = text.find("*/", index + 2, end)
+            index = end if close == -1 else close + 2
+            continue
+
+        char = text[index]
+        if char in {'"', "'"}:
+            token_end = scan_jsonc_string(text, index)
+            token = text[index + 1 : token_end - 1]
+            next_index = skip_jsonc_ws_comments(text, token_end)
+        elif char.isalpha() or char in "_$":
+            token, token_end = scan_jsonc_identifier(text, index)
+            next_index = skip_jsonc_ws_comments(text, token_end)
+        else:
+            index += 1
+            continue
+
+        if token == key and next_index < end and text[next_index] == ":":
+            value_start = skip_jsonc_ws_comments(text, next_index + 1)
+            if value_start >= end:
+                return None
+            opener = text[value_start]
+            if expected_open is not None and opener != expected_open:
+                return None
+            if opener in "{[":
+                value_end = find_matching_jsonc_brace(text, value_start)
+                return None if value_end == -1 else (value_start, value_end + 1)
+            value_end = value_start
+            while value_end < end and text[value_end] not in ",}\n\r":
+                value_end += 1
+            return value_start, value_end
+        index = token_end
+    return None
+
+
+def find_jbeam_part_object_bounds(source_text, part_name):
+    bounds = find_jsonc_value_for_key_in_range(source_text, part_name, 0, len(source_text), expected_open="{")
+    if bounds is None:
+        return None
+    return bounds
+
+
+def find_jbeam_part_section_array_bounds(source_text, part_name, section_name):
+    part_bounds = find_jbeam_part_object_bounds(source_text, part_name)
+    if part_bounds is None:
+        return None
+    part_start, part_end = part_bounds
+    return find_jsonc_value_for_key_in_range(source_text, section_name, part_start, part_end, expected_open="[")
+
+
+def line_bounds_for_index(text, index):
+    line_start = text.rfind("\n", 0, index) + 1
+    line_end = text.find("\n", index)
+    if line_end == -1:
+        return line_start, len(text)
+    return line_start, line_end + 1
+
+
+def line_text_without_newline(line):
+    return line.rstrip("\r\n")
+
+
+def jbeam_node_row_text(node_ids):
+    return json.dumps([str(node_id) for node_id in node_ids], ensure_ascii=False, separators=(", ", ": "))
+
+
+def jbeam_row_line_indent(section_text):
+    for line in section_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and not stripped.startswith("[]"):
+            return line[: len(line) - len(line.lstrip())]
+    return "  "
+
+
+def jbeam_section_closing_indent(source_text, section_bounds):
+    close_index = section_bounds[1] - 1
+    return text_indent_before_index(source_text, close_index)
+
+
+def beam_row_nodes_pattern(node_ids):
+    if len(node_ids) < 2:
+        return None
+    left = re.escape(str(node_ids[0]))
+    right = re.escape(str(node_ids[1]))
+    return re.compile(
+        rf"^\s*\[\s*([\"']){left}\1\s*,\s*([\"']){right}\2(?:\s*,[^\]]*)?\]\s*,?\s*(?://.*)?$"
+    )
+
+
+def row_line_matches_beam_nodes(line, node_ids):
+    pattern = beam_row_nodes_pattern(node_ids)
+    if pattern is None:
+        return False
+    return bool(pattern.match(line_text_without_newline(line)))
+
+
+def find_unique_beam_row_line(source_text, section_bounds, node_ids):
+    section_start, section_end = section_bounds
+    matches = []
+    search_index = section_start
+    while search_index < section_end:
+        line_start, line_end = line_bounds_for_index(source_text, search_index)
+        if line_end <= section_start:
+            search_index = line_end + 1
+            continue
+        if line_start >= section_end:
+            break
+        line = source_text[line_start:min(line_end, section_end)]
+        if row_line_matches_beam_nodes(line, node_ids):
+            matches.append((line_start, line_end))
+        search_index = line_end if line_end > search_index else search_index + 1
+    return matches
+
+
+def remove_text_line_preserving_surroundings(text, line_start, line_end):
+    line = text[line_start:line_end]
+    if line_text_without_newline(line).rstrip().endswith(","):
+        return text[:line_start] + text[line_end:]
+
+    previous_line_end = line_start
+    previous_line_start = text.rfind("\n", 0, max(0, previous_line_end - 1)) + 1
+    previous_line = text[previous_line_start:previous_line_end]
+    previous_body = line_text_without_newline(previous_line)
+    if previous_body.rstrip().endswith(","):
+        comma_index = previous_line_start + previous_body.rstrip().rfind(",")
+        return text[:comma_index] + text[comma_index + 1:line_start] + text[line_end:]
+    return text[:line_start] + text[line_end:]
+
+
+def insert_beam_row_into_section_text(source_text, section_bounds, node_ids, params=None):
+    section_text = source_text[section_bounds[0]:section_bounds[1]]
+    row_indent = jbeam_row_line_indent(section_text)
+    closing_indent = jbeam_section_closing_indent(source_text, section_bounds)
+    insert_at = section_bounds[1] - 1
+    while insert_at > section_bounds[0] and source_text[insert_at - 1] in " \t\r\n":
+        insert_at -= 1
+
+    rows = []
+    cleaned_params = clean_jbeam_params(params or {})
+    if cleaned_params:
+        rows.append(json.dumps(cleaned_params, ensure_ascii=False, separators=(", ", ": ")))
+    rows.append(jbeam_node_row_text(node_ids))
+
+    prefix = "," if insert_at > section_bounds[0] and source_text[insert_at - 1] != "[" else ""
+    insertion = prefix + "\n" + "\n".join(row_indent + row for row in rows) + "\n" + closing_indent
+    return source_text[:insert_at] + insertion + source_text[section_bounds[1] - 1:]
+
+
+def apply_topology_updates_to_jbeam_text(source_text, file_group):
+    text = source_text
+    changed = []
+    skipped = []
+
+    for part_group in file_group.get("parts", []):
+        part_name = part_group.get("part", "")
+        beam_inserts = list(part_group.get("beam_inserts", []))
+        beam_deletes = list(part_group.get("beam_deletes", []))
+        unsupported_count = (
+            len(part_group.get("beam_param_updates", []))
+            + len(part_group.get("triangle_inserts", []))
+            + len(part_group.get("triangle_deletes", []))
+            + len(part_group.get("triangle_node_updates", []))
+            + len(part_group.get("triangle_param_updates", []))
+        )
+        if unsupported_count:
+            skipped.append(
+                {
+                    "part": part_name,
+                    "section": "topology",
+                    "reason": "Source-preserving text patch currently supports Beam insert/delete only",
+                }
+            )
+
+        for update in beam_deletes:
+            node_ids = [str(node_id) for node_id in update.get("nodes", [])[:2]]
+            section_bounds = find_jbeam_part_section_array_bounds(text, part_name, "beams")
+            if section_bounds is None:
+                skipped.append({"part": part_name, "section": "beams", "nodes": node_ids, "reason": "Beams section not found"})
+                continue
+            matches = find_unique_beam_row_line(text, section_bounds, node_ids)
+            if len(matches) != 1:
+                skipped.append(
+                    {
+                        "part": part_name,
+                        "section": "beams",
+                        "nodes": node_ids,
+                        "reason": "Beam row not found uniquely in source text",
+                    }
+                )
+                continue
+            line_start, line_end = matches[0]
+            old_row = line_text_without_newline(text[line_start:line_end]).strip().rstrip(",")
+            text = remove_text_line_preserving_surroundings(text, line_start, line_end)
+            changed.append({"part": part_name, "section": "beams", "operation": "delete", "old": old_row, "new": []})
+
+        for update in beam_inserts:
+            node_ids = [str(node_id) for node_id in update.get("nodes", [])[:2]]
+            if len(node_ids) != 2:
+                skipped.append({"part": part_name, "section": "beams", "nodes": node_ids, "reason": "Beam insert is not two nodes"})
+                continue
+            section_bounds = find_jbeam_part_section_array_bounds(text, part_name, "beams")
+            if section_bounds is None:
+                skipped.append({"part": part_name, "section": "beams", "nodes": node_ids, "reason": "Beams section not found"})
+                continue
+            if find_unique_beam_row_line(text, section_bounds, node_ids):
+                skipped.append({"part": part_name, "section": "beams", "nodes": node_ids, "reason": "Beam already exists"})
+                continue
+            text = insert_beam_row_into_section_text(text, section_bounds, node_ids, update.get("params", {}))
+            changed.append({"part": part_name, "section": "beams", "operation": "insert", "old": [], "new": node_ids})
+
+    return text, changed, skipped
+
+
+def apply_jbeam_updates_to_source_text(source_text, file_group):
+    text, node_changed, node_skipped = apply_node_updates_to_jbeam_text(source_text, file_group)
+    text, topology_changed, topology_skipped = apply_topology_updates_to_jbeam_text(text, file_group)
+    return text, node_changed + topology_changed, node_skipped + topology_skipped
 
 
 def apply_node_updates_to_jbeam_payload(payload, file_group):
@@ -6395,7 +6621,7 @@ def build_jbeam_patched_cache_copies(context, selected_virtual_paths=None):
         output_path = output_root / Path(virtual_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        patched_text, text_changed, text_skipped = apply_node_updates_to_jbeam_text(source_text, file_group)
+        patched_text, text_changed, text_skipped = apply_jbeam_updates_to_source_text(source_text, file_group)
         expected_node_update_count = sum(
             len(part_group.get("node_inserts", []))
             + len(part_group.get("node_updates", []))
@@ -6414,7 +6640,7 @@ def build_jbeam_patched_cache_copies(context, selected_virtual_paths=None):
             part_group.get("node_inserts") or part_group.get("node_deletes")
             for part_group in file_group.get("parts", [])
         )
-        if not has_node_structural_changes and expected_topology_update_count == 0 and text_changed and not text_skipped and len(text_changed) == expected_update_count:
+        if not has_node_structural_changes and text_changed and not text_skipped and len(text_changed) == expected_update_count:
             changed = text_changed
             skipped = []
             file_result["patch_mode"] = "source_preserving_text"
@@ -6462,7 +6688,7 @@ def build_jbeam_patched_cache_copies(context, selected_virtual_paths=None):
         "changed_topology_count": sum(file_group["changed_topology_count"] for file_group in files),
         "skipped_update_count": sum(file_group["skipped_update_count"] for file_group in files),
         "warnings": sorted(set(plan["warnings"] + [
-            "Patched cache copies prefer source-preserving text patches for node-only files; topology edits use clean JSON fallback.",
+            "Patched cache copies prefer source-preserving text patches for node positions and Beam insert/delete edits; other topology edits use clean JSON fallback.",
             "No BeamNG user, mod, or vanilla files were modified.",
         ])),
         "files": files,
