@@ -5598,6 +5598,7 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
         file_infos = []
         stale_source_checks = []
         semantic_diff = semantic_diff_for_file_group(file_group)
+        round_trip_validation = {"status": "not_run", "errors": [], "warnings": [], "infos": []}
         file_infos.extend(semantic_diff_summary_lines(semantic_diff))
         patch_mode = ""
         source = source_index.get(virtual_path)
@@ -5635,6 +5636,11 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
             try:
                 payload = json.loads(json.dumps(new_file_payload))
                 clean_changed, clean_skipped = apply_jbeam_updates_to_payload(payload, file_group)
+                if clean_changed:
+                    round_trip_validation = round_trip_validate_patched_jbeam_text(compact_jbeam_json(payload), file_group)
+                    file_errors.extend(round_trip_validation.get("errors", []))
+                    file_warnings.extend(round_trip_validation.get("warnings", []))
+                    file_infos.extend(round_trip_validation.get("infos", []))
                 reference_errors = validate_jbeam_payload_references(context, payload, file_group)
                 inconsistent_inserts = changed_insert_refs_to_deleted_nodes(clean_changed)
                 if inconsistent_inserts:
@@ -5681,6 +5687,10 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
                     for part_group in file_group.get("parts", [])
                 )
                 if not has_node_structural_changes and text_changed and not text_skipped and len(text_changed) == expected_update_count:
+                    round_trip_validation = round_trip_validate_patched_jbeam_text(_patched_text, file_group)
+                    file_errors.extend(round_trip_validation.get("errors", []))
+                    file_warnings.extend(round_trip_validation.get("warnings", []))
+                    file_infos.extend(round_trip_validation.get("infos", []))
                     patch_mode = "source_preserving_text"
                 else:
                     try:
@@ -5698,6 +5708,10 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
                     for ref_error in reference_errors:
                         file_errors.append(ref_error)
                     if clean_changed and not reference_errors and not inconsistent_inserts:
+                        round_trip_validation = round_trip_validate_patched_jbeam_text(compact_jbeam_json(payload), file_group)
+                        file_errors.extend(round_trip_validation.get("errors", []))
+                        file_warnings.extend(round_trip_validation.get("warnings", []))
+                        file_infos.extend(round_trip_validation.get("infos", []))
                         patch_mode = "clean_json_fallback"
                         file_warnings.append("Clean JSON fallback will be used for this file.")
                         if clean_skipped:
@@ -5731,6 +5745,7 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
                 "patch_mode": patch_mode,
                 "stale_source_checks": stale_source_checks,
                 "semantic_diff": semantic_diff,
+                "round_trip_validation": round_trip_validation,
                 "errors": file_errors,
                 "warnings": sorted(set(file_warnings)),
                 "infos": file_infos,
@@ -6042,6 +6057,95 @@ def semantic_diff_summary_lines(diff):
     return lines
 
 
+def imported_topology_part_by_name(imported_jbeam, part_name):
+    for part in getattr(imported_jbeam, "parts", []) or []:
+        if getattr(part, "part_name", "") == part_name:
+            return part
+    return None
+
+
+def imported_topology_node_map(part):
+    return {str(node.node_id): node for node in getattr(part, "nodes", []) or []}
+
+
+def imported_topology_beam_keys(part):
+    return {
+        tuple(sorted((str(beam.id1), str(beam.id2))))
+        for beam in getattr(part, "beams", []) or []
+        if getattr(beam, "id1", "") and getattr(beam, "id2", "")
+    }
+
+
+def imported_topology_triangle_keys(part):
+    return {
+        tuple(str(node_id) for node_id in (triangle.id1, triangle.id2, triangle.id3))
+        for triangle in getattr(part, "triangles", []) or []
+        if getattr(triangle, "id1", "") and getattr(triangle, "id2", "") and getattr(triangle, "id3", "")
+    }
+
+
+def round_trip_validate_patched_jbeam_text(patched_text, file_group):
+    imported = import_jbeam_topology_subset(patched_text, source_path=file_group.get("virtual_path", "<patched>"))
+    errors = []
+    warnings = []
+    infos = []
+    for diagnostic in getattr(imported, "diagnostics", []) or []:
+        if getattr(diagnostic, "level", "") == "error":
+            errors.append(f"Round-trip import error: {getattr(diagnostic, 'message', diagnostic)}")
+
+    for part_group in file_group.get("parts", []):
+        part_name = part_group.get("part", "")
+        part = imported_topology_part_by_name(imported, part_name)
+        if part is None:
+            errors.append(f"Round-trip missing part: {part_name}")
+            continue
+
+        nodes = imported_topology_node_map(part)
+        beams = imported_topology_beam_keys(part)
+        triangles = imported_topology_triangle_keys(part)
+
+        for update in part_group.get("node_updates", []):
+            node_id = str(update.get("node", ""))
+            node = nodes.get(node_id)
+            if node is None:
+                errors.append(f"Round-trip missing moved node: {part_name}.{node_id}")
+                continue
+            expected = rounded_position_list(update.get("new_position", []))
+            actual = rounded_position_list(getattr(node, "position", []))
+            if actual != expected:
+                errors.append(f"Round-trip node position mismatch: {part_name}.{node_id} {actual} != {expected}")
+        for update in part_group.get("node_inserts", []):
+            node_id = str(update.get("node", ""))
+            if node_id not in nodes:
+                errors.append(f"Round-trip missing inserted node: {part_name}.{node_id}")
+        for update in part_group.get("node_deletes", []):
+            node_id = str(update.get("node", ""))
+            if node_id in nodes:
+                errors.append(f"Round-trip deleted node still present: {part_name}.{node_id}")
+
+        for update in part_group.get("beam_inserts", []):
+            node_ids = [str(node_id) for node_id in update.get("nodes", [])[:2]]
+            if len(node_ids) == 2 and tuple(sorted(node_ids)) not in beams:
+                errors.append(f"Round-trip missing inserted Beam: {part_name} {node_ids}")
+        for update in part_group.get("beam_deletes", []):
+            node_ids = [str(node_id) for node_id in update.get("nodes", [])[:2]]
+            if len(node_ids) == 2 and tuple(sorted(node_ids)) in beams:
+                errors.append(f"Round-trip deleted Beam still present: {part_name} {node_ids}")
+
+        for update in part_group.get("triangle_inserts", []):
+            node_ids = tuple(str(node_id) for node_id in update.get("nodes", [])[:3])
+            if len(node_ids) == 3 and node_ids not in triangles:
+                errors.append(f"Round-trip missing inserted Triangle: {part_name} {list(node_ids)}")
+        for update in part_group.get("triangle_deletes", []):
+            node_ids = tuple(str(node_id) for node_id in update.get("nodes", [])[:3])
+            if len(node_ids) == 3 and node_ids in triangles:
+                errors.append(f"Round-trip deleted Triangle still present: {part_name} {list(node_ids)}")
+
+    if not errors:
+        infos.append("Round-trip validation: patched JBeam re-imported with expected semantic edits.")
+    return {"status": "fail" if errors else "pass", "errors": errors, "warnings": warnings, "infos": infos}
+
+
 def write_text_without_newline_translation(path, text, encoding="utf-8"):
     with Path(path).open("w", encoding=encoding, newline="") as handle:
         handle.write(text)
@@ -6320,7 +6424,8 @@ def insert_beam_row_into_section_text(source_text, section_bounds, node_ids, par
         rows.append(json.dumps(cleaned_params, ensure_ascii=False, separators=(", ", ": ")))
     rows.append(jbeam_node_row_text(node_ids))
 
-    prefix = "," if insert_at > section_bounds[0] and source_text[insert_at - 1] != "[" else ""
+    previous_char = source_text[insert_at - 1] if insert_at > section_bounds[0] else "["
+    prefix = "" if previous_char in "[," else ","
     insertion = prefix + "\n" + "\n".join(row_indent + row for row in rows) + "\n" + closing_indent
     return source_text[:insert_at] + insertion + source_text[section_bounds[1] - 1:]
 
