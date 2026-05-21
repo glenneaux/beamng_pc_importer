@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import re
@@ -105,6 +106,8 @@ class ImportedJBeamPart:
 @dataclass
 class JBeamTopologySubsetImport:
     source_path: str = ""
+    cached_source: dict = field(default_factory=dict)
+    source_map: dict = field(default_factory=dict)
     parts: list = field(default_factory=list)
     diagnostics: list = field(default_factory=list)
 
@@ -1213,14 +1216,18 @@ def import_jbeam_topology_subset(source, source_path=""):
     """
     path = _existing_source_path(source)
     source_label = str(source_path or path or "")
-    text = path.read_text(encoding="utf-8") if path else str(source)
+    raw_bytes, text, source_diagnostics = _read_jbeam_import_source(source, path)
+    cached_source = _cached_jbeam_source(raw_bytes, text, source_label)
     diagnostics = []
+    diagnostics.extend(source_diagnostics)
     try:
         payload = load_jsonc_text(text)
     except Exception as exc:
         return JBeamTopologySubsetImport(
             source_path=source_label,
+            cached_source=cached_source,
             diagnostics=[
+                *diagnostics,
                 JBeamImportDiagnostic(
                     level="error",
                     code="parse_failed",
@@ -1232,7 +1239,9 @@ def import_jbeam_topology_subset(source, source_path=""):
     if not isinstance(payload, dict):
         return JBeamTopologySubsetImport(
             source_path=source_label,
+            cached_source=cached_source,
             diagnostics=[
+                *diagnostics,
                 JBeamImportDiagnostic(
                     level="error",
                     code="top_level_not_object",
@@ -1255,7 +1264,14 @@ def import_jbeam_topology_subset(source, source_path=""):
         part = import_jbeam_topology_subset_part(str(part_name), part_data, source_label)
         parts.append(part)
         diagnostics.extend(part.diagnostics)
-    return JBeamTopologySubsetImport(source_path=source_label, parts=parts, diagnostics=diagnostics)
+    source_map = build_jbeam_topology_subset_source_map(text, payload, parts)
+    return JBeamTopologySubsetImport(
+        source_path=source_label,
+        cached_source=cached_source,
+        source_map=source_map,
+        parts=parts,
+        diagnostics=diagnostics,
+    )
 
 
 def _existing_source_path(source):
@@ -1266,6 +1282,233 @@ def _existing_source_path(source):
         return path if path.exists() else None
     except (OSError, ValueError):
         return None
+
+
+def _read_jbeam_import_source(source, path):
+    diagnostics = []
+    if path is not None:
+        raw_bytes = path.read_bytes()
+    elif isinstance(source, bytes):
+        raw_bytes = source
+    else:
+        raw_bytes = str(source).encode("utf-8")
+
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+        if raw_bytes.startswith(b"\xef\xbb\xbf"):
+            encoding = "utf-8-sig"
+        else:
+            encoding = "utf-8"
+    except UnicodeDecodeError as exc:
+        text = raw_bytes.decode("utf-8", errors="replace")
+        encoding = "utf-8-replace"
+        diagnostics.append(
+            JBeamImportDiagnostic(
+                level="warning",
+                code="source_decode_uncertain",
+                message=f"Source decoding used replacement characters: {exc}",
+            )
+        )
+    diagnostics.append(
+        JBeamImportDiagnostic(
+            level="info",
+            code="source_decoded",
+            message=f"Source decoded as {encoding}",
+        )
+    )
+    return raw_bytes, text, diagnostics
+
+
+def _cached_jbeam_source(raw_bytes, text, source_path):
+    return {
+        "schema_version": 1,
+        "source_path": str(source_path or ""),
+        "original_bytes": raw_bytes,
+        "decoded_text": text,
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "encoding": "utf-8-sig" if raw_bytes.startswith(b"\xef\xbb\xbf") else "utf-8",
+        "newline": _detect_newline_style(raw_bytes),
+        "byte_count": len(raw_bytes),
+        "line_count": len(text.splitlines()),
+    }
+
+
+def _detect_newline_style(raw_bytes):
+    if b"\r\n" in raw_bytes:
+        return "crlf"
+    if b"\r" in raw_bytes:
+        return "cr"
+    if b"\n" in raw_bytes:
+        return "lf"
+    return "none"
+
+
+def build_jbeam_topology_subset_source_map(text, payload, parts):
+    lines = text.splitlines(keepends=True)
+    source_map = {
+        "schema_version": 1,
+        "line_count": len(lines),
+        "parts": {},
+    }
+    if not isinstance(payload, dict):
+        return source_map
+
+    line_ranges = _line_ranges(lines)
+    for part in parts:
+        part_name = part.part_name
+        part_span = _span_for_named_json_value(text, line_ranges, part_name, "{")
+        part_map = {
+            "span": part_span,
+            "sections": {},
+            "unknown_preserved_sections": {},
+        }
+        part_data = payload.get(part_name, {})
+        if isinstance(part_data, dict):
+            for section_name in TOPOLOGY_SUBSET_PART_KEYS:
+                if section_name in part_data:
+                    section_span = _span_for_named_json_value(text, line_ranges, section_name)
+                    section_map = {"span": section_span}
+                    if section_name in {"nodes", "beams", "triangles"}:
+                        section_map["rows"] = _row_spans_for_section(text, lines, line_ranges, section_span)
+                    part_map["sections"][section_name] = section_map
+            for section_name in part.unknown_preserved_sections:
+                part_map["unknown_preserved_sections"][section_name] = {
+                    "span": _span_for_named_json_value(text, line_ranges, section_name)
+                }
+        source_map["parts"][part_name] = part_map
+    return source_map
+
+
+def _line_ranges(lines):
+    ranges = []
+    offset = 0
+    for line_number, line in enumerate(lines, start=1):
+        start = offset
+        offset += len(line)
+        ranges.append((line_number, start, offset))
+    return ranges
+
+
+def _line_for_offset(line_ranges, offset):
+    for line_number, start, end in line_ranges:
+        if start <= offset < end:
+            return line_number
+    return line_ranges[-1][0] if line_ranges else 1
+
+
+def _span_dict(line_ranges, start_offset, end_offset):
+    if start_offset < 0:
+        return {"start_line": -1, "end_line": -1, "start_offset": -1, "end_offset": -1}
+    return {
+        "start_line": _line_for_offset(line_ranges, start_offset),
+        "end_line": _line_for_offset(line_ranges, max(start_offset, end_offset - 1)),
+        "start_offset": start_offset,
+        "end_offset": end_offset,
+    }
+
+
+def _span_for_named_json_value(text, line_ranges, name, preferred_open=""):
+    pattern = re.compile(rf'"{re.escape(str(name))}"\s*:')
+    match = pattern.search(text)
+    if match is None:
+        return _span_dict(line_ranges, -1, -1)
+    value_start = match.end()
+    while value_start < len(text) and text[value_start].isspace():
+        value_start += 1
+    if preferred_open and value_start < len(text) and text[value_start] != preferred_open:
+        return _span_dict(line_ranges, match.start(), value_start)
+    if value_start < len(text) and text[value_start] in "{[":
+        value_end = _find_matching_jsonc_delimiter(text, value_start)
+    else:
+        value_end = _find_jsonc_scalar_end(text, value_start)
+    return _span_dict(line_ranges, match.start(), value_end)
+
+
+def _find_matching_jsonc_delimiter(text, start):
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    index = start
+    in_string = False
+    escape = False
+    line_comment = False
+    block_comment = False
+    while index < len(text):
+        char = text[index]
+        nxt = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and nxt == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == "/" and nxt == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and nxt == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return len(text)
+
+
+def _find_jsonc_scalar_end(text, start):
+    index = start
+    while index < len(text) and text[index] not in ",\r\n]}":
+        index += 1
+    return index
+
+
+def _row_spans_for_section(text, lines, line_ranges, section_span):
+    rows = []
+    start_line = section_span.get("start_line", -1)
+    end_line = section_span.get("end_line", -1)
+    if start_line < 1 or end_line < start_line:
+        return rows
+    for line_number in range(start_line, end_line + 1):
+        line_text = lines[line_number - 1]
+        stripped = line_text.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if re.match(r'^"[A-Za-z0-9_./:-]+"\s*:', stripped):
+            continue
+        if stripped.startswith("[") or stripped.startswith("{"):
+            line_start_offset = line_ranges[line_number - 1][1]
+            row_start = line_start_offset + line_text.find(stripped[0])
+            row_end = line_start_offset + len(line_text)
+            rows.append(
+                {
+                    "row_index": len(rows),
+                    "span": _span_dict(line_ranges, row_start, row_end),
+                    "kind": "options" if stripped.startswith("{") else "row",
+                }
+            )
+    return rows
 
 
 def import_jbeam_topology_subset_part(part_name, part_data, source_path=""):

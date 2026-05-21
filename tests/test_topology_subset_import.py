@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -69,3 +70,33 @@ def test_topology_subset_distinguishes_blocking_parse_diagnostics():
     assert len(imported.parts) == 1
     assert imported.parts[0].nodes == []
     assert any(diagnostic.code == "nodes_not_list" and diagnostic.level == "error" for diagnostic in imported.diagnostics)
+
+
+def test_topology_subset_caches_source_bytes_hash_and_newlines(topology_subset_path):
+    imported = addon.import_jbeam_topology_subset(topology_subset_path)
+    raw_bytes = topology_subset_path.read_bytes()
+
+    assert imported.cached_source["original_bytes"] == raw_bytes
+    assert imported.cached_source["decoded_text"] == topology_subset_path.read_text(encoding="utf-8")
+    assert imported.cached_source["sha256"] == hashlib.sha256(raw_bytes).hexdigest()
+    assert imported.cached_source["encoding"] == "utf-8"
+    assert imported.cached_source["newline"] in {"lf", "crlf"}
+    assert imported.cached_source["line_count"] > 0
+
+
+def test_topology_subset_builds_source_map_for_supported_rows(topology_subset_path):
+    imported = addon.import_jbeam_topology_subset(topology_subset_path)
+    part_map = imported.source_map["parts"]["subset_main"]
+
+    assert part_map["span"]["start_line"] > 0
+    assert set(part_map["sections"]) >= {"information", "slotType", "slots2", "nodes", "beams", "triangles"}
+    assert set(part_map["unknown_preserved_sections"]) == {"hydros", "customUnknown"}
+
+    node_rows = part_map["sections"]["nodes"]["rows"]
+    beam_rows = part_map["sections"]["beams"]["rows"]
+    triangle_rows = part_map["sections"]["triangles"]["rows"]
+
+    assert [row["kind"] for row in node_rows] == ["row", "options", "row", "row", "row"]
+    assert [row["kind"] for row in beam_rows] == ["row", "options", "row", "row", "row"]
+    assert [row["kind"] for row in triangle_rows] == ["row", "options", "row"]
+    assert node_rows[2]["span"]["start_line"] < node_rows[-1]["span"]["start_line"]
