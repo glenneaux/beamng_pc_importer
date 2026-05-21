@@ -941,6 +941,7 @@ def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_
     edge_uid_to_guid = {}
     non_exportable_topology_uids = []
     edge_node_ids = []
+    mesh_edge_params = []
     for edge, uid in zip(mesh.edges, edge_uids):
         indices = tuple(edge.vertices)
         edge_key = tuple(sorted(indices))
@@ -949,12 +950,15 @@ def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_
         beam = beam_edge_keys.get(edge_key)
         if beam is not None:
             edge_uid_to_type[str(uid)] = "beam"
-            edge_uid_to_params[str(uid)] = beam_options_by_key.get(edge_key, {})
+            edge_params = beam_options_by_key.get(edge_key, {})
+            edge_uid_to_params[str(uid)] = edge_params
             edge_uid_to_guid[str(uid)] = beam.topology_guid
         else:
             edge_uid_to_type[str(uid)] = "triangle_boundary"
-            edge_uid_to_params[str(uid)] = {}
+            edge_params = {}
+            edge_uid_to_params[str(uid)] = edge_params
             non_exportable_topology_uids.append(uid)
+        mesh_edge_params.append(edge_params)
         edge_uid_to_state[str(uid)] = "valid"
 
     face_uid_to_type = {str(uid): "triangle" for uid in face_uids}
@@ -973,14 +977,17 @@ def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_
     mesh["beamng_node_committed_params_json"] = json.dumps([dict(node.options or {}) for node in part.nodes])
     mesh["beamng_mesh_edge_node_ids_json"] = json.dumps(edge_node_ids)
     mesh["beamng_edge_node_ids_json"] = json.dumps([[beam.id1, beam.id2] for beam in part.beams if not beam.missing_nodes])
-    mesh["beamng_edge_params_json"] = json.dumps([dict(beam.options or {}) for beam in part.beams if not beam.missing_nodes])
+    mesh["beamng_edge_params_json"] = json.dumps(mesh_edge_params)
+    mesh["beamng_edge_committed_params_json"] = json.dumps(mesh_edge_params)
     mesh["beamng_face_node_ids_json"] = json.dumps(face_node_ids)
     mesh["beamng_face_params_json"] = json.dumps([dict(triangle.options or {}) for triangle in face_records])
     mesh["beamng_face_committed_params_json"] = mesh["beamng_face_params_json"]
     mesh["beamng_node_uid_to_id_json"] = json.dumps(node_uid_to_id)
     mesh["beamng_node_uid_to_kind_json"] = json.dumps({str(uid): "owned" for uid in node_uids})
     mesh["beamng_node_uid_to_owner_part_id_json"] = json.dumps({str(uid): part_index for uid in node_uids})
-    mesh["beamng_node_uid_to_original_position_json"] = json.dumps({str(uid): pos for uid, pos in zip(node_uids, vertex_positions)})
+    mesh["beamng_node_uid_to_original_position_json"] = json.dumps(
+        {str(uid): pos for uid, pos in zip(node_uids, vertex_positions)}
+    )
     mesh["beamng_node_uid_to_generated_json"] = json.dumps({str(uid): False for uid in node_uids})
     mesh["beamng_node_uid_to_committed_json"] = json.dumps({str(uid): True for uid in node_uids})
     mesh["beamng_node_uid_to_params_json"] = json.dumps(node_uid_to_params)
