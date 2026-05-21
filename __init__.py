@@ -18,6 +18,7 @@ def addon_version_label():
     return f"{version} build {ADDON_BUILD}"
 
 import json
+import hashlib
 import math
 import re
 import tempfile
@@ -5595,6 +5596,9 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
         file_errors = []
         file_warnings = list(file_group.get("warnings", []))
         file_infos = []
+        stale_source_checks = []
+        semantic_diff = semantic_diff_for_file_group(file_group)
+        file_infos.extend(semantic_diff_summary_lines(semantic_diff))
         patch_mode = ""
         source = source_index.get(virtual_path)
         expected_node_update_count = sum(
@@ -5661,6 +5665,15 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
             file_errors.append("Could not find matching source JBeam asset.")
         else:
             try:
+                stale_source_checks = stale_source_checks_for_file_group(context, file_group, source)
+                for check in stale_source_checks:
+                    if check.get("status") == "stale_external_data":
+                        file_errors.append(
+                            "Stale External Data: source JBeam changed since import; review semantic differences "
+                            "before exporting."
+                        )
+                    elif check.get("status") == "unknown":
+                        file_warnings.append(f"Could not verify source freshness: {check.get('reason', '')}")
                 source_text = read_jbeam_asset_source_text(source)
                 _patched_text, text_changed, text_skipped = apply_jbeam_updates_to_source_text(source_text, file_group)
                 has_node_structural_changes = any(
@@ -5716,6 +5729,8 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
                 "expected_update_count": expected_update_count,
                 "is_new_file": bool(file_group.get("is_new_file")),
                 "patch_mode": patch_mode,
+                "stale_source_checks": stale_source_checks,
+                "semantic_diff": semantic_diff,
                 "errors": file_errors,
                 "warnings": sorted(set(file_warnings)),
                 "infos": file_infos,
@@ -5897,6 +5912,134 @@ def read_jbeam_asset_source_text(source):
         return Path(source.path).read_text(encoding="utf-8-sig")
     with zipfile.ZipFile(source.zip_path, "r") as archive:
         return archive.read(source.zip_entry).decode("utf-8", errors="ignore")
+
+
+def read_jbeam_asset_source_bytes(source):
+    if source.asset_type == "file":
+        return Path(source.path).read_bytes()
+    with zipfile.ZipFile(source.zip_path, "r") as archive:
+        return archive.read(source.zip_entry)
+
+
+def jbeam_asset_source_sha256(source):
+    return hashlib.sha256(read_jbeam_asset_source_bytes(source)).hexdigest()
+
+
+def experimental_jbeam_meshes_for_virtual_path(scene, virtual_path):
+    normalized = normalize_virtual_path(virtual_path)
+    if not normalized:
+        return []
+    return [
+        obj
+        for obj in experimental_jbeam_mesh_objects(scene, active_only=False)
+        if normalize_virtual_path(obj.get("beamng_jbeam_path", "")) == normalized
+    ]
+
+
+def stale_source_checks_for_file_group(context, file_group, source):
+    if source is None:
+        return []
+    virtual_path = normalize_virtual_path(file_group.get("virtual_path", ""))
+    checks = []
+    try:
+        current_hash = jbeam_asset_source_sha256(source)
+    except Exception as exc:
+        return [
+            {
+                "status": "unknown",
+                "virtual_path": virtual_path,
+                "reason": f"Could not hash current source: {exc}",
+            }
+        ]
+
+    for obj in experimental_jbeam_meshes_for_virtual_path(context.scene, virtual_path):
+        cached_hash = str(obj.data.get("beamng_source_sha256", "") or "")
+        if not cached_hash:
+            continue
+        if cached_hash != current_hash:
+            checks.append(
+                {
+                    "status": "stale_external_data",
+                    "object": obj.name,
+                    "virtual_path": virtual_path,
+                    "cached_sha256": cached_hash,
+                    "current_sha256": current_hash,
+                    "action": "review_required_no_mutation",
+                }
+            )
+    return checks
+
+
+def semantic_diff_for_file_group(file_group):
+    diff = {
+        "node_updates": [],
+        "node_inserts": [],
+        "node_deletes": [],
+        "beam_inserts": [],
+        "beam_deletes": [],
+        "triangle_changes": [],
+        "change_count": 0,
+    }
+    for part_group in file_group.get("parts", []):
+        part_name = part_group.get("part", "")
+        for update in part_group.get("node_updates", []):
+            diff["node_updates"].append(
+                {
+                    "part": part_name,
+                    "node": update.get("node", ""),
+                    "old_position": update.get("old_position", []),
+                    "new_position": update.get("new_position", []),
+                }
+            )
+        for update in part_group.get("node_inserts", []):
+            diff["node_inserts"].append(
+                {"part": part_name, "node": update.get("node", ""), "position": update.get("new_position", [])}
+            )
+        for update in part_group.get("node_deletes", []):
+            diff["node_deletes"].append(
+                {"part": part_name, "node": update.get("node", ""), "position": update.get("old_position", [])}
+            )
+        for update in part_group.get("beam_inserts", []):
+            diff["beam_inserts"].append({"part": part_name, "nodes": update.get("nodes", [])})
+        for update in part_group.get("beam_deletes", []):
+            diff["beam_deletes"].append({"part": part_name, "nodes": update.get("nodes", [])})
+        for key, label in (
+            ("triangle_inserts", "insert"),
+            ("triangle_deletes", "delete"),
+            ("triangle_node_updates", "update"),
+            ("triangle_param_updates", "params"),
+        ):
+            for update in part_group.get(key, []):
+                diff["triangle_changes"].append(
+                    {"part": part_name, "operation": label, "nodes": update.get("nodes", update.get("old_nodes", []))}
+                )
+    diff["change_count"] = sum(len(value) for key, value in diff.items() if isinstance(value, list))
+    return diff
+
+
+def semantic_diff_summary_lines(diff):
+    lines = []
+    if not diff or not diff.get("change_count"):
+        return ["Semantic Diff: no JBeam topology or node edits"]
+    lines.append(f"Semantic Diff: {diff['change_count']} JBeam change(s)")
+    for update in diff.get("node_updates", []):
+        lines.append(
+            f"Node moved: {update.get('part', '')}.{update.get('node', '')} "
+            f"{update.get('old_position', [])} -> {update.get('new_position', [])}"
+        )
+    for update in diff.get("node_inserts", []):
+        lines.append(f"Node added: {update.get('part', '')}.{update.get('node', '')} at {update.get('position', [])}")
+    for update in diff.get("node_deletes", []):
+        lines.append(f"Node deleted: {update.get('part', '')}.{update.get('node', '')}")
+    for update in diff.get("beam_inserts", []):
+        lines.append(f"Beam added: {update.get('part', '')} {update.get('nodes', [])}")
+    for update in diff.get("beam_deletes", []):
+        lines.append(f"Beam deleted: {update.get('part', '')} {update.get('nodes', [])}")
+    for update in diff.get("triangle_changes", []):
+        lines.append(
+            f"Triangle {update.get('operation', '')}: {update.get('part', '')} {update.get('nodes', [])}"
+        )
+    return lines
 
 
 def write_text_without_newline_translation(path, text, encoding="utf-8"):
