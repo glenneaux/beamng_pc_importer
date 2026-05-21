@@ -3615,6 +3615,7 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
             original_edges = json.loads(mesh.get("beamng_edge_node_ids_json", "[]"))
             original_faces = json.loads(mesh.get("beamng_face_node_ids_json", "[]"))
             original_mesh_edges = json.loads(mesh.get("beamng_mesh_edge_node_ids_json", "[]"))
+            original_beam_key_to_guid = mesh_json_dict(mesh, "beamng_original_beam_key_to_topology_guid_json")
             topology_uids = ensure_experimental_topology_uids(obj, allow_write=True)
             edge_params = topology_params_for_current_elements(mesh, topology_uids.get("edges", []), "beamng_edge_params_json", "beamng_edge_uid_to_params_json", allow_write=True)
             committed_edge_params = topology_params_for_current_elements(mesh, topology_uids.get("edges", []), "beamng_edge_committed_params_json", "beamng_edge_uid_to_committed_params_json", allow_write=True)
@@ -3777,6 +3778,12 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
         created_face_keys = topology_delta_created_face_keys(topology_delta)
         candidate_new_edge_keys = created_edge_keys or (set(current_edge_by_key) - set(original_mesh_edge_by_key))
         candidate_new_face_keys = created_face_keys or (set(current_face_by_key) - set(original_face_by_key))
+        semantic_new_beam_keys = {
+            key
+            for key in set(current_edge_by_key) - set(original_edge_by_key)
+            if current_edge_semantic_by_key.get(key) == JBEAM_EDGE_SEMANTIC_BEAM
+        }
+        candidate_new_beam_keys = set(candidate_new_edge_keys) | semantic_new_beam_keys
         edge_params_by_key = params_by_topology_key(current_edges, edge_params)
         committed_edge_params_by_key = params_by_topology_key(current_edges, committed_edge_params)
         face_params_by_key = params_by_topology_key(current_faces, face_params)
@@ -3793,7 +3800,7 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
             "deleted_proxy_reference",
         )
 
-        for key in sorted(candidate_new_edge_keys & set(current_edge_by_key)):
+        for key in sorted(candidate_new_beam_keys & set(current_edge_by_key)):
             if current_edge_semantic_by_key.get(key) != JBEAM_EDGE_SEMANTIC_BEAM:
                 continue
             ids = current_edge_by_key[key]
@@ -3836,6 +3843,7 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
             ids = original_edge_by_key[key]
             if not all_nodes_owned_here(ids[:2]):
                 continue
+            retired_guid = original_beam_key_to_guid.get("|".join(key), "")
             mesh_changes.append(
                 {
                     "file": obj.get("beamng_jbeam_path", ""),
@@ -3848,6 +3856,8 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
                     "new": [],
                     "operation": "delete",
                     "source_object": obj.name,
+                    "retired_topology_guid": retired_guid,
+                    "tombstone": {"topology_guid": retired_guid, "kind": "beam"} if retired_guid else {},
                 }
             )
         existing_beam_deletes = {
@@ -3873,6 +3883,7 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
                     "operation": "delete",
                     "source_object": obj.name,
                     "reason": "deleted_node_reference",
+                    "retired_topology_guid": original_beam_key_to_guid.get("|".join(key), ""),
                 }
             )
         for key in sorted(candidate_new_face_keys & set(current_face_by_key)):

@@ -886,6 +886,7 @@ def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_
     beam_edges = []
     beam_edge_keys = {}
     beam_options_by_key = {}
+    beam_guid_by_key = {}
     for beam in part.beams:
         if beam.missing_nodes:
             continue
@@ -900,6 +901,7 @@ def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_
         beam_edges.append(edge)
         beam_edge_keys[edge_key] = beam
         beam_options_by_key[edge_key] = dict(beam.options or {})
+        beam_guid_by_key[tuple(sorted((str(beam.id1), str(beam.id2))))] = beam.topology_guid
 
     faces = []
     face_records = []
@@ -977,6 +979,9 @@ def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_
     mesh["beamng_node_committed_params_json"] = json.dumps([dict(node.options or {}) for node in part.nodes])
     mesh["beamng_mesh_edge_node_ids_json"] = json.dumps(edge_node_ids)
     mesh["beamng_edge_node_ids_json"] = json.dumps([[beam.id1, beam.id2] for beam in part.beams if not beam.missing_nodes])
+    mesh["beamng_original_beam_key_to_topology_guid_json"] = json.dumps(
+        {"|".join(key): value for key, value in beam_guid_by_key.items()}
+    )
     mesh["beamng_edge_params_json"] = json.dumps(mesh_edge_params)
     mesh["beamng_edge_committed_params_json"] = json.dumps(mesh_edge_params)
     mesh["beamng_face_node_ids_json"] = json.dumps(face_node_ids)
