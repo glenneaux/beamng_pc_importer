@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 131
+ADDON_BUILD = 132
 
 
 def addon_version_label():
@@ -8908,6 +8908,86 @@ class BEAMNG_OT_validate_jbeam_assembly(Operator):
         return {"FINISHED"}
 
 
+def authoring_workflow_report_lines(context):
+    scene = context.scene
+    counts = jbeam_counts_for_panel(context)
+    active_object = active_jbeam_assembly_part_object(scene)
+    active_name = str(scene.get("beamng_active_jbeam_part_name", "") or "")
+    part_count = len(experimental_jbeam_part_objects(scene))
+    slot_count = len(getattr(scene, "beamng_slot_editor_items", []) or [])
+    selected_nodes = experimental_jbeam_node_info_for_selection(context, limit=3)
+    selected_edges = experimental_jbeam_edge_info_for_selection(context, limit=3)
+    selected_faces = experimental_jbeam_face_info_for_selection(context, limit=3)
+    current_folder = user_current_folder_from_preferences(context)
+    export_root = (
+        current_folder / "mods" / "unpacked" / jbeam_export_mod_name(context) / "vehicles"
+        if current_folder is not None
+        else None
+    )
+    lines = [
+        "[BeamNG Authoring Workflow]",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "1. UI workflow",
+        f"- Active part: {active_name or '(none)'}",
+        f"- Active object: {active_object.name if active_object else '(none)'}",
+        f"- Assembly parts: {part_count}",
+        "",
+        "2. Slot authoring",
+        f"- Slot rows loaded: {slot_count}",
+        f"- Slot dirty: {bool(scene.get('beamng_slot_editor_dirty', False))}",
+        "- Current support: configuration slot choice apply/save plus new-part slot metadata draft.",
+        "- Remaining: full slot type/default/child-slot authoring workflow.",
+        "",
+        "3. Property inheritance",
+        f"- Selected nodes/edges/faces sampled: {len(selected_nodes)}/{len(selected_edges)}/{len(selected_faces)}",
+        "- Effective params shown in the selection panel are parsed/inherited context where available.",
+        "- Remaining: stronger section-scope inheritance model for every JBeam parameter family.",
+        "",
+        "4. Export review",
+        f"- Accepted operations: {counts['history']}",
+        f"- Export mod: {jbeam_export_mod_name(context)}",
+        f"- Export root: {export_root if export_root else '(BeamNG user folder not configured)'}",
+        "- Current support: validate, file selection, stage new files, quick export.",
+        "- Remaining: richer semantic diff/review window before every write.",
+        "",
+        "5. Validation",
+        f"- Missing refs: {counts['missing_refs']}",
+        f"- Proxy drift: {counts['proxy_drift']}",
+        f"- Dirty params: {counts['dirty_params']}",
+        "- Current support: active mesh health, assembly validation, export preflight.",
+        "- Remaining: diagnostic freshness/conflict UX and BeamNG-side smoke testing.",
+        "",
+        "6. Non-core JBeam semantics",
+        "- Hydros/sliders/props/flexbodies are visible/imported in existing workflows but not full semantic authoring targets.",
+        "- Remaining: rails/sliders/hydros/props/flexbodies editing PRD and data model.",
+        "",
+        "7. Refactor spine",
+        "- Current risk: many model/export/UI concerns still live in __init__.py.",
+        "- Remaining: extract model, import, export, validation, and UI modules after next stable checkpoint.",
+    ]
+    return lines
+
+
+class BEAMNG_OT_write_authoring_workflow_report(Operator):
+    bl_idname = "beamng_pc_importer.write_authoring_workflow_report"
+    bl_label = "Write Authoring Workflow Report"
+    bl_description = "Write a report summarizing the seven current completion/productization milestones"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        lines = authoring_workflow_report_lines(context)
+        text = bpy.data.texts.get("BeamNG Authoring Workflow") or bpy.data.texts.new("BeamNG Authoring Workflow")
+        text.clear()
+        text.write("\n".join(lines) + "\n")
+        report_path = persistent_cache_dir() / "jbeam_editor" / f"authoring_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        context.scene["beamng_jbeam_last_authoring_workflow_report_path"] = str(report_path)
+        self.report({"INFO"}, f"Wrote authoring workflow report: {report_path}")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_write_jbeam_edit_preview(Operator):
     bl_idname = "beamng_pc_importer.write_jbeam_edit_preview"
     bl_label = "Write JBeam Edit Preview"
@@ -10653,6 +10733,17 @@ class VIEW3D_PT_beamng_jbeam_health(Panel):
             row.label(text=f"{level}: {message}")
 
 
+class VIEW3D_PT_beamng_jbeam_workflow(Panel):
+    bl_label = "JBeam Workflow"
+    bl_idname = "VIEW3D_PT_beamng_jbeam_workflow"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "JBeam Workflow"
+
+    def draw(self, context):
+        draw_authoring_workflow_panel(self.layout, context)
+
+
 def draw_jbeam_export_mod_target_controls(layout, context, *, compact=False):
     target_box = layout if compact else layout.box()
     target_box.label(text="Working Mod Target", icon="FILE_FOLDER")
@@ -10681,6 +10772,57 @@ def draw_jbeam_export_mod_target_controls(layout, context, *, compact=False):
             target_box.label(text=f"{len(mod_names) - 8} more mod folder(s) hidden; use preferences for exact name.")
     elif current_folder is not None:
         target_box.label(text="No existing unpacked mod folders found.")
+
+
+def draw_authoring_workflow_panel(layout, context):
+    counts = jbeam_counts_for_panel(context)
+    part_count = len(experimental_jbeam_part_objects(context.scene))
+    slot_count = len(getattr(context.scene, "beamng_slot_editor_items", []) or [])
+    active_name = str(context.scene.get("beamng_active_jbeam_part_name", "") or "")
+
+    box = layout.box()
+    box.label(text="Authoring Workflow", icon="MODIFIER")
+    box.label(text=f"Active: {active_name or '(none)'} / parts: {part_count} / slots: {slot_count}")
+    box.label(text=f"Pending: {counts['pending']} / accepted: {counts['history']}")
+    row = box.row(align=True)
+    row.operator(IMPORT_OT_beamng_jbeam_topology.bl_idname, text="Import JBeam")
+    row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Use Selected Part")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_validate_jbeam_assembly.bl_idname, text="Validate Assembly")
+    row.operator(BEAMNG_OT_write_authoring_workflow_report.bl_idname, text="Workflow Report")
+
+    flow_box = layout.box()
+    flow_box.label(text="Milestones 1-7")
+    for label, state, icon in (
+        ("1 UI workflow: central authoring/status panel", "in place", "CHECKMARK"),
+        ("2 Slot authoring: choice/apply/save plus metadata draft", "partial", "INFO"),
+        ("3 Property inheritance: effective selected params shown", "partial", "INFO"),
+        ("4 Export review: validate/select/stage/quick export", "in place", "CHECKMARK"),
+        ("5 Validation: health, assembly, export preflight", "in place", "CHECKMARK"),
+        ("6 Non-core semantics: visible but not full authoring", "planned", "FILE_TEXT"),
+        ("7 Refactor spine: risk documented, pending extraction", "planned", "FILE_TEXT"),
+    ):
+        row = flow_box.row(align=True)
+        row.label(text=label, icon=icon)
+        row.label(text=state)
+
+    export_box = layout.box()
+    export_box.label(text="Review / Export")
+    draw_jbeam_export_mod_target_controls(export_box, context, compact=True)
+    row = export_box.row(align=True)
+    row.enabled = counts["history"] > 0
+    row.operator(BEAMNG_OT_validate_jbeam_export.bl_idname, text="Validate")
+    row.operator(BEAMNG_OT_stage_jbeam_user_override_copies.bl_idname, text="Review/Stage")
+    row = export_box.row(align=True)
+    row.enabled = counts["history"] > 0
+    row.operator(BEAMNG_OT_quick_export_jbeam_node_moves.bl_idname, text="Quick Export")
+
+    next_box = layout.box()
+    next_box.label(text="Known Remaining Product Work")
+    next_box.label(text="Slot type/default/child-slot editor")
+    next_box.label(text="Hydro/slider/rail/prop/flexbody authoring")
+    next_box.label(text="Richer semantic diff and verified export flow")
+    next_box.label(text="Module extraction from __init__.py")
 
 
 class VIEW3D_PT_beamng_jbeam_export(Panel):
@@ -12336,6 +12478,7 @@ classes = (
     BEAMNG_OT_create_jbeam_export_mod_folder,
     BEAMNG_OT_set_jbeam_export_mod_folder,
     BEAMNG_OT_validate_jbeam_assembly,
+    BEAMNG_OT_write_authoring_workflow_report,
     BEAMNG_OT_write_jbeam_edit_preview,
     BEAMNG_OT_write_jbeam_node_patch_draft,
     BEAMNG_OT_write_jbeam_override_export_plan,
@@ -12358,6 +12501,7 @@ classes = (
     VIEW3D_PT_beamng_pc_importer,
     VIEW3D_PT_beamng_jbeam_edit,
     VIEW3D_PT_beamng_jbeam_health,
+    VIEW3D_PT_beamng_jbeam_workflow,
     VIEW3D_PT_beamng_jbeam_export,
     VIEW3D_PT_beamng_advanced,
     SCENE_PT_beamng_configuration_editor,
