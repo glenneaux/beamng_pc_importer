@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 128
+ADDON_BUILD = 129
 
 
 def addon_version_label():
@@ -2198,6 +2198,76 @@ def add_proxy_nodes_to_experimental_mesh(context, target_obj, sources):
     mesh["beamng_node_uid_to_committed_params_json"] = json.dumps(uid_to_committed_params)
     ensure_experimental_mesh_identity(target_obj, context.scene, allow_write=True)
     return {"added": len(sources_to_add), "skipped": len(sources) - len(sources_to_add)}
+
+
+def experimental_node_index_by_id(obj, node_id, allowed_kinds=None):
+    identity = ensure_experimental_mesh_identity(obj, bpy.context.scene, allow_write=False)
+    node_id = str(node_id)
+    node_ids = [str(value) for value in identity.get("node_ids", [])]
+    node_kinds = [str(value or "owned") for value in identity.get("node_kinds", [])]
+    for index, candidate in enumerate(node_ids):
+        if candidate != node_id:
+            continue
+        if allowed_kinds and (index >= len(node_kinds) or node_kinds[index] not in allowed_kinds):
+            continue
+        return index
+    return -1
+
+
+def create_or_mark_jbeam_beam_between_indices(obj, scene, index_a, index_b):
+    if index_a < 0 or index_b < 0 or index_a == index_b:
+        return {"created_edge": False, "marked": False, "key": ()}
+    identity = ensure_experimental_mesh_identity(obj, scene, allow_write=True)
+    node_ids = identity.get("node_ids", [])
+    if index_a >= len(node_ids) or index_b >= len(node_ids):
+        return {"created_edge": False, "marked": False, "key": ()}
+    import bmesh
+
+    mesh = obj.data
+    created_edge = False
+    if obj.mode == "EDIT":
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.edges.ensure_lookup_table()
+        verts = [edit_mesh.verts[index_a], edit_mesh.verts[index_b]]
+        try:
+            edge = edit_mesh.edges.new(verts)
+            created_edge = True
+        except ValueError:
+            edge = None
+        for vertex in edit_mesh.verts:
+            vertex.select = False
+        for vertex in verts:
+            vertex.select = True
+        if edge is not None:
+            edge.select = True
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+    else:
+        edit_mesh = bmesh.new()
+        edit_mesh.from_mesh(mesh)
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.edges.ensure_lookup_table()
+        verts = [edit_mesh.verts[index_a], edit_mesh.verts[index_b]]
+        try:
+            edit_mesh.edges.new(verts)
+            created_edge = True
+        except ValueError:
+            pass
+        edit_mesh.to_mesh(mesh)
+        edit_mesh.free()
+        mesh.update()
+
+    key = edge_key((node_ids[index_a], node_ids[index_b]))
+    existing = {
+        tuple(str(item) for item in item_key)
+        for item_key in mesh_json_list(mesh, "beamng_explicit_beam_edge_keys_json")
+        if isinstance(item_key, (list, tuple)) and len(item_key) >= 2
+    }
+    before_count = len(existing)
+    existing.add(key)
+    mesh["beamng_explicit_beam_edge_keys_json"] = json.dumps([list(item_key) for item_key in sorted(existing)])
+    ensure_experimental_mesh_identity(obj, scene, allow_write=True)
+    return {"created_edge": created_edge, "marked": len(existing) != before_count, "key": key}
 
 
 def mesh_json_list(mesh, key, fallback=None):
@@ -8052,6 +8122,71 @@ class BEAMNG_OT_import_marked_nodes_as_proxies(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_create_crossbeam_to_marked_node(Operator):
+    bl_idname = "beamng_pc_importer.create_crossbeam_to_marked_node"
+    bl_label = "Crossbeam To Marked Node"
+    bl_description = "Create/reuse a proxy from one marked external node and create a JBeam beam from the selected owned node"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        target_obj = active_experimental_jbeam_mesh(context)
+        if target_obj is None or target_obj.type != "MESH" or target_obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+            self.report({"WARNING"}, "Activate target JBeam mesh first")
+            return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, target_obj):
+            return {"CANCELLED"}
+        selected_indices = selected_experimental_jbeam_vertex_indices(target_obj)
+        if len(selected_indices) != 1:
+            self.report({"WARNING"}, "Select exactly one owned node in the Active Part")
+            return {"CANCELLED"}
+        identity = ensure_experimental_mesh_identity(target_obj, context.scene, allow_write=True)
+        node_kinds = identity.get("node_kinds", [])
+        local_index = selected_indices[0]
+        if local_index >= len(node_kinds) or str(node_kinds[local_index]) != "owned":
+            self.report({"WARNING"}, "Selected Active Part node must be owned, not proxy")
+            return {"CANCELLED"}
+        marked = proxy_clipboard_nodes(context.scene)
+        if len(marked) != 1:
+            self.report({"WARNING"}, "Mark exactly one external node first")
+            return {"CANCELLED"}
+        external = marked[0]
+        external_node_id = str(external.get("node_id", "") or "")
+        if not external_node_id:
+            self.report({"WARNING"}, "Marked node has no node id")
+            return {"CANCELLED"}
+        owner_part_id = int(external.get("owner_part_id", -1) or -1)
+        active_part_id = int(target_obj.get("beamng_resolved_part_id", -1) or -1)
+        if owner_part_id == active_part_id:
+            self.report({"WARNING"}, "Marked node belongs to the Active Part; use Beam 2 for local beams")
+            return {"CANCELLED"}
+        try:
+            position = Vector(external.get("world_position", []))
+        except Exception:
+            position = Vector()
+        if len(position) != 3:
+            self.report({"WARNING"}, "Marked node has no valid world position")
+            return {"CANCELLED"}
+        add_proxy_nodes_to_experimental_mesh(
+            context,
+            target_obj,
+            [{
+                "node_id": external_node_id,
+                "world_position": position,
+                "owner_part_id": owner_part_id,
+                "source_object": str(external.get("source_object", "")),
+            }],
+        )
+        proxy_index = experimental_node_index_by_id(target_obj, external_node_id, {"proxy"})
+        if proxy_index < 0:
+            self.report({"ERROR"}, "Could not create or find proxy node")
+            return {"CANCELLED"}
+        result = create_or_mark_jbeam_beam_between_indices(target_obj, context.scene, local_index, proxy_index)
+        key = result.get("key", ())
+        semantic_topology_snapshot_for_object(target_obj, context.scene, allow_write=True)
+        self.report({"INFO"}, f"Created crossbeam: {key[0]} -> {key[1]}" if key else "Created crossbeam")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_clear_marked_proxy_nodes(Operator):
     bl_idname = "beamng_pc_importer.clear_marked_proxy_nodes"
     bl_label = "Clear Marked Nodes"
@@ -8582,6 +8717,110 @@ class BEAMNG_OT_clear_jbeam_edit_session(Operator):
             {"INFO"},
             f"Cleared {previous_count} accepted and {pending_count} pending JBeam edit operation(s)",
         )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_create_jbeam_export_mod_folder(Operator):
+    bl_idname = "beamng_pc_importer.create_jbeam_export_mod_folder"
+    bl_label = "Create Export Mod Folder"
+    bl_description = "Create the configured current/mods/unpacked/<mod>/vehicles folder if it does not exist"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        current_folder = user_current_folder_from_preferences(context)
+        if current_folder is None:
+            self.report({"ERROR"}, "Set BeamNG user folder in add-on preferences first")
+            return {"CANCELLED"}
+        mod_name = jbeam_export_mod_name(context)
+        if not mod_name:
+            self.report({"ERROR"}, "Set a JBeam export mod folder name first")
+            return {"CANCELLED"}
+        target = current_folder / "mods" / "unpacked" / mod_name / "vehicles"
+        target.mkdir(parents=True, exist_ok=True)
+        context.scene["beamng_jbeam_last_export_mod_folder_path"] = str(target)
+        self.report({"INFO"}, f"Ready export mod folder: {target}")
+        return {"FINISHED"}
+
+
+def assembly_validation_report(context):
+    scene = context.scene
+    objects = experimental_jbeam_part_objects(scene)
+    lines = [
+        "[BeamNG Assembly Validation]",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"Assembly parts: {len(objects)}",
+        f"Active part: {scene.get('beamng_active_jbeam_part_name', '') or '(none)'}",
+        f"Export mod: {jbeam_export_mod_name(context)}",
+        "",
+    ]
+    issues = []
+    if not objects:
+        issues.append("No imported JBeam topology parts are loaded.")
+    if objects and not scene.get("beamng_active_jbeam_part_key", ""):
+        issues.append("No Active Part is selected.")
+    current_folder = user_current_folder_from_preferences(context)
+    if current_folder is None:
+        issues.append("BeamNG user folder is not configured.")
+    else:
+        export_root = current_folder / "mods" / "unpacked" / jbeam_export_mod_name(context) / "vehicles"
+        lines.append(f"JBeam asset export root: {export_root}")
+    if getattr(scene, "beamng_slot_editor_items", None):
+        lines.append(f"Slot rows loaded: {len(scene.beamng_slot_editor_items)}")
+        if scene.get("beamng_slot_editor_dirty", False):
+            issues.append("Slot editor has unapplied/unsaved dirty changes; assembly may require reload.")
+    else:
+        lines.append("Slot rows loaded: 0")
+    lines.append("")
+    lines.append("Parts:")
+    for obj in objects:
+        lines.append(
+            f"- {obj.get('beamng_part_name', obj.name)} | "
+            f"source={normalize_virtual_path(obj.get('beamng_jbeam_path', '')) or '(unknown)'} | "
+            f"owned={int(obj.get('beamng_owned_node_count', 0) or 0)} | "
+            f"proxy={int(obj.get('beamng_proxy_node_count', 0) or 0)} | "
+            f"state={obj.get('beamng_active_part_state', '') or 'unknown'}"
+        )
+    history = jbeam_operation_history(scene)
+    grouped = defaultdict(lambda: defaultdict(int))
+    for operation in history:
+        grouped[str(operation.get("source_file", "") or "(unknown)")][str(operation.get("type", "update"))] += 1
+    lines.append("")
+    lines.append("Accepted edit groups:")
+    if grouped:
+        for source_file, counts in sorted(grouped.items()):
+            summary = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            lines.append(f"- {source_file}: {summary}")
+    else:
+        lines.append("- none")
+    lines.append("")
+    if issues:
+        lines.append("Issues:")
+        for issue in issues:
+            lines.append(f"- {issue}")
+    else:
+        lines.append("Issues: none")
+    return {"status": "blocked" if issues else "ok", "issues": issues, "lines": lines}
+
+
+class BEAMNG_OT_validate_jbeam_assembly(Operator):
+    bl_idname = "beamng_pc_importer.validate_jbeam_assembly"
+    bl_label = "Validate Assembly"
+    bl_description = "Write an assembly-level validation and semantic edit grouping report"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        report = assembly_validation_report(context)
+        text = bpy.data.texts.get("BeamNG Assembly Validation") or bpy.data.texts.new("BeamNG Assembly Validation")
+        text.clear()
+        text.write("\n".join(report["lines"]))
+        text.write("\n")
+        report_path = persistent_cache_dir() / "jbeam_editor" / f"assembly_validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("\n".join(report["lines"]) + "\n", encoding="utf-8")
+        context.scene["beamng_jbeam_last_assembly_validation_path"] = str(report_path)
+        context.scene["beamng_jbeam_last_assembly_validation_status"] = report["status"]
+        level = {"WARNING"} if report["status"] == "blocked" else {"INFO"}
+        self.report(level, f"Assembly validation: {report['status']}")
         return {"FINISHED"}
 
 
@@ -9979,6 +10218,13 @@ def draw_jbeam_assembly_part_controls(layout, context):
     row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Use Selected")
     clear = row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Clear")
     clear.clear = True
+    box.operator(BEAMNG_OT_validate_jbeam_assembly.bl_idname, text="Validate Assembly")
+    slot_count = len(getattr(context.scene, "beamng_slot_editor_items", []) or [])
+    if slot_count:
+        slot_state = "dirty; apply/save or reload assembly" if context.scene.get("beamng_slot_editor_dirty", False) else "loaded"
+        box.label(text=f"Slot context: {slot_count} row(s), {slot_state}")
+    else:
+        box.label(text="Slot context: none loaded")
     if active_mesh and active_key and not active_part_allows_topology_edit(context, active_mesh):
         box.label(text="Selected mesh is reference-only while another part is active.", icon="LOCKED")
     objects = experimental_jbeam_part_objects(context.scene)
@@ -10032,6 +10278,7 @@ def draw_jbeam_topology_tools(layout, context, active_mesh):
     row = box.row(align=True)
     row.operator(BEAMNG_OT_mark_selected_nodes_for_proxy_import.bl_idname, text="Mark Nodes")
     row.operator(BEAMNG_OT_import_marked_nodes_as_proxies.bl_idname, text="Import Marked Nodes")
+    box.operator(BEAMNG_OT_create_crossbeam_to_marked_node.bl_idname, text="Crossbeam To Marked Node")
     row = box.row(align=True)
     op = row.operator(BEAMNG_OT_mark_selected_nodes_for_proxy_import.bl_idname, text="Append Marks")
     op.append = True
@@ -10334,6 +10581,7 @@ class VIEW3D_PT_beamng_jbeam_export(Panel):
         history_count = int(context.scene.get("beamng_jbeam_operation_history_count", 0))
         layout.label(text=f"Export mod: {jbeam_export_mod_name(context)}")
         layout.label(text="Target: current/mods/unpacked/<mod>/vehicles")
+        layout.operator(BEAMNG_OT_create_jbeam_export_mod_folder.bl_idname, text="Create/Verify Export Mod Folder")
         row = layout.row(align=True)
         row.enabled = history_count > 0
         row.operator(BEAMNG_OT_validate_jbeam_export.bl_idname, text="Validate")
@@ -10444,6 +10692,10 @@ class VIEW3D_PT_beamng_advanced(Panel):
         box.separator()
         box.label(text=f"Export mod: {jbeam_export_mod_name(context)}")
         box.label(text="JBeam target: current/mods/unpacked/<mod>/vehicles")
+        box.operator(BEAMNG_OT_create_jbeam_export_mod_folder.bl_idname, text="Create/Verify Export Mod Folder")
+        last_mod_path = context.scene.get("beamng_jbeam_last_export_mod_folder_path", "")
+        if last_mod_path:
+            box.label(text=f"Export folder: {Path(last_mod_path).name}")
         row = box.row(align=True)
         row.enabled = history_count > 0
         row.operator(BEAMNG_OT_validate_jbeam_export.bl_idname, text="Validate Export")
@@ -11955,6 +12207,7 @@ classes = (
     BEAMNG_OT_import_selected_nodes_as_proxies,
     BEAMNG_OT_mark_selected_nodes_for_proxy_import,
     BEAMNG_OT_import_marked_nodes_as_proxies,
+    BEAMNG_OT_create_crossbeam_to_marked_node,
     BEAMNG_OT_clear_marked_proxy_nodes,
     BEAMNG_OT_clear_unused_proxy_nodes,
     BEAMNG_OT_clear_orphan_provisional_nodes,
@@ -11970,6 +12223,8 @@ classes = (
     BEAMNG_OT_apply_selected_jbeam_triangle_properties,
     BEAMNG_OT_load_selected_jbeam_triangle_properties,
     BEAMNG_OT_clear_jbeam_edit_session,
+    BEAMNG_OT_create_jbeam_export_mod_folder,
+    BEAMNG_OT_validate_jbeam_assembly,
     BEAMNG_OT_write_jbeam_edit_preview,
     BEAMNG_OT_write_jbeam_node_patch_draft,
     BEAMNG_OT_write_jbeam_override_export_plan,
