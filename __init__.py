@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 123
+ADDON_BUILD = 124
 
 
 def addon_version_label():
@@ -10999,6 +10999,67 @@ def jbeam_topology_import_part_items(self, _context):
     return items
 
 
+def jbeam_import_diagnostic_key(diagnostic):
+    return (
+        str(getattr(diagnostic, "level", "")),
+        str(getattr(diagnostic, "code", "")),
+        str(getattr(diagnostic, "part_name", "")),
+        str(getattr(diagnostic, "section", "")),
+        str(getattr(diagnostic, "message", "")),
+    )
+
+
+def filtered_jbeam_import_diagnostics(diagnostics, selected_part_name=""):
+    if not selected_part_name:
+        return list(diagnostics)
+    filtered = []
+    seen = set()
+    for diagnostic in diagnostics:
+        part_name = str(getattr(diagnostic, "part_name", ""))
+        if part_name not in {"", selected_part_name}:
+            continue
+        key = jbeam_import_diagnostic_key(diagnostic)
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(diagnostic)
+    return filtered
+
+
+def jbeam_import_diagnostic_counts(diagnostics):
+    counts = defaultdict(int)
+    for diagnostic in diagnostics:
+        level = str(getattr(diagnostic, "level", "") or "unknown")
+        code = str(getattr(diagnostic, "code", "") or "unknown")
+        counts[(level, code)] += 1
+    return counts
+
+
+def write_jbeam_import_diagnostic_log(text, diagnostics, sample_limit=8):
+    counts = jbeam_import_diagnostic_counts(diagnostics)
+    text.write("\nDiagnostic summary:\n")
+    if not counts:
+        text.write("- none\n")
+        return
+    for (level, code), count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        text.write(f"- {level}: {code}: {count}\n")
+
+    text.write("\nDiagnostic samples:\n")
+    shown_by_code = defaultdict(int)
+    for diagnostic in diagnostics:
+        key = (str(getattr(diagnostic, "level", "")), str(getattr(diagnostic, "code", "")))
+        if shown_by_code[key] >= sample_limit:
+            continue
+        shown_by_code[key] += 1
+        text.write(
+            f"- {getattr(diagnostic, 'level', '')}: "
+            f"{getattr(diagnostic, 'code', '')}: "
+            f"part={getattr(diagnostic, 'part_name', '')} "
+            f"section={getattr(diagnostic, 'section', '')}: "
+            f"{getattr(diagnostic, 'message', diagnostic)}\n"
+        )
+
+
 def filter_imported_jbeam_topology_parts(imported, selection):
     if selection == "__ALL__":
         return imported, ""
@@ -11012,6 +11073,7 @@ def filter_imported_jbeam_topology_parts(imported, selection):
     if index < 0 or index >= len(imported.parts):
         return imported, "Selected JBeam part no longer exists"
     imported.parts = [imported.parts[index]]
+    imported.diagnostics = filtered_jbeam_import_diagnostics(imported.diagnostics, names[index])
     return imported, names[index]
 
 
@@ -11128,6 +11190,7 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
         text.write(f"Parts: {len(imported.parts)}\n")
         text.write(f"Objects: {created}\n")
         text.write(f"Collection: {mesh_collection.name}\n")
+        write_jbeam_import_diagnostic_log(text, imported.diagnostics)
         text.write("\nDiagnostics:\n")
         for diagnostic in imported.diagnostics:
             text.write(
@@ -11137,6 +11200,19 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
             )
 
         warning_count = sum(1 for diagnostic in imported.diagnostics if getattr(diagnostic, "level", "") == "warning")
+        info_count = sum(1 for diagnostic in imported.diagnostics if getattr(diagnostic, "level", "") == "info")
+        error_count = sum(1 for diagnostic in imported.diagnostics if getattr(diagnostic, "level", "") == "error")
+        print(
+            "[BeamNG JBeam Import] "
+            f"source={filepath} selection={context.scene['beamng_last_direct_jbeam_import_part_filter']} "
+            f"parts={len(imported.parts)} objects={created} "
+            f"errors={error_count} warnings={warning_count} infos={info_count}"
+        )
+        for (level, code), count in sorted(
+            jbeam_import_diagnostic_counts(imported.diagnostics).items(),
+            key=lambda item: (-item[1], item[0]),
+        ):
+            print(f"[BeamNG JBeam Import] diagnostic {level}:{code} count={count}")
         if warning_count:
             self.report({"WARNING"}, f"Imported {len(imported.parts)} JBeam part(s) with {warning_count} warning(s)")
         else:
