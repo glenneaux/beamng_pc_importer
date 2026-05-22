@@ -137,6 +137,10 @@ def rounded_position_tuple(position, precision=JBEAM_POSITION_PRECISION):
     return tuple(round(float(value), precision) for value in position)
 
 
+def preserved_position_tuple(position):
+    return tuple(float(value) for value in position)
+
+
 def create_jbeam_nodes_object(nodes, collection, part_name="", resolved_part_id=-1, color=None):
     if not nodes:
         return None
@@ -687,7 +691,7 @@ def create_experimental_jbeam_meshes(nodes, beams, triangles, parent_collection,
                 return vertex_index_by_node_id[node_id]
             vertex_index = len(vertex_positions)
             vertex_index_by_node_id[node_id] = vertex_index
-            vertex_positions.append(rounded_position_tuple(position))
+            vertex_positions.append(preserved_position_tuple(position))
             vertex_node_ids.append(node_id)
             vertex_options.append(dict(local_node_options.get(node_id, {})))
             if node_id in local_node_ids:
@@ -879,7 +883,7 @@ def create_imported_jbeam_topology_meshes(imported_jbeam, parent_collection):
 
 
 def create_imported_jbeam_part_mesh(part, imported_jbeam, mesh_collection, part_index, color):
-    vertex_positions = [rounded_position_tuple(node.position) for node in part.nodes]
+    vertex_positions = [preserved_position_tuple(node.position) for node in part.nodes]
     vertex_node_ids = [node.node_id for node in part.nodes]
     vertex_index_by_node_id = {node_id: index for index, node_id in enumerate(vertex_node_ids)}
 

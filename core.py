@@ -1525,6 +1525,16 @@ def _row_spans_for_section(text, lines, line_ranges, section_span):
     return rows
 
 
+def jbeam_decimal_places(value):
+    text = str(value).strip()
+    if not text or "e" in text.lower():
+        return 0
+    if "." not in text:
+        return 0
+    fractional = text.split(".", 1)[1]
+    return len(fractional)
+
+
 def import_jbeam_topology_subset_part(
     part_name,
     part_data,
@@ -1640,15 +1650,15 @@ def _import_topology_subset_nodes(part_name, rows, diagnostics, coordinate_preci
             coerce_number(row[2], 0.0),
             coerce_number(row[3], 0.0),
         )
-        rounded_position = rounded_jbeam_import_position(original_position, coordinate_precision)
-        if rounded_position != original_position:
+        source_precision = max(jbeam_decimal_places(row[1]), jbeam_decimal_places(row[2]), jbeam_decimal_places(row[3]))
+        if source_precision > int(coordinate_precision):
             diagnostics.append(
                 JBeamImportDiagnostic(
-                    level="info",
-                    code="node_position_normalized",
+                    level="warning",
+                    code="node_precision_exceeds_project",
                     message=(
-                        f"Node '{row[0]}' coordinates normalized to "
-                        f"{coordinate_precision} decimal place(s)"
+                        f"Node '{row[0]}' uses {source_precision} decimal place(s), "
+                        f"above project precision {coordinate_precision}; coordinates preserved on import"
                     ),
                     part_name=part_name,
                     section="nodes",
@@ -1657,7 +1667,7 @@ def _import_topology_subset_nodes(part_name, rows, diagnostics, coordinate_preci
         nodes.append(
             ImportedJBeamNode(
                 node_id=str(row[0]),
-                position=rounded_position,
+                position=original_position,
                 original_position=original_position,
                 topology_guid=_new_internal_guid(),
                 options=jbeam_option_metadata(options),

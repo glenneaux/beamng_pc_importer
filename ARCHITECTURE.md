@@ -196,7 +196,9 @@ Unknown parameters should remain visible and inspectable even before the editor 
 
 Use a mutable working model plus explicit change tracking.
 
-Positions for objects and nodes should generally be treated at three decimal places of precision. Scanning, comparison, display, change records, and eventual export should avoid noisy sub-millimetre churn unless a specific BeamNG field proves it needs more precision.
+Positions for objects and nodes should use a project precision preference, defaulting to three decimal places. Import must preserve source coordinates rather than normalizing silently. If imported data uses more decimal places than the current project setting, the editor should warn and offer to raise the project precision to match so later exports do not lose detail.
+
+A future explicit normalization tool should support normalizing coordinates by selected part or globally. Normalization must be user-triggered and previewable, not an automatic side effect of import.
 
 Each meaningful edit should record:
 

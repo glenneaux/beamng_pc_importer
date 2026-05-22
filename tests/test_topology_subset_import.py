@@ -154,7 +154,7 @@ def test_topology_subset_does_not_inject_guids_into_cached_source(topology_subse
     assert part.nodes[0].topology_guid not in imported.cached_source["decoded_text"]
 
 
-def test_topology_subset_normalizes_editable_coordinates_at_project_precision():
+def test_topology_subset_preserves_high_precision_coordinates_and_warns():
     source = """
     {
         "precision_part": {
@@ -173,6 +173,6 @@ def test_topology_subset_normalizes_editable_coordinates_at_project_precision():
 
     assert imported.coordinate_precision == 3
     assert node.original_position == (1.23456, -0.0004, 2.0)
-    assert node.position == (1.235, -0.0, 2.0)
+    assert node.position == (1.23456, -0.0004, 2.0)
     assert addon.formatted_jbeam_import_position(node.position) == ["1.235", "0", "2"]
-    assert any(diagnostic.code == "node_position_normalized" for diagnostic in imported.diagnostics)
+    assert any(diagnostic.code == "node_precision_exceeds_project" for diagnostic in imported.diagnostics)

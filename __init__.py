@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 124
+ADDON_BUILD = 125
 
 
 def addon_version_label():
@@ -3332,6 +3332,30 @@ def formatted_jbeam_position_number(value, precision=JBEAM_POSITION_PRECISION):
     return f"{rounded:.{precision}f}"
 
 
+def jbeam_decimal_places(value):
+    text = str(value).strip()
+    if not text or "e" in text.lower() or "." not in text:
+        return 0
+    return len(text.split(".", 1)[1])
+
+
+def jbeam_project_position_precision(context=None):
+    prefs = get_addon_preferences(context or bpy.context)
+    if prefs is None:
+        return JBEAM_POSITION_PRECISION
+    try:
+        return max(0, min(12, int(getattr(prefs, "jbeam_position_precision", JBEAM_POSITION_PRECISION))))
+    except (TypeError, ValueError):
+        return JBEAM_POSITION_PRECISION
+
+
+def set_jbeam_project_position_precision(context, precision):
+    prefs = get_addon_preferences(context)
+    if prefs is None:
+        return
+    prefs.jbeam_position_precision = max(0, min(12, int(precision)))
+
+
 def coerce_jbeam_param_value(value):
     if isinstance(value, bool):
         return value
@@ -6271,7 +6295,10 @@ def apply_node_updates_to_jbeam_text(source_text, file_group):
         part_name = part_group.get("part", "")
         for update in part_group.get("node_updates", []):
             node_id = str(update.get("node", ""))
-            new_position = rounded_position_list(update.get("new_position", []))
+            try:
+                new_position = [float(value) for value in update.get("new_position", [])]
+            except (TypeError, ValueError):
+                new_position = []
             if len(new_position) != 3:
                 skipped.append({"part": part_name, "node": node_id, "reason": "New position is not xyz"})
                 continue
@@ -6300,13 +6327,20 @@ def apply_node_updates_to_jbeam_text(source_text, file_group):
 
             line_index, _line_body, newline, match = matches[0]
             old_position = rounded_position_list([match.group("x"), match.group("y"), match.group("z")])
+            source_precision = max(
+                jbeam_decimal_places(match.group("x")),
+                jbeam_decimal_places(match.group("y")),
+                jbeam_decimal_places(match.group("z")),
+            )
+            precision = max(JBEAM_POSITION_PRECISION, source_precision)
+            new_position = rounded_position_list(new_position, precision)
             replacement = (
                 match.group("prefix")
-                + formatted_jbeam_position_number(new_position[0])
+                + formatted_jbeam_position_number(new_position[0], precision)
                 + match.group("after_x")
-                + formatted_jbeam_position_number(new_position[1])
+                + formatted_jbeam_position_number(new_position[1], precision)
                 + match.group("after_y")
-                + formatted_jbeam_position_number(new_position[2])
+                + formatted_jbeam_position_number(new_position[2], precision)
                 + match.group("suffix")
                 + newline
             )
@@ -10070,9 +10104,9 @@ class VIEW3D_PT_beamng_advanced(Panel):
 
         box = layout.box()
         box.label(text="JBeam Session")
-        precision = int(context.scene.get("beamng_jbeam_position_precision", JBEAM_POSITION_PRECISION))
-        if context.scene.get("beamng_jbeam_positions_rounded_on_import", False):
-            box.label(text=f"Node positions rounded to {precision} decimals on import", icon="INFO")
+        precision = jbeam_project_position_precision(context)
+        box.label(text=f"Project/export precision: {precision} decimal place(s)", icon="INFO")
+        box.label(text="Import preserves higher source precision; normalization will be explicit.")
         pending_count = int(context.scene.get("beamng_jbeam_pending_node_move_count", 0))
         pending_topology_count = int(context.scene.get("beamng_jbeam_pending_topology_change_count", 0))
         restored_count = int(context.scene.get("beamng_jbeam_restored_proxy_move_count", 0))
@@ -10454,6 +10488,16 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         description="Draw colored overlay points/edges for owned nodes, proxy nodes, beams, triangle boundaries, and relationship edges",
         default=True,
     )
+    jbeam_position_precision: IntProperty(
+        name="JBeam Project Decimal Places",
+        description=(
+            "Default decimal places for newly authored/exported JBeam coordinates. Imports preserve higher source "
+            "precision and can raise this setting when accepted"
+        ),
+        default=JBEAM_POSITION_PRECISION,
+        min=0,
+        max=12,
+    )
     jbeam_export_mod_name: StringProperty(
         name="JBeam Export Mod Folder",
         description="Folder under BeamNG user current/mods/unpacked used for staged JBeam overrides",
@@ -10470,6 +10514,7 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         layout.prop(self, "auto_scan_jbeam_edits")
         layout.prop(self, "show_proxy_node_overlay")
         layout.prop(self, "show_jbeam_semantic_overlay")
+        layout.prop(self, "jbeam_position_precision")
         layout.prop(self, "jbeam_export_mod_name")
 
 
@@ -10782,13 +10827,12 @@ def import_beamng_pc_path(
             )
             report_lines.append(f"Experimental JBeam mesh parts: {experimental_mesh_count}")
             report_lines.append(
-                f"Experimental JBeam mesh node positions were rounded to {JBEAM_POSITION_PRECISION} decimal places on import."
+                f"Experimental JBeam mesh node positions preserve source coordinates on import. "
+                f"Project/export precision is {jbeam_project_position_precision(context)} decimal places."
             )
-            context.scene["beamng_jbeam_position_precision"] = JBEAM_POSITION_PRECISION
-            context.scene["beamng_jbeam_positions_rounded_on_import"] = True
             operator.report(
                 {"INFO"},
-                f"Experimental JBeam mesh node positions rounded to {JBEAM_POSITION_PRECISION} decimal places",
+                f"Experimental JBeam mesh node positions preserve source precision; export precision {jbeam_project_position_precision(context)}",
             )
         vehicle_model = str(pc_data.get("model", ""))
 
@@ -11035,6 +11079,17 @@ def jbeam_import_diagnostic_counts(diagnostics):
     return counts
 
 
+def max_precision_from_jbeam_import_diagnostics(diagnostics):
+    max_precision = 0
+    for diagnostic in diagnostics:
+        if str(getattr(diagnostic, "code", "")) != "node_precision_exceeds_project":
+            continue
+        match = re.search(r"uses\s+(\d+)\s+decimal", str(getattr(diagnostic, "message", "")))
+        if match:
+            max_precision = max(max_precision, int(match.group(1)))
+    return max_precision
+
+
 def write_jbeam_import_diagnostic_log(text, diagnostics, sample_limit=8):
     counts = jbeam_import_diagnostic_counts(diagnostics)
     text.write("\nDiagnostic summary:\n")
@@ -11095,6 +11150,7 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
         items=jbeam_topology_import_part_items,
     )
     part_selection_confirmed: BoolProperty(default=False, options={"HIDDEN"})
+    precision_confirmed: BoolProperty(default=False, options={"HIDDEN"})
 
     def draw(self, context):
         self.layout.prop(self, "clear_existing")
@@ -11105,9 +11161,18 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
             self.layout.prop(self, "part_selection")
         elif len(names) == 1:
             self.layout.label(text=f"Part: {names[0]}")
+        source_precision = int(context.scene.get("beamng_pending_import_source_precision", 0) or 0)
+        project_precision = jbeam_project_position_precision(context)
+        if source_precision > project_precision:
+            self.layout.separator()
+            self.layout.label(text="High precision coordinates found", icon="ERROR")
+            self.layout.label(text=f"Source uses up to {source_precision} decimal place(s).")
+            self.layout.label(text=f"Current project setting is {project_precision}.")
+            self.layout.label(text="OK imports and raises project precision to match.")
 
     def invoke(self, context, event):
         self.part_selection_confirmed = False
+        self.precision_confirmed = False
         self.part_selection = "__ALL__"
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
@@ -11123,12 +11188,25 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
             self.part_selection_confirmed = True
             return context.window_manager.invoke_props_dialog(self, width=420)
 
-        imported = import_jbeam_topology_subset(filepath)
+        imported = import_jbeam_topology_subset(
+            filepath,
+            coordinate_precision=jbeam_project_position_precision(context),
+        )
         imported, selected_part_name = filter_imported_jbeam_topology_parts(imported, self.part_selection)
         if selected_part_name:
             context.scene["beamng_last_direct_jbeam_import_part_filter"] = selected_part_name
         else:
             context.scene["beamng_last_direct_jbeam_import_part_filter"] = "All parts"
+
+        source_precision = max_precision_from_jbeam_import_diagnostics(imported.diagnostics)
+        project_precision = jbeam_project_position_precision(context)
+        context.scene["beamng_pending_import_source_precision"] = source_precision
+        if source_precision > project_precision and not self.precision_confirmed:
+            self.precision_confirmed = True
+            return context.window_manager.invoke_props_dialog(self, width=460)
+        if source_precision > project_precision:
+            set_jbeam_project_position_precision(context, source_precision)
+            self.report({"INFO"}, f"Raised JBeam project precision to {source_precision} decimal places")
 
         if self.clear_existing:
             collections_to_remove = [
