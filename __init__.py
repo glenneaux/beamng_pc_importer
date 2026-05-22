@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 125
+ADDON_BUILD = 126
 
 
 def addon_version_label():
@@ -314,6 +314,17 @@ class BeamNGJBeamExportFileItem(PropertyGroup):
     planned_target_path: StringProperty(default="")
     node_update_count: IntProperty(default=0)
     topology_update_count: IntProperty(default=0)
+
+
+class BeamNGAssemblyPartItem(PropertyGroup):
+    part_key: StringProperty(default="")
+    part_name: StringProperty(default="")
+    object_name: StringProperty(default="")
+    source_file: StringProperty(default="")
+    part_guid: StringProperty(default="")
+    resolved_part_id: IntProperty(default=-1)
+    owned_node_count: IntProperty(default=0)
+    proxy_node_count: IntProperty(default=0)
 
 
 def populate_vehicle_slot_editor(scene, pc_data, part_index):
@@ -984,6 +995,97 @@ def active_experimental_jbeam_mesh(context):
         ):
             return obj
     return None
+
+
+def jbeam_assembly_part_key_for_object(obj):
+    if obj is None:
+        return ""
+    guid = str(obj.get("beamng_part_guid", "") or "").strip()
+    if guid:
+        return f"guid:{guid}"
+    source = normalize_virtual_path(obj.get("beamng_jbeam_path", ""))
+    part_name = str(obj.get("beamng_part_name", "") or "").strip()
+    resolved_part_id = obj.get("beamng_resolved_part_id", "")
+    return f"part:{source}|{part_name}|{resolved_part_id}|{obj.name}"
+
+
+def experimental_jbeam_part_objects(scene):
+    return sorted(
+        (
+            obj
+            for obj in scene.objects
+            if obj.type == "MESH" and obj.get("beamng_visual_type") == "experimental_jbeam_mesh"
+        ),
+        key=lambda obj: (
+            normalize_virtual_path(obj.get("beamng_jbeam_path", "")),
+            str(obj.get("beamng_part_name", "")),
+            obj.name,
+        ),
+    )
+
+
+def refresh_jbeam_assembly_parts(scene):
+    if not hasattr(scene, "beamng_assembly_part_items"):
+        return []
+    objects = experimental_jbeam_part_objects(scene)
+    items = scene.beamng_assembly_part_items
+    items.clear()
+    for obj in objects:
+        item = items.add()
+        item.part_key = jbeam_assembly_part_key_for_object(obj)
+        item.part_name = str(obj.get("beamng_part_name", "") or obj.name)
+        item.object_name = obj.name
+        item.source_file = normalize_virtual_path(obj.get("beamng_jbeam_path", ""))
+        item.part_guid = str(obj.get("beamng_part_guid", "") or "")
+        item.resolved_part_id = int(obj.get("beamng_resolved_part_id", -1) or -1)
+        item.owned_node_count = int(obj.get("beamng_owned_node_count", 0) or 0)
+        item.proxy_node_count = int(obj.get("beamng_proxy_node_count", 0) or 0)
+    valid_keys = {item.part_key for item in items}
+    active_key = str(scene.get("beamng_active_jbeam_part_key", "") or "")
+    if active_key and active_key not in valid_keys:
+        scene["beamng_active_jbeam_part_key"] = ""
+        scene["beamng_active_jbeam_part_name"] = ""
+        scene["beamng_active_jbeam_part_object"] = ""
+    scene["beamng_assembly_part_count"] = len(items)
+    return objects
+
+
+def active_jbeam_assembly_part_object(scene):
+    active_key = str(scene.get("beamng_active_jbeam_part_key", "") or "")
+    if not active_key:
+        return None
+    for obj in experimental_jbeam_part_objects(scene):
+        if jbeam_assembly_part_key_for_object(obj) == active_key:
+            return obj
+    return None
+
+
+def set_active_jbeam_assembly_part(scene, obj):
+    if obj is None:
+        scene["beamng_active_jbeam_part_key"] = ""
+        scene["beamng_active_jbeam_part_name"] = ""
+        scene["beamng_active_jbeam_part_object"] = ""
+        scene["beamng_active_jbeam_part_source"] = ""
+        return
+    scene["beamng_active_jbeam_part_key"] = jbeam_assembly_part_key_for_object(obj)
+    scene["beamng_active_jbeam_part_name"] = str(obj.get("beamng_part_name", "") or obj.name)
+    scene["beamng_active_jbeam_part_object"] = obj.name
+    scene["beamng_active_jbeam_part_source"] = normalize_virtual_path(obj.get("beamng_jbeam_path", ""))
+
+
+def active_part_allows_topology_edit(context, obj):
+    active_key = str(context.scene.get("beamng_active_jbeam_part_key", "") or "")
+    if not active_key:
+        return True
+    return jbeam_assembly_part_key_for_object(obj) == active_key
+
+
+def require_active_part_for_topology_edit(operator, context, obj):
+    if active_part_allows_topology_edit(context, obj):
+        return True
+    active_name = context.scene.get("beamng_active_jbeam_part_name", "") or "(none)"
+    operator.report({"WARNING"}, f"Active Part is '{active_name}'. Switch Active Part before editing this mesh")
+    return False
 
 
 def active_object_debug_label(context):
@@ -7334,6 +7436,66 @@ class BEAMNG_OT_scan_experimental_jbeam_mesh_edits(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_refresh_jbeam_assembly_parts(Operator):
+    bl_idname = "beamng_pc_importer.refresh_jbeam_assembly_parts"
+    bl_label = "Refresh Assembly Parts"
+    bl_description = "Refresh the assembly part list from imported/editable JBeam mesh objects"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        objects = refresh_jbeam_assembly_parts(context.scene)
+        self.report({"INFO"}, f"Found {len(objects)} JBeam assembly part(s)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_set_active_jbeam_part_from_selection(Operator):
+    bl_idname = "beamng_pc_importer.set_active_jbeam_part_from_selection"
+    bl_label = "Set Active Part From Selection"
+    bl_description = "Make the selected imported JBeam mesh the Active Part for ordinary topology editing"
+    bl_options = {"REGISTER", "UNDO"}
+
+    clear: BoolProperty(name="Clear Active Part", default=False)
+
+    def execute(self, context):
+        if self.clear:
+            set_active_jbeam_assembly_part(context.scene, None)
+            self.report({"INFO"}, "Cleared Active Part")
+            return {"FINISHED"}
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None:
+            self.report({"WARNING"}, "Select an imported/experimental JBeam mesh first")
+            return {"CANCELLED"}
+        refresh_jbeam_assembly_parts(context.scene)
+        set_active_jbeam_assembly_part(context.scene, obj)
+        self.report({"INFO"}, f"Active Part: {context.scene.get('beamng_active_jbeam_part_name', '')}")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_activate_jbeam_assembly_part(Operator):
+    bl_idname = "beamng_pc_importer.activate_jbeam_assembly_part"
+    bl_label = "Activate Assembly Part"
+    bl_description = "Select and activate a JBeam assembly part"
+    bl_options = {"REGISTER", "UNDO"}
+
+    part_key: StringProperty(default="")
+
+    def execute(self, context):
+        refresh_jbeam_assembly_parts(context.scene)
+        for obj in experimental_jbeam_part_objects(context.scene):
+            if jbeam_assembly_part_key_for_object(obj) == self.part_key:
+                if context.object and context.object.mode != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+                for selected in context.selected_objects:
+                    selected.select_set(False)
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+                set_active_jbeam_assembly_part(context.scene, obj)
+                self.report({"INFO"}, f"Active Part: {obj.get('beamng_part_name', obj.name)}")
+                return {"FINISHED"}
+        self.report({"WARNING"}, "Assembly part is no longer available")
+        return {"CANCELLED"}
+
+
 class BEAMNG_OT_accept_experimental_jbeam_node_moves(Operator):
     bl_idname = "beamng_pc_importer.accept_experimental_jbeam_node_moves"
     bl_label = "Accept JBeam Edits"
@@ -7362,6 +7524,8 @@ class BEAMNG_OT_mark_selected_edges_as_jbeam_beams(Operator):
         obj = active_experimental_jbeam_mesh(context)
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Select an experimental JBeam mesh edge first")
+            return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
             return {"CANCELLED"}
         keys = selected_experimental_jbeam_edge_node_keys(obj)
         if not keys:
@@ -7392,6 +7556,8 @@ class BEAMNG_OT_set_selected_jbeam_edge_semantic(Operator):
         obj = active_experimental_jbeam_mesh(context)
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Select an experimental JBeam mesh edge first")
+            return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
             return {"CANCELLED"}
         result = set_selected_edge_semantic_type(obj, context.scene, self.semantic_type)
         changed = int(result.get("changed", 0))
@@ -7726,6 +7892,8 @@ class BEAMNG_OT_add_standalone_jbeam_node(Operator):
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Select an experimental JBeam mesh first")
             return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
+            return {"CANCELLED"}
         if obj.mode != "EDIT":
             self.report({"WARNING"}, "Enter Edit Mode first")
             return {"CANCELLED"}
@@ -7756,6 +7924,8 @@ class BEAMNG_OT_import_selected_nodes_as_proxies(Operator):
         target_obj = active_experimental_jbeam_mesh(context)
         if target_obj is None or target_obj.type != "MESH" or target_obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Activate target experimental JBeam mesh first")
+            return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, target_obj):
             return {"CANCELLED"}
         sources = selected_proxy_node_sources(context, target_obj)
         if not sources:
@@ -7812,6 +7982,8 @@ class BEAMNG_OT_import_marked_nodes_as_proxies(Operator):
         if target_obj is None or target_obj.type != "MESH" or target_obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Activate target experimental JBeam mesh first")
             return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, target_obj):
+            return {"CANCELLED"}
         nodes = proxy_clipboard_nodes(context.scene)
         if not nodes:
             self.report({"WARNING"}, "No marked proxy nodes. Select source nodes, then click Mark Selected Nodes first")
@@ -7865,6 +8037,8 @@ class BEAMNG_OT_clear_unused_proxy_nodes(Operator):
         obj = active_experimental_jbeam_mesh(context)
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Activate an experimental JBeam mesh first")
+            return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
             return {"CANCELLED"}
         identity = ensure_experimental_mesh_identity(obj, context.scene, allow_write=True)
         node_kinds = identity.get("node_kinds", [])
@@ -7926,6 +8100,8 @@ class BEAMNG_OT_clear_orphan_provisional_nodes(Operator):
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Activate an experimental JBeam mesh first")
             return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
+            return {"CANCELLED"}
         indices = set(orphan_provisional_node_indices(obj))
         if not indices:
             self.report({"INFO"}, "No orphan provisional nodes to clear")
@@ -7966,6 +8142,8 @@ class BEAMNG_OT_create_jbeam_beam_from_selected_nodes(Operator):
         obj = active_experimental_jbeam_mesh(context)
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Select an experimental JBeam mesh first")
+            return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
             return {"CANCELLED"}
         if obj.mode != "EDIT":
             self.report({"WARNING"}, "Enter Edit Mode first")
@@ -8015,6 +8193,8 @@ class BEAMNG_OT_create_jbeam_triangle_from_selected_nodes(Operator):
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Select an experimental JBeam mesh first")
             return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
+            return {"CANCELLED"}
         if obj.mode != "EDIT":
             self.report({"WARNING"}, "Enter Edit Mode first")
             return {"CANCELLED"}
@@ -8053,6 +8233,8 @@ class BEAMNG_OT_delete_selected_jbeam_elements(Operator):
         obj = active_experimental_jbeam_mesh(context)
         if obj is None or obj.type != "MESH" or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
             self.report({"WARNING"}, "Select an experimental JBeam mesh first")
+            return {"CANCELLED"}
+        if not require_active_part_for_topology_edit(self, context, obj):
             return {"CANCELLED"}
         if obj.mode != "EDIT":
             self.report({"WARNING"}, "Enter Edit Mode first")
@@ -9736,6 +9918,49 @@ def draw_jbeam_edit_status(layout, context):
     row.operator(BEAMNG_OT_clear_jbeam_edit_session.bl_idname, text="Discard")
 
 
+def draw_jbeam_assembly_part_controls(layout, context):
+    active_key = str(context.scene.get("beamng_active_jbeam_part_key", "") or "")
+    active_name = str(context.scene.get("beamng_active_jbeam_part_name", "") or "")
+    active_object = active_jbeam_assembly_part_object(context.scene)
+    active_mesh = active_experimental_jbeam_mesh(context)
+    box = layout.box()
+    box.label(text="Assembly / Active Part")
+    if active_key and active_object:
+        box.label(text=f"Active: {active_name}", icon="CHECKMARK")
+        box.label(text=f"Object: {active_object.name}")
+        source = context.scene.get("beamng_active_jbeam_part_source", "")
+        if source:
+            box.label(text=f"Source: {Path(source).name}")
+    elif active_key:
+        box.label(text="Active Part missing; refresh or choose a part", icon="ERROR")
+    else:
+        box.label(text="No Active Part set; tools can edit the active JBeam mesh.", icon="INFO")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_refresh_jbeam_assembly_parts.bl_idname, text="Refresh")
+    row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Use Selected")
+    clear = row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Clear")
+    clear.clear = True
+    if active_mesh and active_key and not active_part_allows_topology_edit(context, active_mesh):
+        box.label(text="Selected mesh is reference-only while another part is active.", icon="LOCKED")
+    objects = experimental_jbeam_part_objects(context.scene)
+    if not objects:
+        box.label(text="Import JBeam topology to populate assembly parts.")
+        return
+    list_box = box.box()
+    list_box.label(text=f"Parts: {len(objects)}")
+    for obj in objects[:12]:
+        part_key = jbeam_assembly_part_key_for_object(obj)
+        part_name = str(obj.get("beamng_part_name", "") or obj.name)
+        row = list_box.row(align=True)
+        is_active = part_key == active_key
+        row.alert = is_active
+        op = row.operator(BEAMNG_OT_activate_jbeam_assembly_part.bl_idname, text=part_name)
+        op.part_key = part_key
+        row.label(text=f"{int(obj.get('beamng_owned_node_count', 0) or 0)}/{int(obj.get('beamng_proxy_node_count', 0) or 0)}")
+    if len(objects) > 12:
+        list_box.label(text=f"+ {len(objects) - 12} more part(s); use viewport selection.")
+
+
 def draw_jbeam_topology_tools(layout, context, active_mesh):
     box = layout.box()
     box.label(text="Topology Tools")
@@ -9749,6 +9974,9 @@ def draw_jbeam_topology_tools(layout, context, active_mesh):
         return
     box.label(text=f"Part: {active_mesh.get('beamng_part_name', '')}")
     box.label(text=f"Mode: {active_mesh.mode}")
+    if not active_part_allows_topology_edit(context, active_mesh):
+        box.label(text="Reference-only: switch Active Part to edit this mesh.", icon="LOCKED")
+        return
     box.label(text=f"Owned/proxy: {active_mesh.get('beamng_owned_node_count', 0)} / {active_mesh.get('beamng_proxy_node_count', 0)}")
     box.label(text=f"Topology revision: {active_mesh.data.get('beamng_topology_revision', 0)}")
     box.label(text=f"Topology delta: {active_mesh.data.get('beamng_semantic_topology_delta_count', 0)}")
@@ -10015,6 +10243,7 @@ class VIEW3D_PT_beamng_jbeam_edit(Panel):
     def draw(self, context):
         layout = self.layout
         active_mesh = active_experimental_jbeam_mesh(context)
+        draw_jbeam_assembly_part_controls(layout, context)
         draw_jbeam_edit_status(layout, context)
         draw_jbeam_topology_tools(layout, context, active_mesh)
         draw_jbeam_selected_elements(layout, context)
@@ -11654,6 +11883,7 @@ def menu_func_jbeam_context(self, context):
 classes = (
     BeamNGSlotEditorItem,
     BeamNGJBeamExportFileItem,
+    BeamNGAssemblyPartItem,
     BeamNGPCImporterPreferences,
     BEAMNG_OT_set_visibility,
     BEAMNG_OT_jbeam_relationship,
@@ -11663,6 +11893,9 @@ classes = (
     BEAMNG_OT_hide_selected_jbeam_items,
     BEAMNG_OT_set_jbeam_visual_visibility,
     BEAMNG_OT_scan_experimental_jbeam_mesh_edits,
+    BEAMNG_OT_refresh_jbeam_assembly_parts,
+    BEAMNG_OT_set_active_jbeam_part_from_selection,
+    BEAMNG_OT_activate_jbeam_assembly_part,
     BEAMNG_OT_accept_experimental_jbeam_node_moves,
     BEAMNG_OT_mark_selected_edges_as_jbeam_beams,
     BEAMNG_OT_set_selected_jbeam_edge_semantic,
@@ -11728,6 +11961,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.beamng_slot_editor_items = CollectionProperty(type=BeamNGSlotEditorItem)
     bpy.types.Scene.beamng_jbeam_export_file_items = CollectionProperty(type=BeamNGJBeamExportFileItem)
+    bpy.types.Scene.beamng_assembly_part_items = CollectionProperty(type=BeamNGAssemblyPartItem)
     bpy.types.Scene.beamng_jbeam_node_weight = StringProperty(
         name="nodeWeight",
         description="Optional JBeam nodeWeight to apply before inserted/new selected nodes",
@@ -11828,6 +12062,8 @@ def unregister():
         del bpy.types.Scene.beamng_slot_editor_items
     if hasattr(bpy.types.Scene, "beamng_jbeam_export_file_items"):
         del bpy.types.Scene.beamng_jbeam_export_file_items
+    if hasattr(bpy.types.Scene, "beamng_assembly_part_items"):
+        del bpy.types.Scene.beamng_assembly_part_items
     for prop_name in (
         "beamng_jbeam_node_weight",
         "beamng_jbeam_node_material",
