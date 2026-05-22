@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 127
+ADDON_BUILD = 128
 
 
 def addon_version_label():
@@ -1112,6 +1112,9 @@ def active_part_allows_topology_edit(context, obj):
 
 
 def require_active_part_for_topology_edit(operator, context, obj):
+    if selected_active_object(context) is obj:
+        set_active_jbeam_assembly_part(context.scene, obj)
+        apply_jbeam_active_part_reference_display(context.scene)
     if active_part_allows_topology_edit(context, obj):
         return True
     active_name = context.scene.get("beamng_active_jbeam_part_name", "") or "(none)"
@@ -9954,7 +9957,6 @@ def draw_jbeam_edit_status(layout, context):
 
 
 def draw_jbeam_assembly_part_controls(layout, context):
-    sync_active_jbeam_part_from_selection(context)
     active_key = str(context.scene.get("beamng_active_jbeam_part_key", "") or "")
     active_name = str(context.scene.get("beamng_active_jbeam_part_name", "") or "")
     active_object = active_jbeam_assembly_part_object(context.scene)
