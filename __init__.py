@@ -5601,7 +5601,7 @@ def build_jbeam_export_validation(context, selected_virtual_paths=None):
         round_trip_validation = {"status": "not_run", "errors": [], "warnings": [], "infos": []}
         file_infos.extend(semantic_diff_summary_lines(semantic_diff))
         patch_mode = ""
-        source = source_index.get(virtual_path)
+        source = jbeam_source_for_file_group(file_group, source_index)
         expected_node_update_count = sum(
             len(part_group.get("node_inserts", []))
             + len(part_group.get("node_updates", []))
@@ -5920,6 +5920,27 @@ def jbeam_asset_source_index_for_context(context):
     for source in sorted(jbeam_sources, key=lambda item: item.precedence):
         source_index[normalize_virtual_path(source.virtual_path)] = source
     return source_index, ""
+
+
+def jbeam_source_for_file_group(file_group, source_index):
+    virtual_path = normalize_virtual_path(file_group.get("virtual_path", ""))
+    source = source_index.get(virtual_path)
+    if source is not None:
+        return source
+
+    source_file = file_group.get("source_file", "")
+    if source_file:
+        try:
+            path = Path(source_file)
+            if path.exists() and path.is_file():
+                return BeamNGAssetSource(
+                    asset_type="file",
+                    virtual_path=virtual_path,
+                    path=str(path),
+                )
+        except (OSError, ValueError):
+            pass
+    return None
 
 
 def read_jbeam_asset_source_text(source):
@@ -6808,7 +6829,7 @@ def build_jbeam_patched_cache_copies(context, selected_virtual_paths=None):
     files = []
     for file_group in plan["files"]:
         virtual_path = normalize_virtual_path(file_group.get("virtual_path", ""))
-        source = source_index.get(virtual_path)
+        source = jbeam_source_for_file_group(file_group, source_index)
         new_file_payload = new_jbeam_payload_for_virtual_path(context.scene, virtual_path)
         file_result = {
             "source_file": file_group.get("source_file", ""),
@@ -7963,7 +7984,7 @@ class BEAMNG_OT_create_jbeam_triangle_from_selected_nodes(Operator):
 class BEAMNG_OT_delete_selected_jbeam_elements(Operator):
     bl_idname = "beamng_pc_importer.delete_selected_jbeam_elements"
     bl_label = "Delete Selected JBeam Elements"
-    bl_description = "Delete selected JBeam vertices/edges/faces using Blender topology, with vertex delete cascading attached edges/faces"
+    bl_description = "Delete selected JBeam faces/edges first; delete nodes only when no beam or triangle is selected"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -7984,15 +8005,26 @@ class BEAMNG_OT_delete_selected_jbeam_elements(Operator):
         verts = [vertex for vertex in edit_mesh.verts if vertex.select]
         edges = [edge for edge in edit_mesh.edges if edge.select]
         faces = [face for face in edit_mesh.faces if face.select]
-        if verts:
-            bmesh.ops.delete(edit_mesh, geom=verts, context="VERTS")
-            deleted = f"{len(verts)} node(s)"
-        elif faces:
+
+        # Blender edge/face selection commonly leaves endpoint vertices selected too.
+        # Prefer deleting JBeam relationships before treating selected vertices as node deletion.
+        if faces:
             bmesh.ops.delete(edit_mesh, geom=faces, context="FACES_ONLY")
             deleted = f"{len(faces)} triangle face(s)"
         elif edges:
-            bmesh.ops.delete(edit_mesh, geom=edges, context="EDGES")
-            deleted = f"{len(edges)} edge(s)"
+            removable_edges = [edge for edge in edges if edge.is_valid and not edge.link_faces]
+            blocked_edges = len(edges) - len(removable_edges)
+            if not removable_edges:
+                self.report({"WARNING"}, "Selected beam edge is also a triangle boundary; select the triangle face to delete it")
+                return {"CANCELLED"}
+            for edge in removable_edges:
+                edit_mesh.edges.remove(edge)
+            deleted = f"{len(removable_edges)} beam edge(s)"
+            if blocked_edges:
+                self.report({"WARNING"}, f"Deleted {deleted}; skipped {blocked_edges} triangle boundary edge(s)")
+        elif verts:
+            bmesh.ops.delete(edit_mesh, geom=verts, context="VERTS")
+            deleted = f"{len(verts)} node(s)"
         else:
             self.report({"WARNING"}, "No JBeam mesh elements selected")
             return {"CANCELLED"}
@@ -9904,6 +9936,7 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         layout.label(text=f"Export mod: {jbeam_export_mod_name(context)}")
         status = "Blocked" if counts["missing_refs"] else "Dirty" if counts["pending"] or counts["history"] else "Clean"
         layout.label(text=f"Status: {status}", icon="ERROR" if status == "Blocked" else "INFO")
+        layout.operator(IMPORT_OT_beamng_jbeam_topology.bl_idname, text="Import JBeam Topology")
         draw_beamng_visibility_controls(layout, context)
         draw_beamng_view_controls(layout, context)
         layout.separator()
@@ -10007,7 +10040,8 @@ class VIEW3D_PT_beamng_advanced(Panel):
         layout.operator(BEAMNG_OT_toggle_relationship_lines.bl_idname, text="Toggle Parent Lines")
         layout.operator(BEAMNG_OT_print_prop_transforms.bl_idname, text="Write Prop Debug File")
 
-
+        box = layout.box()
+        box.label(text="JBeam Session")
         precision = int(context.scene.get("beamng_jbeam_position_precision", JBEAM_POSITION_PRECISION))
         if context.scene.get("beamng_jbeam_positions_rounded_on_import", False):
             box.label(text=f"Node positions rounded to {precision} decimals on import", icon="INFO")
@@ -10892,6 +10926,97 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
         )
 
 
+class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
+    bl_idname = "import_scene.beamng_jbeam_topology"
+    bl_label = "Import BeamNG JBeam Topology"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".jbeam"
+    filter_glob: StringProperty(default="*.jbeam", options={"HIDDEN"})
+    clear_existing: BoolProperty(
+        name="Clear Existing Direct JBeam Imports",
+        description="Remove previous direct JBeam topology import collections before importing",
+        default=False,
+    )
+
+    def draw(self, _context):
+        self.layout.prop(self, "clear_existing")
+
+    def execute(self, context):
+        filepath = Path(self.filepath)
+        if not filepath.exists():
+            self.report({"ERROR"}, f"JBeam file does not exist: {filepath}")
+            return {"CANCELLED"}
+
+        if self.clear_existing:
+            for collection in list(bpy.data.collections):
+                if collection.get("beamng_visual_type") == "direct_jbeam_topology_import":
+                    remove_collection_objects(collection)
+                    bpy.data.collections.remove(collection)
+
+        imported = import_jbeam_topology_subset(filepath)
+        blocking = [
+            diagnostic
+            for diagnostic in imported.diagnostics
+            if getattr(diagnostic, "level", "") == "error"
+        ]
+        if blocking or not imported.parts:
+            message = "; ".join(getattr(diagnostic, "message", str(diagnostic)) for diagnostic in blocking[:3])
+            self.report({"ERROR"}, message or "No supported JBeam parts were imported")
+            return {"CANCELLED"}
+
+        root = bpy.data.collections.new(f"BeamNG JBeam Import - {filepath.stem}")
+        root["beamng_visual_type"] = "direct_jbeam_topology_import"
+        root["beamng_source_path"] = str(filepath)
+        root["beamng_source_sha256"] = imported.cached_source.get("sha256", "")
+        context.scene.collection.children.link(root)
+
+        created = create_imported_jbeam_topology_meshes(imported, root)
+        mesh_collection = next(
+            (
+                collection
+                for collection in root.children
+                if collection.get("beamng_visual_type") == "imported_jbeam_topology_meshes"
+            ),
+            root,
+        )
+        objects = [
+            obj
+            for obj in context.scene.objects
+            if obj.get("beamng_imported_topology_subset")
+            and obj.get("beamng_source_sha256") == imported.cached_source.get("sha256", "")
+        ]
+        for obj in objects:
+            obj.select_set(True)
+        if objects:
+            context.view_layer.objects.active = objects[0]
+        context.scene["beamng_last_direct_jbeam_import_path"] = str(filepath)
+        context.scene["beamng_last_direct_jbeam_import_part_count"] = len(imported.parts)
+
+        text = bpy.data.texts.get("BeamNG Direct JBeam Import Report") or bpy.data.texts.new(
+            "BeamNG Direct JBeam Import Report"
+        )
+        text.clear()
+        text.write(f"Source: {filepath}\n")
+        text.write(f"Parts: {len(imported.parts)}\n")
+        text.write(f"Objects: {created}\n")
+        text.write(f"Collection: {mesh_collection.name}\n")
+        text.write("\nDiagnostics:\n")
+        for diagnostic in imported.diagnostics:
+            text.write(
+                f"- {getattr(diagnostic, 'level', '')}: "
+                f"{getattr(diagnostic, 'code', '')}: "
+                f"{getattr(diagnostic, 'message', diagnostic)}\n"
+            )
+
+        warning_count = sum(1 for diagnostic in imported.diagnostics if getattr(diagnostic, "level", "") == "warning")
+        if warning_count:
+            self.report({"WARNING"}, f"Imported {len(imported.parts)} JBeam part(s) with {warning_count} warning(s)")
+        else:
+            self.report({"INFO"}, f"Imported {len(imported.parts)} JBeam part(s)")
+        return {"FINISHED"}
+
+
 PC_VEHICLE_ENUM_ITEMS = []
 PC_CONFIG_ENUM_ITEMS_BY_VEHICLE = {}
 PC_SOURCE_BY_KEY = {}
@@ -11187,6 +11312,7 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
 def menu_func_import(self, _context):
     self.layout.operator(IMPORT_OT_beamng_pc.bl_idname, text="BeamNG Config (.pc File)")
     self.layout.operator(IMPORT_OT_beamng_pc_from_assets.bl_idname, text="BeamNG Config From BeamNG Assets")
+    self.layout.operator(IMPORT_OT_beamng_jbeam_topology.bl_idname, text="BeamNG JBeam Topology (.jbeam)")
 
 
 def menu_func_view_sync(self, _context):
@@ -11311,6 +11437,7 @@ classes = (
     VIEW3D_PT_beamng_advanced,
     SCENE_PT_beamng_configuration_editor,
     IMPORT_OT_beamng_pc,
+    IMPORT_OT_beamng_jbeam_topology,
     IMPORT_OT_beamng_pc_from_assets,
 )
 
