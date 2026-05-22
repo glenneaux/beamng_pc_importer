@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 130
+ADDON_BUILD = 131
 
 
 def addon_version_label():
@@ -5050,6 +5050,19 @@ def jbeam_export_mod_name(context):
     return safe_mod_folder_name(configured)
 
 
+def existing_unpacked_mod_names(context):
+    current_folder = user_current_folder_from_preferences(context)
+    if current_folder is None:
+        return []
+    root = current_folder / "mods" / "unpacked"
+    if not root.exists():
+        return []
+    try:
+        return sorted(path.name for path in root.iterdir() if path.is_dir())
+    except OSError:
+        return []
+
+
 def loose_current_vehicle_jbeam_path(current_folder, virtual_path):
     normalized = normalize_virtual_path(virtual_path)
     if current_folder is None or not normalized.lower().endswith(".jbeam"):
@@ -8793,6 +8806,26 @@ class BEAMNG_OT_create_jbeam_export_mod_folder(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_set_jbeam_export_mod_folder(Operator):
+    bl_idname = "beamng_pc_importer.set_jbeam_export_mod_folder"
+    bl_label = "Use Export Mod Folder"
+    bl_description = "Use an existing unpacked mod folder as the JBeam/asset export target"
+    bl_options = {"REGISTER"}
+
+    mod_name: StringProperty(default="")
+
+    def execute(self, context):
+        prefs = get_addon_preferences(context)
+        if prefs is None:
+            self.report({"ERROR"}, "Could not access BeamNG PC Importer preferences")
+            return {"CANCELLED"}
+        safe_name = safe_mod_folder_name(self.mod_name)
+        prefs.jbeam_export_mod_name = safe_name
+        context.scene["beamng_jbeam_last_export_mod_folder_path"] = ""
+        self.report({"INFO"}, f"JBeam export mod: {safe_name}")
+        return {"FINISHED"}
+
+
 def assembly_validation_report(context):
     scene = context.scene
     objects = experimental_jbeam_part_objects(scene)
@@ -10620,6 +10653,36 @@ class VIEW3D_PT_beamng_jbeam_health(Panel):
             row.label(text=f"{level}: {message}")
 
 
+def draw_jbeam_export_mod_target_controls(layout, context, *, compact=False):
+    target_box = layout if compact else layout.box()
+    target_box.label(text="Working Mod Target", icon="FILE_FOLDER")
+    target_box.label(text=f"Selected: {jbeam_export_mod_name(context)}")
+    target_box.label(text="JBeam/DAE target: current/mods/unpacked/<mod>/vehicles")
+
+    current_folder = user_current_folder_from_preferences(context)
+    if current_folder is None:
+        target_box.label(text="Set BeamNG user folder in preferences first", icon="ERROR")
+    else:
+        unpacked_root = current_folder / "mods" / "unpacked"
+        target_box.label(text=f"Unpacked mods: {unpacked_root}")
+
+    target_box.operator(BEAMNG_OT_create_jbeam_export_mod_folder.bl_idname, text="Create/Verify Selected Mod")
+
+    mod_names = existing_unpacked_mod_names(context)
+    if mod_names:
+        if not compact:
+            target_box.label(text="Existing unpacked mods")
+        for mod_name in mod_names[:8]:
+            row = target_box.row(align=True)
+            row.label(text=mod_name, icon="FILE_FOLDER")
+            op = row.operator(BEAMNG_OT_set_jbeam_export_mod_folder.bl_idname, text="Use")
+            op.mod_name = mod_name
+        if len(mod_names) > 8:
+            target_box.label(text=f"{len(mod_names) - 8} more mod folder(s) hidden; use preferences for exact name.")
+    elif current_folder is not None:
+        target_box.label(text="No existing unpacked mod folders found.")
+
+
 class VIEW3D_PT_beamng_jbeam_export(Panel):
     bl_label = "JBeam Export"
     bl_idname = "VIEW3D_PT_beamng_jbeam_export"
@@ -10630,9 +10693,7 @@ class VIEW3D_PT_beamng_jbeam_export(Panel):
     def draw(self, context):
         layout = self.layout
         history_count = int(context.scene.get("beamng_jbeam_operation_history_count", 0))
-        layout.label(text=f"Export mod: {jbeam_export_mod_name(context)}")
-        layout.label(text="Target: current/mods/unpacked/<mod>/vehicles")
-        layout.operator(BEAMNG_OT_create_jbeam_export_mod_folder.bl_idname, text="Create/Verify Export Mod Folder")
+        draw_jbeam_export_mod_target_controls(layout, context)
         row = layout.row(align=True)
         row.enabled = history_count > 0
         row.operator(BEAMNG_OT_validate_jbeam_export.bl_idname, text="Validate")
@@ -10741,9 +10802,7 @@ class VIEW3D_PT_beamng_advanced(Panel):
         row.operator(BEAMNG_OT_clear_jbeam_edit_session.bl_idname, text="Discard Session Edits")
 
         box.separator()
-        box.label(text=f"Export mod: {jbeam_export_mod_name(context)}")
-        box.label(text="JBeam target: current/mods/unpacked/<mod>/vehicles")
-        box.operator(BEAMNG_OT_create_jbeam_export_mod_folder.bl_idname, text="Create/Verify Export Mod Folder")
+        draw_jbeam_export_mod_target_controls(box, context, compact=True)
         last_mod_path = context.scene.get("beamng_jbeam_last_export_mod_folder_path", "")
         if last_mod_path:
             box.label(text=f"Export folder: {Path(last_mod_path).name}")
@@ -12275,6 +12334,7 @@ classes = (
     BEAMNG_OT_load_selected_jbeam_triangle_properties,
     BEAMNG_OT_clear_jbeam_edit_session,
     BEAMNG_OT_create_jbeam_export_mod_folder,
+    BEAMNG_OT_set_jbeam_export_mod_folder,
     BEAMNG_OT_validate_jbeam_assembly,
     BEAMNG_OT_write_jbeam_edit_preview,
     BEAMNG_OT_write_jbeam_node_patch_draft,
