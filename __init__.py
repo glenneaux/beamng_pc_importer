@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 129
+ADDON_BUILD = 130
 
 
 def addon_version_label():
@@ -2268,6 +2268,50 @@ def create_or_mark_jbeam_beam_between_indices(obj, scene, index_a, index_b):
     mesh["beamng_explicit_beam_edge_keys_json"] = json.dumps([list(item_key) for item_key in sorted(existing)])
     ensure_experimental_mesh_identity(obj, scene, allow_write=True)
     return {"created_edge": created_edge, "marked": len(existing) != before_count, "key": key}
+
+
+def remove_proxy_vertices_by_node_ids(obj, scene, node_ids):
+    remove_ids = {str(node_id) for node_id in node_ids if str(node_id)}
+    if not remove_ids:
+        return 0
+    identity = ensure_experimental_mesh_identity(obj, scene, allow_write=True)
+    current_node_ids = [str(node_id) for node_id in identity.get("node_ids", [])]
+    current_node_kinds = [str(kind or "owned") for kind in identity.get("node_kinds", [])]
+    indices = {
+        index
+        for index, (node_id, kind) in enumerate(zip(current_node_ids, current_node_kinds))
+        if node_id in remove_ids and kind == "proxy"
+    }
+    if not indices:
+        return 0
+    import bmesh
+
+    mesh = obj.data
+    if obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
+        verts = [vertex for vertex in bm.verts if vertex.index in indices]
+        bmesh.ops.delete(bm, geom=verts, context="VERTS")
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+    else:
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
+        verts = [vertex for vertex in bm.verts if vertex.index in indices]
+        bmesh.ops.delete(bm, geom=verts, context="VERTS")
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+    ensure_experimental_mesh_identity(obj, scene, allow_write=True)
+    semantic_topology_snapshot_for_object(obj, scene, allow_write=True)
+    obj["beamng_proxy_node_count"] = sum(
+        1
+        for kind in ensure_experimental_mesh_identity(obj, scene, allow_write=False).get("node_kinds", [])
+        if str(kind) == "proxy"
+    )
+    return len(indices)
 
 
 def mesh_json_list(mesh, key, fallback=None):
@@ -8166,7 +8210,7 @@ class BEAMNG_OT_create_crossbeam_to_marked_node(Operator):
         if len(position) != 3:
             self.report({"WARNING"}, "Marked node has no valid world position")
             return {"CANCELLED"}
-        add_proxy_nodes_to_experimental_mesh(
+        proxy_result = add_proxy_nodes_to_experimental_mesh(
             context,
             target_obj,
             [{
@@ -8178,10 +8222,17 @@ class BEAMNG_OT_create_crossbeam_to_marked_node(Operator):
         )
         proxy_index = experimental_node_index_by_id(target_obj, external_node_id, {"proxy"})
         if proxy_index < 0:
+            if int(proxy_result.get("added", 0) or 0):
+                remove_proxy_vertices_by_node_ids(target_obj, context.scene, {external_node_id})
             self.report({"ERROR"}, "Could not create or find proxy node")
             return {"CANCELLED"}
         result = create_or_mark_jbeam_beam_between_indices(target_obj, context.scene, local_index, proxy_index)
         key = result.get("key", ())
+        if not key:
+            if int(proxy_result.get("added", 0) or 0):
+                remove_proxy_vertices_by_node_ids(target_obj, context.scene, {external_node_id})
+            self.report({"ERROR"}, "Could not create crossbeam; rolled back new proxy")
+            return {"CANCELLED"}
         semantic_topology_snapshot_for_object(target_obj, context.scene, allow_write=True)
         self.report({"INFO"}, f"Created crossbeam: {key[0]} -> {key[1]}" if key else "Created crossbeam")
         return {"FINISHED"}
