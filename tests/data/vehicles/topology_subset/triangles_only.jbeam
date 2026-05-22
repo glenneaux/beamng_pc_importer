@@ -1,0 +1,18 @@
+{
+    "triangle_only_part": {
+        "information": {
+            "name": "Triangle Only Fixture"
+        },
+        "slotType": "main",
+        "nodes": [
+            ["id", "posX", "posY", "posZ"],
+            ["ta", 0, 0, 0],
+            ["tb", 1, 0, 0],
+            ["tc", 0, 1, 0]
+        ],
+        "triangles": [
+            ["id1:", "id2:", "id3:"],
+            ["ta", "tb", "tc"]
+        ]
+    }
+}

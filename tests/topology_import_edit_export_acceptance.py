@@ -23,6 +23,7 @@ addon = importlib.import_module("beamng_pc_importer")
 
 def main():
     fixture = REPO_ROOT / "tests" / "data" / "vehicles" / "topology_subset" / "subset.jbeam"
+    triangles_only_fixture = REPO_ROOT / "tests" / "data" / "vehicles" / "topology_subset" / "triangles_only.jbeam"
     source = fixture.read_text(encoding="utf-8")
     imported = addon.import_jbeam_topology_subset(fixture)
     assert len(imported.parts) == 1
@@ -78,6 +79,38 @@ def main():
     round_trip = addon.round_trip_validate_patched_jbeam_text(patched, full_group)
     assert round_trip["status"] == "pass", round_trip
 
+    triangles_only = addon.import_jbeam_topology_subset(triangles_only_fixture)
+    assert len(triangles_only.parts) == 1
+    assert len(triangles_only.parts[0].beams) == 0
+    assert len(triangles_only.parts[0].triangles) == 1
+
+    root = addon.bpy.data.collections.new("Triangle Only Boundary Regression")
+    addon.bpy.context.scene.collection.children.link(root)
+    created = addon.create_imported_jbeam_topology_meshes(triangles_only, root)
+    assert created == 1
+    mesh_objects = []
+    for collection in root.children:
+        mesh_objects.extend(
+            obj for obj in collection.objects
+            if obj.get("beamng_imported_topology_subset")
+        )
+    assert len(mesh_objects) == 1
+    obj = mesh_objects[0]
+    mesh = obj.data
+    assert len(mesh.polygons) == 1
+    assert len(mesh.edges) == 3
+    assert addon.mesh_json_list(mesh, "beamng_edge_node_ids_json") == []
+    assert sorted(addon.mesh_json_list(mesh, "beamng_mesh_edge_node_ids_json")) == [
+        ["ta", "tb"],
+        ["ta", "tc"],
+        ["tb", "tc"],
+    ]
+    snapshot = addon.semantic_topology_snapshot_for_object(obj, addon.bpy.context.scene, allow_write=True)
+    edge_types = {tuple(edge["node_ids"]): edge["semantic_type"] for edge in snapshot["edges"]}
+    assert set(edge_types.values()) == {addon.JBEAM_EDGE_SEMANTIC_TRIANGLE_BOUNDARY}
+    scan = addon.scan_experimental_jbeam_mesh_edits(addon.bpy.context.scene, active_only=False)
+    assert not any(change.get("section") == "beams" for change in scan["changes"]), scan["changes"]
+
     print(
         json.dumps(
             {
@@ -87,6 +120,7 @@ def main():
                 "full_patch_changes": len(changed),
                 "semantic_diff": semantic_lines,
                 "round_trip": round_trip,
+                "triangle_only_boundary_edges": len(mesh.edges),
             },
             indent=2,
         )

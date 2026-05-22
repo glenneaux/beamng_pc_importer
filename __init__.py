@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 121
+ADDON_BUILD = 122
 
 
 def addon_version_label():
@@ -1687,8 +1687,7 @@ def draw_experimental_jbeam_proxy_node_overlay():
         return
     prefs = get_addon_preferences(context)
     show_proxy_overlay = prefs is None or bool(getattr(prefs, "show_proxy_node_overlay", True))
-    # Native patched Blender renders semantic colors from compact mesh attributes.
-    show_topology_overlay = False
+    show_topology_overlay = prefs is None or bool(getattr(prefs, "show_jbeam_semantic_overlay", True))
     if not show_proxy_overlay and not show_topology_overlay:
         return
 
@@ -2850,7 +2849,7 @@ def active_experimental_mesh_validation_summary(context, limit=6):
     semantic_by_key = semantic_edge_types_by_key(semantic_snapshot)
     beam_edges = [
         edge for edge in edges
-        if semantic_by_key.get(edge_key(edge), JBEAM_EDGE_SEMANTIC_BEAM) == JBEAM_EDGE_SEMANTIC_BEAM
+        if semantic_by_key.get(edge_key(edge), JBEAM_EDGE_SEMANTIC_RELATIONSHIP) == JBEAM_EDGE_SEMANTIC_BEAM
     ]
     messages = []
     duplicate_nodes = duplicate_items(node_ids)
@@ -3005,7 +3004,7 @@ def semantic_edge_type_for_key(key, original_beam_keys, explicit_beam_keys, tria
         return JBEAM_EDGE_SEMANTIC_BEAM
     if key in triangle_boundary_keys:
         return JBEAM_EDGE_SEMANTIC_TRIANGLE_BOUNDARY
-    return JBEAM_EDGE_SEMANTIC_BEAM
+    return JBEAM_EDGE_SEMANTIC_RELATIONSHIP
 
 
 def semantic_topology_snapshot_for_object(obj, scene=None, allow_write=True):
@@ -3210,6 +3209,18 @@ def semantic_edge_types_by_key(snapshot):
         if isinstance(ids, list) and len(ids) >= 2:
             result[edge_key(ids)] = str(item.get("semantic_type", JBEAM_EDGE_SEMANTIC_RELATIONSHIP))
     return result
+
+
+def semantic_beam_edges_for_object(obj, scene=None, current_edges=None, allow_write=True):
+    if current_edges is None:
+        current_edges, _current_faces = read_experimental_mesh_topology(obj, allow_identity_write=allow_write)
+    semantic_snapshot = semantic_topology_snapshot_for_object(obj, scene, allow_write=allow_write)
+    semantic_by_key = semantic_edge_types_by_key(semantic_snapshot)
+    return [
+        list(edge)
+        for edge in current_edges
+        if semantic_by_key.get(edge_key(edge), JBEAM_EDGE_SEMANTIC_RELATIONSHIP) == JBEAM_EDGE_SEMANTIC_BEAM
+    ]
 
 
 def selected_experimental_edge_uid_and_keys(obj):
@@ -3785,6 +3796,11 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
             if current_edge_semantic_by_key.get(key) == JBEAM_EDGE_SEMANTIC_BEAM
         }
         candidate_new_beam_keys = set(candidate_new_edge_keys) | semantic_new_beam_keys
+        current_beam_key_set = {
+            key
+            for key in set(current_edge_by_key)
+            if current_edge_semantic_by_key.get(key, JBEAM_EDGE_SEMANTIC_RELATIONSHIP) == JBEAM_EDGE_SEMANTIC_BEAM
+        }
         edge_params_by_key = params_by_topology_key(current_edges, edge_params)
         committed_edge_params_by_key = params_by_topology_key(current_edges, committed_edge_params)
         face_params_by_key = params_by_topology_key(current_faces, face_params)
@@ -3820,7 +3836,7 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
                     "source_object": obj.name,
                 }
             )
-        for key in sorted((set(current_edge_by_key) & set(original_edge_by_key))):
+        for key in sorted((current_beam_key_set & set(original_edge_by_key))):
             params = edge_params_by_key.get(key, {})
             committed_params = committed_edge_params_by_key.get(key, {})
             if params != committed_params:
@@ -3840,7 +3856,7 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
                         "source_object": obj.name,
                     }
                 )
-        for key in sorted(set(original_edge_by_key) - set(current_edge_by_key)):
+        for key in sorted(set(original_edge_by_key) - current_beam_key_set):
             ids = original_edge_by_key[key]
             if not all_nodes_owned_here(ids[:2]):
                 continue
@@ -4200,6 +4216,9 @@ def commit_exported_jbeam_mesh_baselines(scene, exported_history):
         node_uids = ensure_experimental_topology_uids(obj, allow_write=True).get("nodes", [])
         _edit_mesh, current_positions = read_experimental_mesh_vertices(obj)
         current_edges, current_faces = read_experimental_mesh_topology(obj)
+        current_beam_edges = semantic_beam_edges_for_object(
+            obj, scene, current_edges=current_edges, allow_write=True
+        )
         node_params = list(identity.get("node_params", []))
         edge_params = mesh_json_list(mesh, "beamng_edge_params_json")
         face_params = mesh_json_list(mesh, "beamng_face_params_json")
@@ -4237,7 +4256,7 @@ def commit_exported_jbeam_mesh_baselines(scene, exported_history):
         )
         mesh["beamng_node_committed_flags_json"] = json.dumps([True for _node_id in node_ids])
         mesh["beamng_node_committed_params_json"] = json.dumps(node_params)
-        mesh["beamng_edge_node_ids_json"] = json.dumps([list(edge) for edge in current_edges])
+        mesh["beamng_edge_node_ids_json"] = json.dumps([list(edge) for edge in current_beam_edges])
         mesh["beamng_mesh_edge_node_ids_json"] = json.dumps([list(edge) for edge in current_edges])
         mesh["beamng_edge_committed_params_json"] = json.dumps(edge_params)
         mesh["beamng_face_node_ids_json"] = json.dumps([list(face) for face in current_faces])
@@ -5414,7 +5433,7 @@ def validate_experimental_mesh_topology_for_export(context, file_group):
         semantic_by_key = semantic_edge_types_by_key(semantic_snapshot)
         beam_edges = [
             edge for edge in edges
-            if semantic_by_key.get(edge_key(edge), JBEAM_EDGE_SEMANTIC_BEAM) == JBEAM_EDGE_SEMANTIC_BEAM
+            if semantic_by_key.get(edge_key(edge), JBEAM_EDGE_SEMANTIC_RELATIONSHIP) == JBEAM_EDGE_SEMANTIC_BEAM
         ]
         node_set = set(node_ids)
         duplicate_nodes = duplicate_items(node_ids)
@@ -5481,7 +5500,7 @@ def experimental_jbeam_topology_health(scene):
         semantic_by_key = semantic_edge_types_by_key(semantic_snapshot)
         beam_edges = [
             edge for edge in edges
-            if semantic_by_key.get(edge_key(edge), JBEAM_EDGE_SEMANTIC_BEAM) == JBEAM_EDGE_SEMANTIC_BEAM
+            if semantic_by_key.get(edge_key(edge), JBEAM_EDGE_SEMANTIC_RELATIONSHIP) == JBEAM_EDGE_SEMANTIC_BEAM
         ]
         edge_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("edges", [])
         face_uids = ensure_experimental_topology_uids(obj, allow_write=False).get("faces", [])
@@ -10254,6 +10273,12 @@ class VIEW3D_PT_beamng_advanced(Panel):
                     edge_box.label(
                         text=f"e{edge_info['edge_index']}: {edge_info['id1']} -> {edge_info['id2']}"
                     )
+                    edge_box.label(
+                        text=(
+                            f"Semantic: {edge_info.get('semantic_type', JBEAM_EDGE_SEMANTIC_RELATIONSHIP)} "
+                            f"({edge_info.get('semantic_state', '')})"
+                        )
+                    )
                     edge_box.label(text=f"Model-backed: {'yes' if edge_info.get('model_backed') else 'no'}")
                     params = edge_info.get("params", {})
                     param_box = edge_box.box()
@@ -10304,6 +10329,12 @@ class VIEW3D_PT_beamng_advanced(Panel):
             if not selected_nodes and not selected_edges and not selected_faces:
                 box.label(text="Select JBeam mesh vertices/edges/faces to inspect elements.")
                 box.label(text=f"Debug: {active_object_debug_label(context)}")
+            legend_box = box.box()
+            legend_box.label(text="Viewport Semantic Legend")
+            legend_box.label(text="Green: exported JBeam beam")
+            legend_box.label(text="Amber: triangle boundary helper edge")
+            legend_box.label(text="Grey: non-exporting relationship/helper edge")
+            legend_box.label(text="Orange cross: proxy/reference node")
         else:
             box.label(text="No experimental JBeam mesh is active.")
             box.label(text=f"Debug: {active_object_debug_label(context)}")

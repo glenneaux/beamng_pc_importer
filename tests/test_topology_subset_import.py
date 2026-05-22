@@ -18,6 +18,13 @@ def topology_subset_path() -> Path:
     return path
 
 
+@pytest.fixture
+def triangles_only_path() -> Path:
+    path = Path(__file__).resolve().parent / "data" / "vehicles" / "topology_subset" / "triangles_only.jbeam"
+    assert path.exists(), f"Missing triangle-only fixture: {path}"
+    return path
+
+
 def test_topology_subset_imports_one_part(topology_subset_path):
     imported = addon.import_jbeam_topology_subset(topology_subset_path)
 
@@ -50,6 +57,14 @@ def test_topology_subset_imports_nodes_beams_and_triangles(topology_subset_path)
 
     assert [(triangle.id1, triangle.id2, triangle.id3) for triangle in part.triangles] == [("a", "b", "c")]
     assert part.triangles[0].options == {"dragCoef": 9, "groundModel": "metal"}
+
+
+def test_topology_subset_imports_triangles_without_promoting_edges_to_beams(triangles_only_path):
+    part = addon.import_jbeam_topology_subset(triangles_only_path).parts[0]
+
+    assert [node.node_id for node in part.nodes] == ["ta", "tb", "tc"]
+    assert part.beams == []
+    assert [(triangle.id1, triangle.id2, triangle.id3) for triangle in part.triangles] == [("ta", "tb", "tc")]
 
 
 def test_topology_subset_preserves_unknown_sections_and_reports_diagnostics(topology_subset_path):
