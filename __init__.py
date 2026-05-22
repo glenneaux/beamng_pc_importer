@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 122
+ADDON_BUILD = 123
 
 
 def addon_version_label():
@@ -800,6 +800,15 @@ def walk_child_collections(collection):
     for child in collection.children:
         yield child
         yield from walk_child_collections(child)
+
+
+def remove_collection_tree(collection):
+    for obj in list(walk_collection_objects(collection)):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    for child in list(collection.children):
+        remove_collection_tree(child)
+        if child.name in bpy.data.collections:
+            bpy.data.collections.remove(child)
 
 
 def find_beamng_import_collections(scene):
@@ -10957,6 +10966,55 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
         )
 
 
+JBEAM_TOPOLOGY_IMPORT_PART_ITEMS_CACHE = {}
+
+
+def jbeam_topology_import_part_names(filepath):
+    path = Path(filepath)
+    if not path.exists():
+        return []
+    try:
+        stat = path.stat()
+        cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        cache_key = (str(path), 0, 0)
+    cached = JBEAM_TOPOLOGY_IMPORT_PART_ITEMS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        imported = import_jbeam_topology_subset(path)
+    except Exception:
+        return []
+    names = [str(part.part_name) for part in imported.parts if str(part.part_name)]
+    JBEAM_TOPOLOGY_IMPORT_PART_ITEMS_CACHE.clear()
+    JBEAM_TOPOLOGY_IMPORT_PART_ITEMS_CACHE[cache_key] = names
+    return names
+
+
+def jbeam_topology_import_part_items(self, _context):
+    names = jbeam_topology_import_part_names(getattr(self, "filepath", ""))
+    items = [("__ALL__", "All parts", "Import every supported part from this JBeam file")]
+    for index, name in enumerate(names):
+        items.append((f"PART_{index}", name, f"Import only {name}"))
+    return items
+
+
+def filter_imported_jbeam_topology_parts(imported, selection):
+    if selection == "__ALL__":
+        return imported, ""
+    names = [str(part.part_name) for part in imported.parts]
+    if not str(selection).startswith("PART_"):
+        return imported, ""
+    try:
+        index = int(str(selection).split("_", 1)[1])
+    except (IndexError, ValueError):
+        return imported, "Invalid JBeam part selection"
+    if index < 0 or index >= len(imported.parts):
+        return imported, "Selected JBeam part no longer exists"
+    imported.parts = [imported.parts[index]]
+    return imported, names[index]
+
+
 class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
     bl_idname = "import_scene.beamng_jbeam_topology"
     bl_label = "Import BeamNG JBeam Topology"
@@ -10969,9 +11027,28 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
         description="Remove previous direct JBeam topology import collections before importing",
         default=False,
     )
+    part_selection: EnumProperty(
+        name="Part",
+        description="Choose one JBeam part to import, or import all parts in the file",
+        items=jbeam_topology_import_part_items,
+    )
+    part_selection_confirmed: BoolProperty(default=False, options={"HIDDEN"})
 
-    def draw(self, _context):
+    def draw(self, context):
         self.layout.prop(self, "clear_existing")
+        names = jbeam_topology_import_part_names(self.filepath)
+        if len(names) > 1:
+            self.layout.separator()
+            self.layout.label(text=f"{len(names)} JBeam parts found")
+            self.layout.prop(self, "part_selection")
+        elif len(names) == 1:
+            self.layout.label(text=f"Part: {names[0]}")
+
+    def invoke(self, context, event):
+        self.part_selection_confirmed = False
+        self.part_selection = "__ALL__"
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
 
     def execute(self, context):
         filepath = Path(self.filepath)
@@ -10979,13 +11056,30 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
             self.report({"ERROR"}, f"JBeam file does not exist: {filepath}")
             return {"CANCELLED"}
 
-        if self.clear_existing:
-            for collection in list(bpy.data.collections):
-                if collection.get("beamng_visual_type") == "direct_jbeam_topology_import":
-                    remove_collection_objects(collection)
-                    bpy.data.collections.remove(collection)
+        part_names = jbeam_topology_import_part_names(filepath)
+        if len(part_names) > 1 and not self.part_selection_confirmed:
+            self.part_selection_confirmed = True
+            return context.window_manager.invoke_props_dialog(self, width=420)
 
         imported = import_jbeam_topology_subset(filepath)
+        imported, selected_part_name = filter_imported_jbeam_topology_parts(imported, self.part_selection)
+        if selected_part_name:
+            context.scene["beamng_last_direct_jbeam_import_part_filter"] = selected_part_name
+        else:
+            context.scene["beamng_last_direct_jbeam_import_part_filter"] = "All parts"
+
+        if self.clear_existing:
+            collections_to_remove = [
+                collection
+                for collection in list(bpy.data.collections)
+                if collection.get("beamng_visual_type") == "direct_jbeam_topology_import"
+            ]
+            for collection in collections_to_remove:
+                if collection.name not in bpy.data.collections:
+                    continue
+                remove_collection_tree(collection)
+                bpy.data.collections.remove(collection)
+
         blocking = [
             diagnostic
             for diagnostic in imported.diagnostics
@@ -11000,6 +11094,7 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
         root["beamng_visual_type"] = "direct_jbeam_topology_import"
         root["beamng_source_path"] = str(filepath)
         root["beamng_source_sha256"] = imported.cached_source.get("sha256", "")
+        root["beamng_part_filter"] = context.scene["beamng_last_direct_jbeam_import_part_filter"]
         context.scene.collection.children.link(root)
 
         created = create_imported_jbeam_topology_meshes(imported, root)
@@ -11029,6 +11124,7 @@ class IMPORT_OT_beamng_jbeam_topology(Operator, ImportHelper):
         )
         text.clear()
         text.write(f"Source: {filepath}\n")
+        text.write(f"Part selection: {context.scene['beamng_last_direct_jbeam_import_part_filter']}\n")
         text.write(f"Parts: {len(imported.parts)}\n")
         text.write(f"Objects: {created}\n")
         text.write(f"Collection: {mesh_collection.name}\n")
