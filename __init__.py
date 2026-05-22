@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 126
+ADDON_BUILD = 127
 
 
 def addon_version_label():
@@ -1073,6 +1073,37 @@ def set_active_jbeam_assembly_part(scene, obj):
     scene["beamng_active_jbeam_part_source"] = normalize_virtual_path(obj.get("beamng_jbeam_path", ""))
 
 
+def sync_active_jbeam_part_from_selection(context):
+    obj = active_experimental_jbeam_mesh(context)
+    if obj is None:
+        return None
+    key = jbeam_assembly_part_key_for_object(obj)
+    if str(context.scene.get("beamng_active_jbeam_part_key", "") or "") != key:
+        set_active_jbeam_assembly_part(context.scene, obj)
+    apply_jbeam_active_part_reference_display(context.scene)
+    return obj
+
+
+def apply_jbeam_active_part_reference_display(scene):
+    active_key = str(scene.get("beamng_active_jbeam_part_key", "") or "")
+    for obj in experimental_jbeam_part_objects(scene):
+        is_active = bool(active_key) and jbeam_assembly_part_key_for_object(obj) == active_key
+        obj["beamng_active_part_state"] = "active" if is_active else "reference"
+        if is_active or not active_key:
+            obj.display_type = "TEXTURED"
+            obj.show_wire = True
+            obj.hide_select = False
+            obj.color = tuple(obj.get("beamng_original_view_color", obj.color))
+        else:
+            if "beamng_original_view_color" not in obj:
+                obj["beamng_original_view_color"] = tuple(obj.color)
+            base = tuple(obj.get("beamng_original_view_color", obj.color))
+            obj.display_type = "WIRE"
+            obj.show_wire = True
+            obj.hide_select = False
+            obj.color = (base[0] * 0.45, base[1] * 0.45, base[2] * 0.45, 0.35)
+
+
 def active_part_allows_topology_edit(context, obj):
     active_key = str(context.scene.get("beamng_active_jbeam_part_key", "") or "")
     if not active_key:
@@ -1112,6 +1143,7 @@ def experimental_jbeam_panel_redraw_timer():
             for obj in bpy.data.objects
         )
         if has_experimental_mesh:
+            sync_active_jbeam_part_from_selection(bpy.context)
             prefs = get_addon_preferences(bpy.context)
             if has_edit_mesh and (prefs is None or bool(getattr(prefs, "auto_sync_proxy_nodes", True))):
                 poll_experimental_jbeam_edit_mesh_proxy_sync(bpy.context.scene)
@@ -7459,6 +7491,7 @@ class BEAMNG_OT_set_active_jbeam_part_from_selection(Operator):
     def execute(self, context):
         if self.clear:
             set_active_jbeam_assembly_part(context.scene, None)
+            apply_jbeam_active_part_reference_display(context.scene)
             self.report({"INFO"}, "Cleared Active Part")
             return {"FINISHED"}
         obj = active_experimental_jbeam_mesh(context)
@@ -7467,6 +7500,7 @@ class BEAMNG_OT_set_active_jbeam_part_from_selection(Operator):
             return {"CANCELLED"}
         refresh_jbeam_assembly_parts(context.scene)
         set_active_jbeam_assembly_part(context.scene, obj)
+        apply_jbeam_active_part_reference_display(context.scene)
         self.report({"INFO"}, f"Active Part: {context.scene.get('beamng_active_jbeam_part_name', '')}")
         return {"FINISHED"}
 
@@ -7490,6 +7524,7 @@ class BEAMNG_OT_activate_jbeam_assembly_part(Operator):
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
                 set_active_jbeam_assembly_part(context.scene, obj)
+                apply_jbeam_active_part_reference_display(context.scene)
                 self.report({"INFO"}, f"Active Part: {obj.get('beamng_part_name', obj.name)}")
                 return {"FINISHED"}
         self.report({"WARNING"}, "Assembly part is no longer available")
@@ -9919,6 +9954,7 @@ def draw_jbeam_edit_status(layout, context):
 
 
 def draw_jbeam_assembly_part_controls(layout, context):
+    sync_active_jbeam_part_from_selection(context)
     active_key = str(context.scene.get("beamng_active_jbeam_part_key", "") or "")
     active_name = str(context.scene.get("beamng_active_jbeam_part_name", "") or "")
     active_object = active_jbeam_assembly_part_object(context.scene)
@@ -9934,7 +9970,8 @@ def draw_jbeam_assembly_part_controls(layout, context):
     elif active_key:
         box.label(text="Active Part missing; refresh or choose a part", icon="ERROR")
     else:
-        box.label(text="No Active Part set; tools can edit the active JBeam mesh.", icon="INFO")
+        box.label(text="Select a JBeam mesh to make it the Active Part.", icon="INFO")
+    box.label(text="Selection drives edit ownership; other parts are reference context.")
     row = box.row(align=True)
     row.operator(BEAMNG_OT_refresh_jbeam_assembly_parts.bl_idname, text="Refresh")
     row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Use Selected")
@@ -9956,7 +9993,13 @@ def draw_jbeam_assembly_part_controls(layout, context):
         row.alert = is_active
         op = row.operator(BEAMNG_OT_activate_jbeam_assembly_part.bl_idname, text=part_name)
         op.part_key = part_key
-        row.label(text=f"{int(obj.get('beamng_owned_node_count', 0) or 0)}/{int(obj.get('beamng_proxy_node_count', 0) or 0)}")
+        row.label(
+            text=(
+                f"{'Active' if is_active else 'Ref'} "
+                f"{int(obj.get('beamng_owned_node_count', 0) or 0)}/"
+                f"{int(obj.get('beamng_proxy_node_count', 0) or 0)}"
+            )
+        )
     if len(objects) > 12:
         list_box.label(text=f"+ {len(objects) - 12} more part(s); use viewport selection.")
 
