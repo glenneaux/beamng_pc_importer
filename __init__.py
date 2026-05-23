@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 134
+ADDON_BUILD = 135
 
 
 def addon_version_label():
@@ -44,24 +44,28 @@ try:
     import importlib
     from . import core as _core
     from . import dae_assets as _dae_assets
+    from . import export_review as _export_review
     from . import resolved_model as _resolved_model
     from . import slot_authoring as _slot_authoring
     from . import visuals as _visuals
 
     importlib.reload(_core)
     importlib.reload(_dae_assets)
+    importlib.reload(_export_review)
     importlib.reload(_resolved_model)
     importlib.reload(_slot_authoring)
     importlib.reload(_visuals)
 
     from .core import *
     from .dae_assets import *
+    from .export_review import *
     from .resolved_model import *
     from .slot_authoring import *
     from .visuals import *
 except ImportError:
     from core import *
     from dae_assets import *
+    from export_review import *
     from resolved_model import *
     from slot_authoring import *
     from visuals import *
@@ -5374,70 +5378,6 @@ def build_jbeam_override_export_plan(context, history):
     }
 
 
-def jbeam_override_export_plan_lines(plan):
-    lines = [
-        "[BeamNG JBeam Override Export Plan]",
-        f"Generated: {plan['generated_at']}",
-        f"Operations: {plan.get('operation_count', plan['node_update_count'])}",
-        f"New files: {plan.get('file_create_count', 0)}",
-        f"Node edits: {plan['node_update_count']}",
-        f"Topology updates: {plan.get('topology_update_count', 0)}",
-        f"Source files: {plan['source_file_count']}",
-        f"Stageable files: {plan['stageable_file_count']}",
-        f"User current folder: {plan['user_current_folder'] or '(not configured)'}",
-        f"JBeam export mod: {plan.get('export_mod_folder', '') or '(not configured)'}",
-        f"JBeam export root: {plan.get('export_root', '') or '(not configured)'}",
-        "Cache only: yes",
-        "",
-    ]
-    for warning in plan["warnings"]:
-        lines.append(f"Warning: {warning}")
-    lines.append("")
-
-    for file_group in plan["files"]:
-        lines.append(f"Source: {file_group['source_file']}")
-        lines.append(f"Virtual: {file_group['virtual_path'] or '(unknown)'}")
-        lines.append(f"Planned target: {file_group['planned_target_path'] or '(not stageable)'}")
-        lines.append(f"Can stage override: {'yes' if file_group['can_stage_override'] else 'no'}")
-        if file_group.get("is_new_file"):
-            lines.append("File status: new staged JBeam file")
-        lines.append(f"Operations: {file_group.get('operation_count', file_group['node_update_count'])}")
-        lines.append(f"Node edits: {file_group['node_update_count']}")
-        lines.append(f"Topology updates: {file_group.get('topology_update_count', 0)}")
-        for warning in file_group["warnings"]:
-            lines.append(f"File warning: {warning}")
-        for part_group in file_group["parts"]:
-            lines.append(
-                f"  Part: {part_group['part']} "
-                f"({part_group.get('operation_count', part_group['node_update_count'])} operation(s))"
-            )
-            for update in part_group.get("node_inserts", []):
-                lines.append(
-                    "    "
-                    f"insert node {update.get('node', '')}: {update.get('new_position', '')}"
-                )
-            for update in part_group["node_updates"]:
-                lines.append(
-                    "    "
-                    f"{update.get('node', '')}: "
-                    f"{update.get('old_position', '')} -> {update.get('new_position', '')}"
-                )
-            for update in part_group.get("node_deletes", []):
-                lines.append(f"    delete node {update.get('node', '')}: {update.get('old_position', '')}")
-            for update in part_group.get("beam_inserts", []):
-                lines.append(f"    insert beam: {update.get('nodes', '')}")
-            for update in part_group.get("beam_deletes", []):
-                lines.append(f"    delete beam: {update.get('nodes', '')}")
-            for update in part_group.get("triangle_inserts", []):
-                lines.append(f"    insert triangle: {update.get('nodes', '')}")
-            for update in part_group.get("triangle_deletes", []):
-                lines.append(f"    delete triangle: {update.get('nodes', '')}")
-        lines.append("")
-    if not plan["files"]:
-        lines.append("No accepted JBeam edits are recorded.")
-    return lines
-
-
 def write_jbeam_override_export_plan_report(context):
     history = jbeam_operation_history(context.scene)
     plan = build_jbeam_override_export_plan(context, history)
@@ -5552,7 +5492,7 @@ class BEAMNG_OT_review_jbeam_export(Operator):
             return {"CANCELLED"}
         report_path, plan = write_jbeam_override_export_plan_report(context)
         if selected_virtual_paths is not None:
-            plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths)
+            plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths, normalize_virtual_path)
         if plan.get("operation_count", plan.get("node_update_count", 0)) == 0:
             self.report({"WARNING"}, "No accepted JBeam edits are recorded")
             return {"CANCELLED"}
@@ -5589,7 +5529,7 @@ def draw_jbeam_export_selection(layout, context, overwrite_existing=False):
     ]
     history = jbeam_operation_history(context.scene)
     plan = build_jbeam_override_export_plan(context, history)
-    plan = filter_plan_files_for_selected_virtual_paths(plan, selected_paths)
+    plan = filter_plan_files_for_selected_virtual_paths(plan, selected_paths, normalize_virtual_path)
     counts = jbeam_export_preflight_counts(plan)
     summary = box.box()
     summary.label(text="Preflight selected edits")
@@ -5632,47 +5572,6 @@ def draw_jbeam_export_selection(layout, context, overwrite_existing=False):
         warn = box.box()
         warn.alert = True
         warn.label(text="Existing unpacked mod JBeam files may be overwritten after backup.")
-
-
-def filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths):
-    if selected_virtual_paths is None:
-        return plan
-    selected = {normalize_virtual_path(path) for path in selected_virtual_paths if path}
-    filtered = dict(plan)
-    filtered_files = [
-        file_group
-        for file_group in plan.get("files", [])
-        if normalize_virtual_path(file_group.get("virtual_path", "")) in selected
-    ]
-    filtered["files"] = filtered_files
-    filtered["source_file_count"] = len(filtered_files)
-    filtered["stageable_file_count"] = sum(1 for item in filtered_files if item.get("can_stage_override"))
-    filtered["operation_count"] = sum(int(item.get("operation_count", item.get("node_update_count", 0))) for item in filtered_files)
-    filtered["file_create_count"] = sum(int(item.get("file_create_count", 0)) for item in filtered_files)
-    filtered["node_update_count"] = sum(int(item.get("node_update_count", 0)) for item in filtered_files)
-    filtered["topology_update_count"] = sum(int(item.get("topology_update_count", 0)) for item in filtered_files)
-    if selected and not filtered_files:
-        warnings = set(filtered.get("warnings", []))
-        warnings.add("Selected export files did not match any accepted JBeam edit files.")
-        filtered["warnings"] = sorted(warnings)
-    return filtered
-
-
-def jbeam_export_preflight_counts(plan):
-    counts = defaultdict(int)
-    for file_group in plan.get("files", []):
-        counts["file_creates"] += int(file_group.get("file_create_count", 0))
-        for part_group in file_group.get("parts", []):
-            counts["node_inserts"] += len(part_group.get("node_inserts", []))
-            counts["node_updates"] += len(part_group.get("node_updates", []))
-            counts["node_deletes"] += len(part_group.get("node_deletes", []))
-            counts["beam_inserts"] += len(part_group.get("beam_inserts", []))
-            counts["beam_deletes"] += len(part_group.get("beam_deletes", []))
-            counts["beam_param_updates"] += len(part_group.get("beam_param_updates", []))
-            counts["triangle_inserts"] += len(part_group.get("triangle_inserts", []))
-            counts["triangle_deletes"] += len(part_group.get("triangle_deletes", []))
-            counts["triangle_param_updates"] += len(part_group.get("triangle_param_updates", []))
-    return counts
 
 
 def payload_node_ids(payload):
@@ -5916,7 +5815,7 @@ def store_experimental_jbeam_topology_health(scene, summary):
 def build_jbeam_export_validation(context, selected_virtual_paths=None):
     history = jbeam_operation_history(context.scene)
     plan = build_jbeam_override_export_plan(context, history)
-    plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths)
+    plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths, normalize_virtual_path)
     source_index, source_warning = jbeam_asset_source_index_for_context(context)
     warnings = set(plan.get("warnings", []))
     errors = []
@@ -7180,7 +7079,7 @@ def apply_jbeam_updates_to_payload(payload, file_group):
 def build_jbeam_patched_cache_copies(context, selected_virtual_paths=None):
     history = jbeam_operation_history(context.scene)
     plan = build_jbeam_override_export_plan(context, history)
-    plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths)
+    plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths, normalize_virtual_path)
     source_index, source_warning = jbeam_asset_source_index_for_context(context)
     if source_warning:
         plan["warnings"].append(source_warning)
@@ -8154,6 +8053,139 @@ class BEAMNG_OT_add_active_jbeam_child_slot(Operator):
         )
         set_new_jbeam_payload_for_object(obj, payload)
         self.report({"INFO"}, f"Staged child slot: {child_slot}")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_edit_active_jbeam_child_slot(Operator):
+    bl_idname = "beamng_pc_importer.edit_active_jbeam_child_slot"
+    bl_label = "Edit Active Part Child Slot"
+    bl_description = "Edit one staged child slot row on the active JBeam part; export writes the file"
+    bl_options = {"REGISTER", "UNDO"}
+
+    existing_child_slot_type: StringProperty(name="Existing Child Slot Type", default="")
+    new_child_slot_type: StringProperty(name="New Child Slot Type", default="")
+    child_default: StringProperty(name="Child Default", default="")
+    child_description: StringProperty(name="Child Description", default="")
+
+    def invoke(self, context, _event):
+        obj = active_experimental_jbeam_mesh(context)
+        payload = new_jbeam_payload_for_virtual_path(context.scene, normalize_virtual_path(obj.get("beamng_jbeam_path", ""))) if obj else None
+        part_name = str(obj.get("beamng_part_name", "") or "") if obj else ""
+        part = payload.get(part_name, {}) if isinstance(payload, dict) else {}
+        slots = part.get("slots", []) if isinstance(part, dict) else []
+        for row in slots[1:] if isinstance(slots, list) else []:
+            if isinstance(row, list) and row:
+                self.existing_child_slot_type = str(row[0])
+                self.new_child_slot_type = str(row[0])
+                self.child_default = str(row[1]) if len(row) > 1 else ""
+                self.child_description = str(row[2]) if len(row) > 2 else ""
+                break
+        return context.window_manager.invoke_props_dialog(self, width=500)
+
+    def draw(self, _context):
+        layout = self.layout
+        obj = active_experimental_jbeam_mesh(_context)
+        layout.label(text=f"Part: {obj.get('beamng_part_name', '') if obj else '(none)'}")
+        layout.prop(self, "existing_child_slot_type")
+        layout.prop(self, "new_child_slot_type")
+        layout.prop(self, "child_default")
+        layout.prop(self, "child_description")
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+            self.report({"ERROR"}, "Activate an experimental JBeam mesh first")
+            return {"CANCELLED"}
+        part_name = safe_jbeam_identifier(obj.get("beamng_part_name", ""), "")
+        virtual_path = normalize_virtual_path(obj.get("beamng_jbeam_path", ""))
+        payload = new_jbeam_payload_for_virtual_path(context.scene, virtual_path)
+        if not isinstance(payload, dict):
+            self.report({"ERROR"}, "No staged JBeam payload found for the active part")
+            return {"CANCELLED"}
+        part = payload.get(part_name, {})
+        slots = part.get("slots", []) if isinstance(part, dict) else []
+        if not isinstance(slots, list) or len(slots) <= 1:
+            self.report({"ERROR"}, "Active part has no child slot rows to edit")
+            return {"CANCELLED"}
+        existing_type = safe_jbeam_identifier(self.existing_child_slot_type, "")
+        new_type = safe_jbeam_identifier(self.new_child_slot_type, "")
+        if not existing_type or not new_type:
+            self.report({"ERROR"}, "Enter existing and new child slot types")
+            return {"CANCELLED"}
+        target_index = next((index for index, row in enumerate(slots[1:], start=1) if isinstance(row, list) and row and str(row[0]) == existing_type), -1)
+        if target_index < 0:
+            self.report({"ERROR"}, f"Child slot not found: {existing_type}")
+            return {"CANCELLED"}
+        duplicate = any(
+            index != target_index and isinstance(row, list) and row and str(row[0]) == new_type
+            for index, row in enumerate(slots[1:], start=1)
+        )
+        if duplicate:
+            self.report({"ERROR"}, f"Child slot already exists: {new_type}")
+            return {"CANCELLED"}
+        slots[target_index] = [
+            new_type,
+            safe_jbeam_identifier(self.child_default, "") if self.child_default.strip() else "",
+            self.child_description.strip() or new_type,
+        ]
+        set_new_jbeam_payload_for_object(obj, payload)
+        self.report({"INFO"}, f"Updated child slot: {existing_type} -> {new_type}")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_delete_active_jbeam_child_slot(Operator):
+    bl_idname = "beamng_pc_importer.delete_active_jbeam_child_slot"
+    bl_label = "Delete Active Part Child Slot"
+    bl_description = "Delete one staged child slot row from the active JBeam part; export writes the file"
+    bl_options = {"REGISTER", "UNDO"}
+
+    child_slot_type: StringProperty(name="Child Slot Type", default="")
+
+    def invoke(self, context, _event):
+        obj = active_experimental_jbeam_mesh(context)
+        payload = new_jbeam_payload_for_virtual_path(context.scene, normalize_virtual_path(obj.get("beamng_jbeam_path", ""))) if obj else None
+        part_name = str(obj.get("beamng_part_name", "") or "") if obj else ""
+        part = payload.get(part_name, {}) if isinstance(payload, dict) else {}
+        slots = part.get("slots", []) if isinstance(part, dict) else []
+        for row in slots[1:] if isinstance(slots, list) else []:
+            if isinstance(row, list) and row:
+                self.child_slot_type = str(row[0])
+                break
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, _context):
+        layout = self.layout
+        obj = active_experimental_jbeam_mesh(_context)
+        layout.label(text=f"Part: {obj.get('beamng_part_name', '') if obj else '(none)'}")
+        layout.prop(self, "child_slot_type")
+        warn = layout.box()
+        warn.alert = True
+        warn.label(text="Deletes staged slot metadata only. Export writes the file.")
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+            self.report({"ERROR"}, "Activate an experimental JBeam mesh first")
+            return {"CANCELLED"}
+        part_name = safe_jbeam_identifier(obj.get("beamng_part_name", ""), "")
+        virtual_path = normalize_virtual_path(obj.get("beamng_jbeam_path", ""))
+        payload = new_jbeam_payload_for_virtual_path(context.scene, virtual_path)
+        if not isinstance(payload, dict):
+            self.report({"ERROR"}, "No staged JBeam payload found for the active part")
+            return {"CANCELLED"}
+        part = payload.get(part_name, {})
+        slots = part.get("slots", []) if isinstance(part, dict) else []
+        child_slot = safe_jbeam_identifier(self.child_slot_type, "")
+        if not child_slot:
+            self.report({"ERROR"}, "Enter a child slot type")
+            return {"CANCELLED"}
+        matches = [index for index, row in enumerate(slots[1:], start=1) if isinstance(row, list) and row and str(row[0]) == child_slot]
+        if len(matches) != 1:
+            self.report({"ERROR"}, f"Child slot not found uniquely: {child_slot}")
+            return {"CANCELLED"}
+        slots.pop(matches[0])
+        set_new_jbeam_payload_for_object(obj, payload)
+        self.report({"INFO"}, f"Deleted staged child slot: {child_slot}")
         return {"FINISHED"}
 
 
@@ -10364,6 +10396,7 @@ def slot_authoring_report_lines_for_context(context):
             "slot_name": item.slot_name,
             "parent_part": item.parent_part,
             "selected_part": item.selected_part,
+            "path": item.path,
             "depth": item.depth,
             "is_core": item.is_core,
             "option_count": slot_option_count(item.options_json),
@@ -10438,6 +10471,9 @@ def draw_vehicle_slot_editor(layout, context):
     if active_mesh and active_mesh.get("beamng_visual_type") == "experimental_jbeam_mesh":
         row.operator(BEAMNG_OT_write_active_jbeam_slot_metadata.bl_idname, text="Active Part Slot Metadata")
         box.operator(BEAMNG_OT_add_active_jbeam_child_slot.bl_idname, text="Add Active Part Child Slot")
+        row = box.row(align=True)
+        row.operator(BEAMNG_OT_edit_active_jbeam_child_slot.bl_idname, text="Edit Child Slot")
+        row.operator(BEAMNG_OT_delete_active_jbeam_child_slot.bl_idname, text="Delete Child Slot")
 
     source_label = context.scene.get("beamng_slot_editor_source_pc_path", "")
     if source_label:
@@ -10616,6 +10652,9 @@ def draw_jbeam_topology_tools(layout, context, active_mesh):
     box.label(text=f"Topology delta: {active_mesh.data.get('beamng_semantic_topology_delta_count', 0)}")
     box.operator(BEAMNG_OT_write_active_jbeam_slot_metadata.bl_idname, text="Write Slot Metadata")
     box.operator(BEAMNG_OT_add_active_jbeam_child_slot.bl_idname, text="Add Child Slot")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_edit_active_jbeam_child_slot.bl_idname, text="Edit Child Slot")
+    row.operator(BEAMNG_OT_delete_active_jbeam_child_slot.bl_idname, text="Delete Child Slot")
     row = box.row(align=True)
     row.operator(BEAMNG_OT_add_standalone_jbeam_node.bl_idname, text="Add Node")
     row.operator(BEAMNG_OT_create_jbeam_beam_from_selected_nodes.bl_idname, text="Beam 2")
@@ -12643,6 +12682,8 @@ classes = (
     BEAMNG_OT_create_jbeam_part_file,
     BEAMNG_OT_write_active_jbeam_slot_metadata,
     BEAMNG_OT_add_active_jbeam_child_slot,
+    BEAMNG_OT_edit_active_jbeam_child_slot,
+    BEAMNG_OT_delete_active_jbeam_child_slot,
     BEAMNG_OT_add_standalone_jbeam_node,
     BEAMNG_OT_import_selected_nodes_as_proxies,
     BEAMNG_OT_mark_selected_nodes_for_proxy_import,

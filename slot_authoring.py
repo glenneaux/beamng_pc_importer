@@ -28,6 +28,7 @@ def slot_authoring_report_lines(
     slot_rows,
     active_part_metadata=None,
 ):
+    issues = validate_slot_authoring(slot_rows, active_part_metadata)
     lines = [
         "[BeamNG Slot Authoring Report]",
         f"Generated: {datetime.now().isoformat(timespec='seconds')}",
@@ -35,6 +36,7 @@ def slot_authoring_report_lines(
         f"Vehicle/model: {vehicle_model or '(unknown)'}",
         f"Rows loaded: {len(slot_rows)}",
         f"Dirty: {bool(dirty)}",
+        f"Issues: {len(issues)}",
         "",
         "Configuration slots:",
     ]
@@ -58,6 +60,12 @@ def slot_authoring_report_lines(
     else:
         lines.append("- No active topology part slot metadata found.")
 
+    lines.extend(["", "Validation:"])
+    if issues:
+        lines.extend(f"- {issue}" for issue in issues)
+    else:
+        lines.append("- no slot authoring issues found")
+
     lines.extend(
         [
             "",
@@ -68,3 +76,31 @@ def slot_authoring_report_lines(
         ]
     )
     return lines
+
+
+def validate_slot_authoring(slot_rows, active_part_metadata=None):
+    issues = []
+    seen_paths = set()
+    for row in slot_rows:
+        slot_name = row.get("slot_name") or ""
+        path = row.get("path") or slot_name
+        if path in seen_paths:
+            issues.append(f"Duplicate slot row path/name in configuration tree: {path}")
+        seen_paths.add(path)
+        if row.get("is_core") and not row.get("selected_part"):
+            issues.append(f"Core slot has no selected part: {slot_name or '(unnamed slot)'}")
+
+    active_part_metadata = active_part_metadata or {}
+    if active_part_metadata:
+        if not active_part_metadata.get("slot_type"):
+            issues.append(f"Active part has no slotType: {active_part_metadata.get('part_name') or '(unknown part)'}")
+        child_types = []
+        for row in active_part_metadata.get("child_slots") or []:
+            child_type = str(row[0] if row else "")
+            if not child_type:
+                issues.append("Active part has a child slot row with an empty type")
+                continue
+            if child_type in child_types:
+                issues.append(f"Active part has duplicate child slot type: {child_type}")
+            child_types.append(child_type)
+    return issues
