@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 133
+ADDON_BUILD = 134
 
 
 def addon_version_label():
@@ -45,21 +45,25 @@ try:
     from . import core as _core
     from . import dae_assets as _dae_assets
     from . import resolved_model as _resolved_model
+    from . import slot_authoring as _slot_authoring
     from . import visuals as _visuals
 
     importlib.reload(_core)
     importlib.reload(_dae_assets)
     importlib.reload(_resolved_model)
+    importlib.reload(_slot_authoring)
     importlib.reload(_visuals)
 
     from .core import *
     from .dae_assets import *
     from .resolved_model import *
+    from .slot_authoring import *
     from .visuals import *
 except ImportError:
     from core import *
     from dae_assets import *
     from resolved_model import *
+    from slot_authoring import *
     from visuals import *
 
 
@@ -8079,6 +8083,80 @@ class BEAMNG_OT_write_active_jbeam_slot_metadata(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_add_active_jbeam_child_slot(Operator):
+    bl_idname = "beamng_pc_importer.add_active_jbeam_child_slot"
+    bl_label = "Add Active Part Child Slot"
+    bl_description = "Stage one child slot row on the active JBeam part; export writes the file"
+    bl_options = {"REGISTER", "UNDO"}
+
+    child_slot_type: StringProperty(name="Child Slot Type", default="")
+    child_default: StringProperty(name="Child Default", default="")
+    child_description: StringProperty(name="Child Description", default="")
+
+    def invoke(self, context, _event):
+        obj = active_experimental_jbeam_mesh(context)
+        part_name = str(obj.get("beamng_part_name", "")) if obj else ""
+        if not self.child_slot_type:
+            self.child_slot_type = f"{part_name}_slot" if part_name else ""
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, _context):
+        layout = self.layout
+        obj = active_experimental_jbeam_mesh(_context)
+        layout.label(text=f"Part: {obj.get('beamng_part_name', '') if obj else '(none)'}")
+        layout.prop(self, "child_slot_type")
+        layout.prop(self, "child_default")
+        layout.prop(self, "child_description")
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context)
+        if obj is None or obj.get("beamng_visual_type") != "experimental_jbeam_mesh":
+            self.report({"ERROR"}, "Activate an experimental JBeam mesh first")
+            return {"CANCELLED"}
+        part_name = safe_jbeam_identifier(obj.get("beamng_part_name", ""), "")
+        if not part_name:
+            self.report({"ERROR"}, "Active JBeam mesh has no part name")
+            return {"CANCELLED"}
+        child_slot = safe_jbeam_identifier(self.child_slot_type, "")
+        if not child_slot:
+            self.report({"ERROR"}, "Enter a child slot type")
+            return {"CANCELLED"}
+
+        virtual_path = normalize_virtual_path(obj.get("beamng_jbeam_path", ""))
+        if not virtual_path:
+            vehicle = jbeam_authoring_vehicle_name(context)
+            virtual_path = normalize_virtual_path(Path("vehicles") / vehicle / f"{part_name}.jbeam")
+            obj["beamng_jbeam_path"] = virtual_path
+        payload = new_jbeam_payload_for_virtual_path(context.scene, virtual_path)
+        if payload is None:
+            payload = new_jbeam_part_payload(part_name, part_name)
+        part = payload.setdefault(part_name, {})
+        if not isinstance(part, dict):
+            self.report({"ERROR"}, f"Target part is not an object: {part_name}")
+            return {"CANCELLED"}
+        part.setdefault("slotType", part_name)
+        slots = part.setdefault("slots", [["type", "default", "description"]])
+        if not isinstance(slots, list):
+            slots = [["type", "default", "description"]]
+            part["slots"] = slots
+        if not slots:
+            slots.append(["type", "default", "description"])
+        existing_types = {str(row[0]) for row in slots[1:] if isinstance(row, list) and row}
+        if child_slot in existing_types:
+            self.report({"WARNING"}, f"Child slot already exists: {child_slot}")
+            return {"CANCELLED"}
+        slots.append(
+            [
+                child_slot,
+                safe_jbeam_identifier(self.child_default, "") if self.child_default.strip() else "",
+                self.child_description.strip() or child_slot,
+            ]
+        )
+        set_new_jbeam_payload_for_object(obj, payload)
+        self.report({"INFO"}, f"Staged child slot: {child_slot}")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_add_standalone_jbeam_node(Operator):
     bl_idname = "beamng_pc_importer.add_standalone_jbeam_node"
     bl_label = "Add Standalone Node"
@@ -10277,67 +10355,45 @@ class BEAMNG_OT_save_as_slot_configuration(Operator):
             return {"CANCELLED"}
 
 
-def slot_authoring_report_lines(context):
+def slot_authoring_report_lines_for_context(context):
     scene = context.scene
     slot_items = getattr(scene, "beamng_slot_editor_items", [])
     active_mesh = active_experimental_jbeam_mesh(context)
-    lines = [
-        "[BeamNG Slot Authoring Report]",
-        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
-        f"Root part: {scene.get('beamng_slot_editor_main_part', '') or '(none)'}",
-        f"Vehicle/model: {scene.get('beamng_slot_editor_model', '') or '(unknown)'}",
-        f"Rows loaded: {len(slot_items)}",
-        f"Dirty: {bool(scene.get('beamng_slot_editor_dirty', False))}",
-        "",
-        "Configuration slots:",
+    slot_rows = [
+        {
+            "slot_name": item.slot_name,
+            "parent_part": item.parent_part,
+            "selected_part": item.selected_part,
+            "depth": item.depth,
+            "is_core": item.is_core,
+            "option_count": slot_option_count(item.options_json),
+        }
+        for item in slot_items
     ]
-    if slot_items:
-        for item in slot_items:
-            indent = "  " * min(int(item.depth), 8)
-            option_count = 0
-            try:
-                option_count = len(json.loads(item.options_json or "[]"))
-            except (TypeError, ValueError):
-                option_count = 0
-            lines.append(
-                f"- {indent}{item.slot_name or '(unnamed slot)'} | "
-                f"parent={item.parent_part or '(none)'} | "
-                f"selected={item.selected_part or '(empty)'} | "
-                f"options={option_count} | "
-                f"{'core' if item.is_core else 'optional'}"
-            )
-    else:
-        lines.append("- none loaded")
-    lines.extend(["", "Active part slot metadata:"])
+    active_part_metadata = None
     if active_mesh and active_mesh.get("beamng_visual_type") == "experimental_jbeam_mesh":
         payload = new_jbeam_payload_for_virtual_path(context.scene, normalize_virtual_path(active_mesh.get("beamng_jbeam_path", "")))
         part_name = str(active_mesh.get("beamng_part_name", "") or "")
         part_data = payload.get(part_name, {}) if isinstance(payload, dict) else {}
         if isinstance(part_data, dict) and part_data:
-            lines.append(f"- Part: {part_name}")
-            lines.append(f"- slotType: {part_data.get('slotType', '(unset)')}")
             slots = part_data.get("slots", [])
+            child_slots = []
             if isinstance(slots, list) and len(slots) > 1:
-                lines.append("- Child slots:")
                 for row in slots[1:]:
                     if isinstance(row, list):
-                        lines.append(f"  - {row}")
-            else:
-                lines.append("- Child slots: none")
-        else:
-            lines.append("- No staged slot metadata found for the active topology part.")
-    else:
-        lines.append("- No active topology part.")
-    lines.extend(
-        [
-            "",
-            "Remaining slot authoring work:",
-            "- Dedicated editor for slotType, child slots, defaults, descriptions, and part availability.",
-            "- Safe part rename/reference migration.",
-            "- Validation that new parts are reachable from at least one slot tree path.",
-        ]
+                        child_slots.append(row)
+            active_part_metadata = {
+                "part_name": part_name,
+                "slot_type": part_data.get("slotType", ""),
+                "child_slots": child_slots,
+            }
+    return slot_authoring_report_lines(
+        root_part=scene.get("beamng_slot_editor_main_part", ""),
+        vehicle_model=scene.get("beamng_slot_editor_model", ""),
+        dirty=scene.get("beamng_slot_editor_dirty", False),
+        slot_rows=slot_rows,
+        active_part_metadata=active_part_metadata,
     )
-    return lines
 
 
 class BEAMNG_OT_write_slot_authoring_report(Operator):
@@ -10347,7 +10403,7 @@ class BEAMNG_OT_write_slot_authoring_report(Operator):
     bl_options = {"REGISTER"}
 
     def execute(self, context):
-        lines = slot_authoring_report_lines(context)
+        lines = slot_authoring_report_lines_for_context(context)
         text = bpy.data.texts.get("BeamNG Slot Authoring Report") or bpy.data.texts.new("BeamNG Slot Authoring Report")
         text.clear()
         text.write("\n".join(lines) + "\n")
@@ -10381,6 +10437,7 @@ def draw_vehicle_slot_editor(layout, context):
     active_mesh = active_experimental_jbeam_mesh(context)
     if active_mesh and active_mesh.get("beamng_visual_type") == "experimental_jbeam_mesh":
         row.operator(BEAMNG_OT_write_active_jbeam_slot_metadata.bl_idname, text="Active Part Slot Metadata")
+        box.operator(BEAMNG_OT_add_active_jbeam_child_slot.bl_idname, text="Add Active Part Child Slot")
 
     source_label = context.scene.get("beamng_slot_editor_source_pc_path", "")
     if source_label:
@@ -10558,6 +10615,7 @@ def draw_jbeam_topology_tools(layout, context, active_mesh):
     box.label(text=f"Topology revision: {active_mesh.data.get('beamng_topology_revision', 0)}")
     box.label(text=f"Topology delta: {active_mesh.data.get('beamng_semantic_topology_delta_count', 0)}")
     box.operator(BEAMNG_OT_write_active_jbeam_slot_metadata.bl_idname, text="Write Slot Metadata")
+    box.operator(BEAMNG_OT_add_active_jbeam_child_slot.bl_idname, text="Add Child Slot")
     row = box.row(align=True)
     row.operator(BEAMNG_OT_add_standalone_jbeam_node.bl_idname, text="Add Node")
     row.operator(BEAMNG_OT_create_jbeam_beam_from_selected_nodes.bl_idname, text="Beam 2")
@@ -12584,6 +12642,7 @@ classes = (
     BEAMNG_OT_check_experimental_jbeam_topology_health,
     BEAMNG_OT_create_jbeam_part_file,
     BEAMNG_OT_write_active_jbeam_slot_metadata,
+    BEAMNG_OT_add_active_jbeam_child_slot,
     BEAMNG_OT_add_standalone_jbeam_node,
     BEAMNG_OT_import_selected_nodes_as_proxies,
     BEAMNG_OT_mark_selected_nodes_for_proxy_import,
