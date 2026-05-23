@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 137
+ADDON_BUILD = 138
 
 
 def addon_version_label():
@@ -10469,6 +10469,9 @@ def draw_vehicle_slot_editor(layout, context):
     box.label(text="Configuration Editor")
     if not slot_items:
         box.label(text="Import a .pc to populate the slot tree")
+        row = box.row(align=True)
+        row.operator(IMPORT_OT_beamng_pc_from_assets.bl_idname, text="Load From Assets")
+        row.operator(IMPORT_OT_beamng_pc.bl_idname, text="Load .pc File")
         return
 
     main_part = context.scene.get("beamng_slot_editor_main_part", "")
@@ -10925,7 +10928,11 @@ class VIEW3D_PT_beamng_pc_importer(Panel):
         layout.label(text=f"Export mod: {jbeam_export_mod_name(context)}")
         status = "Blocked" if counts["missing_refs"] else "Dirty" if counts["pending"] or counts["history"] else "Clean"
         layout.label(text=f"Status: {status}", icon="ERROR" if status == "Blocked" else "INFO")
-        layout.operator(IMPORT_OT_beamng_jbeam_topology.bl_idname, text="Import JBeam Topology")
+        import_box = layout.box()
+        import_box.label(text="Load / Import", icon="IMPORT")
+        import_box.operator(IMPORT_OT_beamng_pc_from_assets.bl_idname, text="Load Config From BeamNG Assets")
+        import_box.operator(IMPORT_OT_beamng_pc.bl_idname, text="Load Config From .pc File")
+        import_box.operator(IMPORT_OT_beamng_jbeam_topology.bl_idname, text="Import JBeam Topology")
         draw_beamng_visibility_controls(layout, context)
         draw_beamng_view_controls(layout, context)
         layout.separator()
@@ -11028,7 +11035,9 @@ def draw_authoring_workflow_panel(layout, context):
     box.label(text=f"Active: {active_name or '(none)'} / parts: {part_count} / slots: {slot_count}")
     box.label(text=f"Pending: {counts['pending']} / accepted: {counts['history']}")
     row = box.row(align=True)
+    row.operator(IMPORT_OT_beamng_pc_from_assets.bl_idname, text="Load PC Assets")
     row.operator(IMPORT_OT_beamng_jbeam_topology.bl_idname, text="Import JBeam")
+    row = box.row(align=True)
     row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Use Selected Part")
     row = box.row(align=True)
     row.operator(BEAMNG_OT_validate_jbeam_assembly.bl_idname, text="Validate Assembly")
@@ -11467,6 +11476,10 @@ class SCENE_PT_beamng_configuration_editor(Panel):
     def draw(self, context):
         layout = self.layout
         layout.label(text=f"Version: {addon_version_label()}")
+        load_box = layout.box()
+        load_box.label(text="Load Configuration", icon="IMPORT")
+        load_box.operator(IMPORT_OT_beamng_pc_from_assets.bl_idname, text="Load From BeamNG Assets")
+        load_box.operator(IMPORT_OT_beamng_pc.bl_idname, text="Load From .pc File")
         draw_vehicle_slot_editor(layout, context)
 
 
