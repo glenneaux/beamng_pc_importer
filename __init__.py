@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 141
+ADDON_BUILD = 142
 
 
 def addon_version_label():
@@ -10194,6 +10194,10 @@ class BEAMNG_OT_print_prop_transforms(Operator):
                     f"  anchor_origin=({format_vector(obj.get('beamng_prop_anchor_origin', (0.0, 0.0, 0.0)))})",
                     f"  anchor_x_ref=({format_vector(obj.get('beamng_prop_anchor_x_ref', (0.0, 0.0, 0.0)))})",
                     f"  anchor_y_ref=({format_vector(obj.get('beamng_prop_anchor_y_ref', (0.0, 0.0, 0.0)))})",
+                    f"  anchor_x_axis=({format_vector(obj.get('beamng_prop_anchor_x_axis', (0.0, 0.0, 0.0)))})",
+                    f"  anchor_y_axis=({format_vector(obj.get('beamng_prop_anchor_y_axis', (0.0, 0.0, 0.0)))})",
+                    f"  anchor_z_axis=({format_vector(obj.get('beamng_prop_anchor_z_axis', (0.0, 0.0, 0.0)))})",
+                    f"  anchor_determinant={float(obj.get('beamng_prop_anchor_determinant', 0.0)):.6f}",
                     f"  missing_anchor_nodes={obj.get('beamng_prop_missing_anchor_nodes', ())}",
                     f"  local_translation=({format_vector(obj.get('beamng_prop_local_translation', (0.0, 0.0, 0.0)))})",
                     f"  global_translation=({format_vector(obj.get('beamng_prop_global_translation', (0.0, 0.0, 0.0)))})",

@@ -45,6 +45,10 @@ class FlexbodySpec:
     debug_prop_base_rotation: tuple = field(default_factory=tuple)
     debug_prop_row_rotation: tuple = field(default_factory=tuple)
     debug_prop_anim_factor: float = 0.0
+    debug_prop_anchor_x_axis: tuple = field(default_factory=tuple)
+    debug_prop_anchor_y_axis: tuple = field(default_factory=tuple)
+    debug_prop_anchor_z_axis: tuple = field(default_factory=tuple)
+    debug_prop_anchor_determinant: float = 0.0
 
 
 @dataclass
@@ -800,7 +804,7 @@ def matrix_from_axes(origin, x_axis, y_axis):
     x_axis = x_axis.normalized() if x_axis.length > 0.000001 else Vector((1.0, 0.0, 0.0))
     y_axis = y_axis - x_axis * y_axis.dot(x_axis)
     y_axis = y_axis.normalized() if y_axis.length > 0.000001 else Vector((0.0, 1.0, 0.0))
-    z_axis = y_axis.cross(x_axis)
+    z_axis = x_axis.cross(y_axis)
     z_axis = z_axis.normalized() if z_axis.length > 0.000001 else Vector((0.0, 0.0, 1.0))
 
     return Matrix(
@@ -2357,10 +2361,15 @@ def get_prop_anchor(row, local_node_positions, global_node_positions):
 
     rotation = matrix_from_axes(origin, x_ref - origin, y_ref - origin)
     rotation.translation = Vector((0.0, 0.0, 0.0))
+    rotation_3x3 = rotation.to_3x3()
     debug = {
         "origin": origin,
         "x_ref": x_ref,
         "y_ref": y_ref,
+        "x_axis": rotation_3x3.col[0],
+        "y_axis": rotation_3x3.col[1],
+        "z_axis": rotation_3x3.col[2],
+        "determinant": rotation_3x3.determinant(),
     }
     return origin, rotation, debug
 
@@ -2505,6 +2514,10 @@ def parse_props(
                     for value in row_rotation_vec
                 ),
                 debug_prop_anim_factor=round(row_anim_factor, 6),
+                debug_prop_anchor_x_axis=tuple(round(value, 6) for value in anchor_debug.get("x_axis", ())),
+                debug_prop_anchor_y_axis=tuple(round(value, 6) for value in anchor_debug.get("y_axis", ())),
+                debug_prop_anchor_z_axis=tuple(round(value, 6) for value in anchor_debug.get("z_axis", ())),
+                debug_prop_anchor_determinant=round(float(anchor_debug.get("determinant", 0.0)), 6),
             )
         )
     return results

@@ -34,10 +34,10 @@ def test_prop_anchor_basis_and_local_translation_follow_beamng_docs():
 
     assert len(specs) == 1
     matrix = specs[0].transform_matrix
-    assert_vector_close(matrix.to_translation(), (2.0, 4.0, 0.0))
+    assert_vector_close(matrix.to_translation(), (2.0, 4.0, 6.0))
     assert_vector_close(matrix.col[0].to_3d(), (1.0, 0.0, 0.0))
     assert_vector_close(matrix.col[1].to_3d(), (0.0, 1.0, 0.0))
-    assert_vector_close(matrix.col[2].to_3d(), (0.0, 0.0, -1.0))
+    assert_vector_close(matrix.col[2].to_3d(), (0.0, 0.0, 1.0))
 
 
 def test_prop_inherited_options_and_static_function_factor_are_applied():
