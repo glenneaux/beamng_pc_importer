@@ -1165,15 +1165,6 @@ def matrix_scale_only(matrix):
     return Matrix.Diagonal((abs(scale.x), abs(scale.y), abs(scale.z), 1.0))
 
 
-def prop_keeps_template_orientation(mesh_name: str) -> bool:
-    key = normalized_name(mesh_name)
-    return (
-        "enginefan" in key
-        or "enginepulley" in key
-        or "slipshaft" in key
-    )
-
-
 def bake_negative_handedness_into_mesh(instance, target_matrix):
     if target_matrix.to_3x3().determinant() >= 0.0:
         return target_matrix, False
@@ -1203,8 +1194,12 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
     instance["beamng_spec_pos"] = tuple(round(value, 6) for value in spec.pos)
     instance["beamng_spec_rot_deg"] = tuple(round(value, 6) for value in spec.rot)
     instance["beamng_spec_scale"] = tuple(round(value, 6) for value in spec.scale)
-    template_location, _template_rotation, template_scale = template_obj.matrix_world.decompose()
+    template_location, template_rotation, template_scale = template_obj.matrix_world.decompose()
     instance["beamng_template_scale"] = tuple(round(value, 6) for value in template_scale)
+    instance["beamng_template_rotation_deg"] = tuple(
+        round(math.degrees(value), 6)
+        for value in template_rotation.to_euler("XYZ")
+    )
     if spec.debug_anchor_nodes:
         instance["beamng_prop_anchor_nodes"] = spec.debug_anchor_nodes
     if spec.debug_anchor_origin:
@@ -1240,11 +1235,7 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
     else:
         template_transform = matrix_without_translation(template_obj.matrix_world)
         if spec.source_type == "prop":
-            if prop_keeps_template_orientation(spec.mesh):
-                instance["beamng_prop_template_orientation_mode"] = "template_rotation"
-            else:
-                template_transform = matrix_scale_only(template_obj.matrix_world)
-                instance["beamng_prop_template_orientation_mode"] = "scale_only"
+            instance["beamng_prop_template_orientation_mode"] = "template_rotation"
         target_matrix = spec.transform_matrix @ template_transform
     if spec.source_type == "prop":
         target_matrix, normalized_negative_scale = bake_negative_handedness_into_mesh(instance, target_matrix)
