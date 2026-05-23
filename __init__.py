@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 132
+ADDON_BUILD = 133
 
 
 def addon_version_label():
@@ -5528,6 +5528,39 @@ class BEAMNG_OT_set_jbeam_export_selection(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_review_jbeam_export(Operator):
+    bl_idname = "beamng_pc_importer.review_jbeam_export"
+    bl_label = "Review JBeam Export"
+    bl_description = "Open the changed-file export checklist and write a non-destructive review report"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, _event):
+        populate_jbeam_export_file_selection(context)
+        return context.window_manager.invoke_props_dialog(self, width=820)
+
+    def draw(self, context):
+        draw_jbeam_export_selection(self.layout, context, overwrite_existing=False)
+
+    def execute(self, context):
+        selected_virtual_paths = selected_jbeam_export_virtual_paths(context.scene)
+        if selected_virtual_paths is not None and not selected_virtual_paths:
+            self.report({"WARNING"}, "No JBeam files selected for export review")
+            return {"CANCELLED"}
+        report_path, plan = write_jbeam_override_export_plan_report(context)
+        if selected_virtual_paths is not None:
+            plan = filter_plan_files_for_selected_virtual_paths(plan, selected_virtual_paths)
+        if plan.get("operation_count", plan.get("node_update_count", 0)) == 0:
+            self.report({"WARNING"}, "No accepted JBeam edits are recorded")
+            return {"CANCELLED"}
+        text = bpy.data.texts.get("BeamNG JBeam Export Review") or bpy.data.texts.new("BeamNG JBeam Export Review")
+        text.clear()
+        text.write("\n".join(jbeam_override_export_plan_lines(plan)))
+        text.write("\n")
+        context.scene["beamng_jbeam_last_export_review_path"] = str(report_path)
+        self.report({"INFO"}, f"Reviewed {len(plan.get('files', []))} changed JBeam file(s): {report_path}")
+        return {"FINISHED"}
+
+
 def draw_jbeam_export_selection(layout, context, overwrite_existing=False):
     items = getattr(context.scene, "beamng_jbeam_export_file_items", [])
     box = layout.box()
@@ -10244,6 +10277,88 @@ class BEAMNG_OT_save_as_slot_configuration(Operator):
             return {"CANCELLED"}
 
 
+def slot_authoring_report_lines(context):
+    scene = context.scene
+    slot_items = getattr(scene, "beamng_slot_editor_items", [])
+    active_mesh = active_experimental_jbeam_mesh(context)
+    lines = [
+        "[BeamNG Slot Authoring Report]",
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"Root part: {scene.get('beamng_slot_editor_main_part', '') or '(none)'}",
+        f"Vehicle/model: {scene.get('beamng_slot_editor_model', '') or '(unknown)'}",
+        f"Rows loaded: {len(slot_items)}",
+        f"Dirty: {bool(scene.get('beamng_slot_editor_dirty', False))}",
+        "",
+        "Configuration slots:",
+    ]
+    if slot_items:
+        for item in slot_items:
+            indent = "  " * min(int(item.depth), 8)
+            option_count = 0
+            try:
+                option_count = len(json.loads(item.options_json or "[]"))
+            except (TypeError, ValueError):
+                option_count = 0
+            lines.append(
+                f"- {indent}{item.slot_name or '(unnamed slot)'} | "
+                f"parent={item.parent_part or '(none)'} | "
+                f"selected={item.selected_part or '(empty)'} | "
+                f"options={option_count} | "
+                f"{'core' if item.is_core else 'optional'}"
+            )
+    else:
+        lines.append("- none loaded")
+    lines.extend(["", "Active part slot metadata:"])
+    if active_mesh and active_mesh.get("beamng_visual_type") == "experimental_jbeam_mesh":
+        payload = new_jbeam_payload_for_virtual_path(context.scene, normalize_virtual_path(active_mesh.get("beamng_jbeam_path", "")))
+        part_name = str(active_mesh.get("beamng_part_name", "") or "")
+        part_data = payload.get(part_name, {}) if isinstance(payload, dict) else {}
+        if isinstance(part_data, dict) and part_data:
+            lines.append(f"- Part: {part_name}")
+            lines.append(f"- slotType: {part_data.get('slotType', '(unset)')}")
+            slots = part_data.get("slots", [])
+            if isinstance(slots, list) and len(slots) > 1:
+                lines.append("- Child slots:")
+                for row in slots[1:]:
+                    if isinstance(row, list):
+                        lines.append(f"  - {row}")
+            else:
+                lines.append("- Child slots: none")
+        else:
+            lines.append("- No staged slot metadata found for the active topology part.")
+    else:
+        lines.append("- No active topology part.")
+    lines.extend(
+        [
+            "",
+            "Remaining slot authoring work:",
+            "- Dedicated editor for slotType, child slots, defaults, descriptions, and part availability.",
+            "- Safe part rename/reference migration.",
+            "- Validation that new parts are reachable from at least one slot tree path.",
+        ]
+    )
+    return lines
+
+
+class BEAMNG_OT_write_slot_authoring_report(Operator):
+    bl_idname = "beamng_pc_importer.write_slot_authoring_report"
+    bl_label = "Write Slot Authoring Report"
+    bl_description = "Write a report describing current configuration slots and staged active-part slot metadata"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        lines = slot_authoring_report_lines(context)
+        text = bpy.data.texts.get("BeamNG Slot Authoring Report") or bpy.data.texts.new("BeamNG Slot Authoring Report")
+        text.clear()
+        text.write("\n".join(lines) + "\n")
+        report_path = persistent_cache_dir() / "jbeam_editor" / f"slot_authoring_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        context.scene["beamng_jbeam_last_slot_authoring_report_path"] = str(report_path)
+        self.report({"INFO"}, f"Wrote slot authoring report: {report_path}")
+        return {"FINISHED"}
+
+
 def draw_vehicle_slot_editor(layout, context):
     slot_items = getattr(context.scene, "beamng_slot_editor_items", [])
     box = layout.box()
@@ -10261,10 +10376,17 @@ def draw_vehicle_slot_editor(layout, context):
     row = box.row(align=True)
     row.operator(BEAMNG_OT_save_slot_configuration.bl_idname, text="Save PC")
     row.operator(BEAMNG_OT_save_as_slot_configuration.bl_idname, text="Save PC As...")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_write_slot_authoring_report.bl_idname, text="Slot Report")
+    active_mesh = active_experimental_jbeam_mesh(context)
+    if active_mesh and active_mesh.get("beamng_visual_type") == "experimental_jbeam_mesh":
+        row.operator(BEAMNG_OT_write_active_jbeam_slot_metadata.bl_idname, text="Active Part Slot Metadata")
 
     source_label = context.scene.get("beamng_slot_editor_source_pc_path", "")
     if source_label:
         box.label(text=f"Source: {Path(source_label).name}")
+    if context.scene.get("beamng_slot_editor_dirty", False):
+        box.label(text="Unsaved slot choices are dirty.", icon="ERROR")
 
     expanded_by_path = {item.path: item.expanded for item in slot_items}
     for item in slot_items:
@@ -10790,6 +10912,9 @@ def draw_authoring_workflow_panel(layout, context):
     row = box.row(align=True)
     row.operator(BEAMNG_OT_validate_jbeam_assembly.bl_idname, text="Validate Assembly")
     row.operator(BEAMNG_OT_write_authoring_workflow_report.bl_idname, text="Workflow Report")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_write_slot_authoring_report.bl_idname, text="Slot Report")
+    row.operator(BEAMNG_OT_write_jbeam_edit_preview.bl_idname, text="Semantic Edit Preview")
 
     flow_box = layout.box()
     flow_box.label(text="Milestones 1-7")
@@ -10812,7 +10937,10 @@ def draw_authoring_workflow_panel(layout, context):
     row = export_box.row(align=True)
     row.enabled = counts["history"] > 0
     row.operator(BEAMNG_OT_validate_jbeam_export.bl_idname, text="Validate")
-    row.operator(BEAMNG_OT_stage_jbeam_user_override_copies.bl_idname, text="Review/Stage")
+    row.operator(BEAMNG_OT_review_jbeam_export.bl_idname, text="Review")
+    row = export_box.row(align=True)
+    row.enabled = counts["history"] > 0
+    row.operator(BEAMNG_OT_stage_jbeam_user_override_copies.bl_idname, text="Stage New")
     row = export_box.row(align=True)
     row.enabled = counts["history"] > 0
     row.operator(BEAMNG_OT_quick_export_jbeam_node_moves.bl_idname, text="Quick Export")
@@ -10839,6 +10967,7 @@ class VIEW3D_PT_beamng_jbeam_export(Panel):
         row = layout.row(align=True)
         row.enabled = history_count > 0
         row.operator(BEAMNG_OT_validate_jbeam_export.bl_idname, text="Validate")
+        row.operator(BEAMNG_OT_review_jbeam_export.bl_idname, text="Review")
         row = layout.row(align=True)
         row.enabled = history_count > 0
         row.operator(BEAMNG_OT_stage_jbeam_user_override_copies.bl_idname, text="Stage New")
@@ -12483,6 +12612,7 @@ classes = (
     BEAMNG_OT_write_jbeam_node_patch_draft,
     BEAMNG_OT_write_jbeam_override_export_plan,
     BEAMNG_OT_set_jbeam_export_selection,
+    BEAMNG_OT_review_jbeam_export,
     BEAMNG_OT_validate_jbeam_export,
     BEAMNG_OT_write_jbeam_patched_cache_copies,
     BEAMNG_OT_stage_jbeam_user_override_copies,
@@ -12498,6 +12628,7 @@ classes = (
     BEAMNG_OT_revert_slot_change,
     BEAMNG_OT_save_slot_configuration,
     BEAMNG_OT_save_as_slot_configuration,
+    BEAMNG_OT_write_slot_authoring_report,
     VIEW3D_PT_beamng_pc_importer,
     VIEW3D_PT_beamng_jbeam_edit,
     VIEW3D_PT_beamng_jbeam_health,
