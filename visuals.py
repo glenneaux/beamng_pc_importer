@@ -1165,6 +1165,15 @@ def matrix_scale_only(matrix):
     return Matrix.Diagonal((abs(scale.x), abs(scale.y), abs(scale.z), 1.0))
 
 
+def prop_keeps_template_orientation(mesh_name: str) -> bool:
+    key = normalized_name(mesh_name)
+    return (
+        "enginefan" in key
+        or "enginepulley" in key
+        or "slipshaft" in key
+    )
+
+
 def bake_negative_handedness_into_mesh(instance, target_matrix):
     if target_matrix.to_3x3().determinant() >= 0.0:
         return target_matrix, False
@@ -1235,7 +1244,11 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
     else:
         template_transform = matrix_without_translation(template_obj.matrix_world)
         if spec.source_type == "prop":
-            instance["beamng_prop_template_orientation_mode"] = "template_rotation"
+            if prop_keeps_template_orientation(spec.mesh):
+                instance["beamng_prop_template_orientation_mode"] = "template_rotation"
+            else:
+                template_transform = matrix_scale_only(template_obj.matrix_world)
+                instance["beamng_prop_template_orientation_mode"] = "scale_only"
         target_matrix = spec.transform_matrix @ template_transform
     if spec.source_type == "prop":
         target_matrix, normalized_negative_scale = bake_negative_handedness_into_mesh(instance, target_matrix)

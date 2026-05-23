@@ -776,28 +776,38 @@ def matrix_from_trs(pos=None, rot=None, scale=None):
     return translation @ rotation @ scale_matrix
 
 
+def axis_rotation_matrix(axis: str, degrees: float):
+    radians = math.radians(float(degrees))
+    if axis == "X":
+        return Matrix.Rotation(radians, 4, "X")
+    if axis == "Y":
+        return Matrix.Rotation(radians, 4, "Y")
+    if axis == "Z":
+        return Matrix.Rotation(radians, 4, "Z")
+    return Matrix.Identity(4)
+
+
+def intrinsic_axis_rotation(sequence):
+    result = Matrix.Identity(4)
+    for axis, degrees in sequence:
+        # Intrinsic rotations are applied around the prop's current local axes.
+        result = result @ axis_rotation_matrix(axis, degrees)
+    return result
+
+
 def prop_base_rotation_matrix(rot: Vector):
     # BeamNG docs: props baseRotation uses intrinsic Euler -X -Z +Y.
-    return Euler(
-        (math.radians(-rot.x), math.radians(rot.y), math.radians(-rot.z)),
-        "XZY",
-    ).to_matrix().to_4x4()
+    return intrinsic_axis_rotation((("X", -rot.x), ("Z", -rot.z), ("Y", rot.y)))
 
 
 def prop_anim_rotation_matrix(rot: Vector):
     # BeamNG docs: props animated rotation uses intrinsic Euler -X -Z -Y.
-    return Euler(
-        (math.radians(-rot.x), math.radians(-rot.y), math.radians(-rot.z)),
-        "XZY",
-    ).to_matrix().to_4x4()
+    return intrinsic_axis_rotation((("X", -rot.x), ("Z", -rot.z), ("Y", -rot.y)))
 
 
 def prop_global_rotation_matrix(rot: Vector):
     # BeamNG docs: props baseRotationGlobal uses intrinsic Euler +Y +Z +X.
-    return Euler(
-        (math.radians(rot.x), math.radians(rot.y), math.radians(rot.z)),
-        "YZX",
-    ).to_matrix().to_4x4()
+    return intrinsic_axis_rotation((("Y", rot.y), ("Z", rot.z), ("X", rot.x)))
 
 
 def matrix_from_axes(origin, x_axis, y_axis):
