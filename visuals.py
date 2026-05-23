@@ -1228,6 +1228,8 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
     if spec.debug_prop_row_rotation:
         instance["beamng_prop_row_rotation_deg"] = spec.debug_prop_row_rotation
     instance["beamng_prop_anim_factor"] = spec.debug_prop_anim_factor
+    if getattr(spec, "debug_prop_mesh_basis_correction", ""):
+        instance["beamng_prop_mesh_basis_correction"] = spec.debug_prop_mesh_basis_correction
     if spec.debug_prop_anchor_x_axis:
         instance["beamng_prop_anchor_x_axis"] = spec.debug_prop_anchor_x_axis
     if spec.debug_prop_anchor_y_axis:

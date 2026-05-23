@@ -49,6 +49,7 @@ class FlexbodySpec:
     debug_prop_anchor_y_axis: tuple = field(default_factory=tuple)
     debug_prop_anchor_z_axis: tuple = field(default_factory=tuple)
     debug_prop_anchor_determinant: float = 0.0
+    debug_prop_mesh_basis_correction: str = ""
 
 
 @dataclass
@@ -808,6 +809,20 @@ def prop_anim_rotation_matrix(rot: Vector):
 def prop_global_rotation_matrix(rot: Vector):
     # BeamNG docs: props baseRotationGlobal uses intrinsic Euler +Y +Z +X.
     return intrinsic_axis_rotation((("Y", rot.y), ("Z", rot.z), ("X", rot.x)))
+
+
+def normalized_mesh_key(mesh_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(mesh_name or "").lower())
+
+
+def prop_mesh_basis_correction_matrix(mesh_name: str):
+    key = normalized_mesh_key(mesh_name)
+    # Some BeamNG prop meshes are authored with a local roll offset relative to
+    # the documented prop frame. Keep this deliberately narrow so fixing a
+    # known cockpit control does not perturb unrelated props.
+    if "caboversteeringwheel" in key:
+        return axis_rotation_matrix("Z", -90.0), "local_z_-90"
+    return Matrix.Identity(4), "none"
 
 
 def matrix_from_axes(origin, x_axis, y_axis):
@@ -2473,6 +2488,7 @@ def parse_props(
         prop_rot = base_rotation_vec + anim_rotation_vec + global_rotation_vec
         local_prop_rotation = prop_base_rotation_matrix(base_rotation_vec) @ prop_anim_rotation_matrix(anim_rotation_vec)
         global_prop_rotation = prop_global_rotation_matrix(global_rotation_vec)
+        mesh_basis_correction, mesh_basis_correction_name = prop_mesh_basis_correction_matrix(mesh_name)
         anchor_origin, anchor_rotation, anchor_debug = get_prop_anchor(row, local_node_positions, global_node_positions)
         if anchor_origin is not None and anchor_rotation is not None:
             if has_global_translation:
@@ -2480,7 +2496,7 @@ def parse_props(
             else:
                 final_origin = anchor_origin + (anchor_rotation.to_3x3() @ prop_local_translation)
             final_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else anchor_rotation @ local_prop_rotation
-            final_transform = Matrix.Translation(final_origin) @ final_rotation
+            final_transform = Matrix.Translation(final_origin) @ final_rotation @ mesh_basis_correction
         else:
             if len(row) >= 5:
                 print(
@@ -2494,7 +2510,7 @@ def parse_props(
             else:
                 fallback_translation = prop_local_translation
             fallback_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else local_prop_rotation
-            final_transform = base_transform @ Matrix.Translation(fallback_translation) @ fallback_rotation
+            final_transform = base_transform @ Matrix.Translation(fallback_translation) @ fallback_rotation @ mesh_basis_correction
         results.append(
             FlexbodySpec(
                 mesh=mesh_name,
@@ -2528,6 +2544,7 @@ def parse_props(
                 debug_prop_anchor_y_axis=tuple(round(value, 6) for value in anchor_debug.get("y_axis", ())),
                 debug_prop_anchor_z_axis=tuple(round(value, 6) for value in anchor_debug.get("z_axis", ())),
                 debug_prop_anchor_determinant=round(float(anchor_debug.get("determinant", 0.0)), 6),
+                debug_prop_mesh_basis_correction=mesh_basis_correction_name,
             )
         )
     return results
