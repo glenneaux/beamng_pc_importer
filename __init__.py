@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 140
+ADDON_BUILD = 141
 
 
 def addon_version_label():
@@ -10221,8 +10221,13 @@ class BEAMNG_OT_print_prop_transforms(Operator):
             report_path = Path(tempfile.gettempdir()) / report_name
             report_path.write_text("\n".join(lines), encoding="utf-8")
 
+        text_name = "BeamNG Prop Transform Diagnostics"
+        text = bpy.data.texts.get(text_name) or bpy.data.texts.new(text_name)
+        text.clear()
+        text.write("\n".join(lines) + "\n")
+        context.scene["beamng_last_prop_debug_text"] = text_name
         print(f"[BeamNG Importer] Wrote prop diagnostics to: {report_path}")
-        self.report({"INFO"}, f"Wrote prop diagnostics: {report_path}")
+        self.report({"INFO"}, f"Wrote prop diagnostics text block and file: {report_path}")
         return {"FINISHED"}
 
 
