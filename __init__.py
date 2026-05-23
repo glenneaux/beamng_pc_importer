@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 135
+ADDON_BUILD = 136
 
 
 def addon_version_label():
@@ -45,6 +45,7 @@ try:
     from . import core as _core
     from . import dae_assets as _dae_assets
     from . import export_review as _export_review
+    from . import jbeam_params as _jbeam_params
     from . import resolved_model as _resolved_model
     from . import slot_authoring as _slot_authoring
     from . import visuals as _visuals
@@ -52,6 +53,7 @@ try:
     importlib.reload(_core)
     importlib.reload(_dae_assets)
     importlib.reload(_export_review)
+    importlib.reload(_jbeam_params)
     importlib.reload(_resolved_model)
     importlib.reload(_slot_authoring)
     importlib.reload(_visuals)
@@ -59,6 +61,7 @@ try:
     from .core import *
     from .dae_assets import *
     from .export_review import *
+    from .jbeam_params import *
     from .resolved_model import *
     from .slot_authoring import *
     from .visuals import *
@@ -66,6 +69,7 @@ except ImportError:
     from core import *
     from dae_assets import *
     from export_review import *
+    from jbeam_params import *
     from resolved_model import *
     from slot_authoring import *
     from visuals import *
@@ -6104,11 +6108,14 @@ def jbeam_export_validation_lines(validation):
 
 
 def draw_param_summary(layout, params, empty_text="none"):
-    if not params:
-        layout.label(text=empty_text)
-        return
-    for key in sorted(params):
-        layout.label(text=f"{key}: {params[key]}")
+    for line in param_summary_lines(params, empty_text):
+        layout.label(text=line)
+
+
+def draw_param_change_summary(layout, params, committed_params):
+    layout.label(text=param_state_label(params, committed_params))
+    for line in param_diff_lines(params, committed_params):
+        layout.label(text=line, icon="GREASEPENCIL")
 
 
 def write_jbeam_export_validation_report(context, selected_virtual_paths=None):
@@ -10714,6 +10721,9 @@ def draw_jbeam_selected_elements(layout, context):
             param_box = node_box.box()
             param_box.label(text="Effective params")
             draw_param_summary(param_box, params, "none found")
+            change_box = node_box.box()
+            change_box.label(text="Param changes")
+            draw_param_change_summary(change_box, params, node_info.get("committed_params", {}))
         props_box = node_box.box()
         props_box.label(text="Node Params")
         for prop in ("beamng_jbeam_node_weight", "beamng_jbeam_node_material", "beamng_jbeam_node_group", "beamng_jbeam_node_friction"):
@@ -10737,6 +10747,9 @@ def draw_jbeam_selected_elements(layout, context):
             param_box = edge_box.box()
             param_box.label(text="Effective params")
             draw_param_summary(param_box, edge_info.get("params", {}), "none found")
+            change_box = edge_box.box()
+            change_box.label(text="Param changes")
+            draw_param_change_summary(change_box, edge_info.get("params", {}), edge_info.get("committed_params", {}))
         edge_box.label(text="Triangle boundary edges are not beams unless marked.")
         beam_props_box = edge_box.box()
         beam_props_box.label(text="Beam Params")
@@ -10757,6 +10770,9 @@ def draw_jbeam_selected_elements(layout, context):
             param_box = face_box.box()
             param_box.label(text="Effective params")
             draw_param_summary(param_box, face_info.get("params", {}), "none found")
+            change_box = face_box.box()
+            change_box.label(text="Param changes")
+            draw_param_change_summary(change_box, face_info.get("params", {}), face_info.get("committed_params", {}))
         face_box.label(text="Node order = collision winding.")
         tri_props_box = face_box.box()
         tri_props_box.label(text="Triangle Params")
