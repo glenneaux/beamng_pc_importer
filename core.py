@@ -2373,6 +2373,26 @@ def prop_row_number(row, index, fallback, component_context=None):
     return coerce_number(row[index], fallback, component_context) if len(row) > index else float(fallback)
 
 
+def first_vector_option(options, names, default=(0.0, 0.0, 0.0), component_context=None):
+    for name in names:
+        value = options.get(name)
+        if isinstance(value, dict):
+            return vector_from_dict(value, default, component_context), name
+    return Vector(default), ""
+
+
+def prop_static_function_factor(row, component_context=None):
+    # BeamNG evaluates prop animation as clamp(input * multiplier, min, max) + offset.
+    # For static import previews we use input=0, so min/max still matter and offset is
+    # not multiplied.
+    min_value = prop_row_number(row, 8, 0.0, component_context)
+    max_value = prop_row_number(row, 9, 100.0, component_context)
+    offset = prop_row_number(row, 10, 0.0, component_context)
+    multiplier = prop_row_number(row, 11, 1.0, component_context)
+    animated = 0.0 * multiplier
+    return min(max(animated, min_value), max_value) + offset
+
+
 def parse_props(
     part_def: PartDefinition,
     base_transform: Matrix,
@@ -2388,13 +2408,18 @@ def parse_props(
     global_node_positions = global_node_positions or {}
     local_node_positions = local_node_positions or {}
 
+    current_options = {}
     for row in rows:
+        if isinstance(row, dict):
+            current_options = merge_options(current_options, row)
+            continue
         if not isinstance(row, list) or len(row) < 2:
             continue
         if row and row[0] == "func":
             continue
 
-        options = row[12] if len(row) > 12 and isinstance(row[12], dict) else {}
+        inline_options = row[12] if len(row) > 12 and isinstance(row[12], dict) else {}
+        options = merge_options(current_options, inline_options)
         if is_disabled(options, component_context):
             continue
 
@@ -2407,45 +2432,36 @@ def parse_props(
         base_rotation = prop_row_dict(row, 5)
         row_rotation = prop_row_dict(row, 6)
         row_translation = prop_row_dict(row, 7)
-        row_base_translation = prop_row_dict(row, 9)
-        row_anim_factor = (
-            prop_row_number(row, 10, 0.0, component_context)
-            * prop_row_number(row, 11, 1.0, component_context)
-        )
+        row_anim_factor = prop_static_function_factor(row, component_context)
         row_translation_vec = vector_from_dict(row_translation, (0.0, 0.0, 0.0), component_context)
         row_rotation_vec = vector_from_dict(row_rotation, (0.0, 0.0, 0.0), component_context)
-        prop_local_translation = (
-            (row_translation_vec * row_anim_factor)
-            + vector_from_dict(row_base_translation, (0.0, 0.0, 0.0), component_context)
-            + vector_from_dict(options.get("baseTranslation"), (0.0, 0.0, 0.0), component_context)
+        prop_anim_translation = row_translation_vec * row_anim_factor
+        prop_base_translation = vector_from_dict(options.get("baseTranslation"), (0.0, 0.0, 0.0), component_context)
+        prop_global_translation, prop_global_translation_source = first_vector_option(
+            options,
+            ("baseTranslationGlobal", "baseTranslationGlobalElastic", "baseTranslationGlobalRigid"),
+            (0.0, 0.0, 0.0),
+            component_context,
         )
-        prop_global_translation = vector_from_dict(
-            options.get("baseTranslationGlobal"), (0.0, 0.0, 0.0), component_context
-        )
+        prop_local_translation = prop_anim_translation + prop_base_translation
+        has_global_translation = bool(prop_global_translation_source)
         base_rotation_vec = vector_from_dict(base_rotation, (0.0, 0.0, 0.0), component_context)
         anim_rotation_vec = row_rotation_vec * row_anim_factor
         global_rotation_vec = vector_from_dict(
             options.get("baseRotationGlobal"), (0.0, 0.0, 0.0), component_context
         )
+        has_global_rotation = isinstance(options.get("baseRotationGlobal"), dict)
         prop_rot = base_rotation_vec + anim_rotation_vec + global_rotation_vec
-        prop_rotation = (
-            prop_base_rotation_matrix(base_rotation_vec)
-            @ prop_anim_rotation_matrix(anim_rotation_vec)
-            @ prop_global_rotation_matrix(global_rotation_vec)
-        )
+        local_prop_rotation = prop_base_rotation_matrix(base_rotation_vec) @ prop_anim_rotation_matrix(anim_rotation_vec)
+        global_prop_rotation = prop_global_rotation_matrix(global_rotation_vec)
         anchor_origin, anchor_rotation, anchor_debug = get_prop_anchor(row, local_node_positions, global_node_positions)
         if anchor_origin is not None and anchor_rotation is not None:
-            offset = anchor_rotation.to_3x3() @ prop_local_translation
-            final_origin = anchor_origin + offset
-            if prop_global_translation.length > 0.000001:
-                final_origin = base_transform @ (prop_global_translation + prop_local_translation)
-            axis_correction = Euler((math.radians(270.0), 0.0, 0.0), "XYZ").to_matrix().to_4x4()
-            final_transform = (
-                Matrix.Translation(final_origin)
-                @ anchor_rotation
-                @ axis_correction
-                @ prop_rotation
-            )
+            if has_global_translation:
+                final_origin = (base_transform @ prop_global_translation) + (anchor_rotation.to_3x3() @ prop_anim_translation)
+            else:
+                final_origin = anchor_origin + (anchor_rotation.to_3x3() @ prop_local_translation)
+            final_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else anchor_rotation @ local_prop_rotation
+            final_transform = Matrix.Translation(final_origin) @ final_rotation
         else:
             if len(row) >= 5:
                 print(
@@ -2454,10 +2470,12 @@ def parse_props(
                     f"{anchor_debug.get('missing', tuple())}"
                 )
                 continue
-            fallback_translation = prop_local_translation
-            if prop_global_translation.length > 0.000001:
-                fallback_translation = prop_global_translation + prop_local_translation
-            final_transform = base_transform @ Matrix.Translation(fallback_translation) @ prop_rotation
+            if has_global_translation:
+                fallback_translation = prop_global_translation + prop_anim_translation
+            else:
+                fallback_translation = prop_local_translation
+            fallback_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else local_prop_rotation
+            final_transform = base_transform @ Matrix.Translation(fallback_translation) @ fallback_rotation
         results.append(
             FlexbodySpec(
                 mesh=mesh_name,

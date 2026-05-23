@@ -31,6 +31,15 @@ The importer must not treat a vanilla `.pc`/zip selection as vanilla-only if use
 
 The editor should never use the add-on's own cache directories as JBeam/DAE asset roots. Cache files may hold reports, materialized picker inputs, backups, and generated review output, but they must not become normal vehicle source data during import resolution.
 
+Future import workflow direction:
+
+- `.pc from BeamNG assets` should become the primary configuration import path, with direct `.pc file` import kept as an advanced/manual fallback.
+- Both `.pc` import paths should share clear modes: `Visual model only` and `Authoring mode`.
+- `Visual model only` imports flexbodies/props and populates the configuration editor, but does not create JBeam visuals/edit meshes unless explicitly requested.
+- `Authoring mode` imports editable JBeam parts, assembly state, slots, proxy/crossbeam tools, and source/export tracking.
+- Any `.pc` import that could be affected by active user mods or overrides should warn and offer `Load clean / ignore mods` and `Load with active mods`, defaulting to the clean/no-mod path.
+- Raw `.jbeam` import should remain a separate `Editable JBeam Part/File Import` workflow that offers all parts or a specific part. Importing multiple parts with shared node, beam, or triangle names needs conflict warnings until namespacing/resolution is implemented.
+
 ## Resolved Vehicle Model
 
 The resolved vehicle model should contain both configuration state and JBeam structure state:
@@ -134,6 +143,7 @@ The future editing representation should use Blender mesh principles:
 - Authoring should prefer explicit JBeam topology operators for standalone node creation, beam creation from two selected nodes, triangle creation from three selected nodes, and safe element deletion. Raw Blender mesh gestures remain useful, but tool-owned operators reduce accidental beams and ambiguous topology.
 - Mesh-native edge visibility should be preferred over separate legacy beam geometry. Duplicate Skin/Wireframe preview meshes were visually promising, but the live synchronization cost was too high during Edit Mode node movement and the approach is parked for now.
 - Experimental editable JBeam meshes should depth-test normally against flexbodies by default. X-ray/always-on-top display can be useful as an explicit inspection mode, but should not be the default authoring view because translucent collision faces appear to float over body geometry.
+- Prop visual imports must follow BeamNG's documented prop reference frame rather than generic Blender XYZ transforms. Prop placement is anchored by `idRef`, `idX`, and `idY`; local `baseTranslation` is relative to that prop axis system, `baseTranslationGlobal*` is relative to JBeam/world coordinates, `baseRotation` uses intrinsic `-X -Z +Y`, animated `rotation` uses intrinsic `-X -Z -Y`, and `baseRotationGlobal` uses intrinsic `+Y +Z +X`.
 
 This lets the editor use Blender's native selection and editing concepts while the internal resolved model remains authoritative.
 
