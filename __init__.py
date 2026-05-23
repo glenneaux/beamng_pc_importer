@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 136
+ADDON_BUILD = 137
 
 
 def addon_version_label():
@@ -2416,6 +2416,14 @@ def set_bmesh_string_value(element, layer, value):
         element[layer] = text
 
 
+def set_blender_string_attribute_value(attribute_value, value):
+    text = str(value or "")
+    try:
+        attribute_value.value = text
+    except TypeError:
+        attribute_value.value = text.encode("utf-8")
+
+
 def object_mode_string_attribute_values(mesh, attr_name, domain, count, allow_write=True):
     if not hasattr(mesh, "attributes"):
         return ["" for _index in range(count)]
@@ -2459,7 +2467,7 @@ def set_object_mode_string_attribute_values(mesh, attr_name, domain, values):
             return
     for index, value in enumerate(values):
         if index < len(attr.data):
-            attr.data[index].value = str(value or "")
+            set_blender_string_attribute_value(attr.data[index], value)
 
 
 def object_mode_int_attribute_values(mesh, attr_name, domain, count, allow_write=True):
