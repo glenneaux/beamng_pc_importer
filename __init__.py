@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 138
+ADDON_BUILD = 139
 
 
 def addon_version_label():
@@ -12002,7 +12002,7 @@ class IMPORT_OT_beamng_pc(Operator, ImportHelper):
     create_experimental_jbeam_meshes: BoolProperty(
         name="Experimental JBeam Meshes",
         description="Create one editable Blender mesh per resolved JBeam part using nodes as vertices, beams as edges, and triangles as faces",
-        default=False,
+        default=True,
     )
     include_user_overrides: BoolProperty(
         name="Use User Mods/Overrides",
@@ -12531,7 +12531,7 @@ class IMPORT_OT_beamng_pc_from_assets(Operator):
     create_experimental_jbeam_meshes: BoolProperty(
         name="Experimental JBeam Meshes",
         description="Create one editable Blender mesh per resolved JBeam part using nodes as vertices, beams as edges, and triangles as faces",
-        default=False,
+        default=True,
     )
     include_user_overrides: BoolProperty(
         name="Use User Mods/Overrides",
