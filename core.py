@@ -2371,7 +2371,7 @@ def parse_rails_and_slidenodes(
 
 def get_prop_anchor(row, local_node_positions, global_node_positions):
     if len(row) < 5:
-        return None, None, {"missing": tuple()}
+        return None, None, None, {"missing": tuple()}
 
     local_node_positions = local_node_positions or {}
     global_node_positions = global_node_positions or {}
@@ -2390,11 +2390,13 @@ def get_prop_anchor(row, local_node_positions, global_node_positions):
         for name, value in ((row[2], origin), (row[3], x_ref), (row[4], y_ref)):
             if value is None:
                 missing.append(str(name))
-        return None, None, {"missing": tuple(missing)}
+        return None, None, None, {"missing": tuple(missing)}
 
-    rotation = matrix_from_prop_axes(origin, x_ref - origin, y_ref - origin)
-    rotation.translation = Vector((0.0, 0.0, 0.0))
-    rotation_3x3 = rotation.to_3x3()
+    translation_basis = matrix_from_prop_axes(origin, x_ref - origin, y_ref - origin)
+    translation_basis.translation = Vector((0.0, 0.0, 0.0))
+    rotation_basis = matrix_from_axes(origin, x_ref - origin, y_ref - origin)
+    rotation_basis.translation = Vector((0.0, 0.0, 0.0))
+    rotation_3x3 = rotation_basis.to_3x3()
     debug = {
         "origin": origin,
         "x_ref": x_ref,
@@ -2404,7 +2406,7 @@ def get_prop_anchor(row, local_node_positions, global_node_positions):
         "z_axis": rotation_3x3.col[2],
         "determinant": rotation_3x3.determinant(),
     }
-    return origin, rotation, debug
+    return origin, translation_basis, rotation_basis, debug
 
 
 def prop_row_dict(row, index):
@@ -2496,15 +2498,15 @@ def parse_props(
         prop_rot = base_rotation_vec + anim_rotation_vec + global_rotation_vec
         local_prop_rotation = prop_base_rotation_matrix(base_rotation_vec) @ prop_anim_rotation_matrix(anim_rotation_vec)
         global_prop_rotation = prop_global_rotation_matrix(global_rotation_vec)
-        anchor_origin, anchor_rotation, anchor_debug = get_prop_anchor(row, local_node_positions, global_node_positions)
+        anchor_origin, anchor_translation, anchor_rotation, anchor_debug = get_prop_anchor(row, local_node_positions, global_node_positions)
         prop_world_translation_offset = Vector((0.0, 0.0, 0.0))
         prop_rest_matrix = Matrix.Identity(4)
-        if anchor_origin is not None and anchor_rotation is not None:
+        if anchor_origin is not None and anchor_translation is not None and anchor_rotation is not None:
             if has_global_translation:
-                prop_world_translation_offset = anchor_rotation.to_3x3() @ prop_anim_translation
+                prop_world_translation_offset = anchor_translation.to_3x3() @ prop_anim_translation
                 final_origin = (base_transform @ prop_global_translation) + prop_world_translation_offset
             else:
-                prop_world_translation_offset = anchor_rotation.to_3x3() @ prop_local_translation
+                prop_world_translation_offset = anchor_translation.to_3x3() @ prop_local_translation
                 final_origin = anchor_origin + prop_world_translation_offset
             rest_rotation = global_prop_rotation @ prop_base_rotation_matrix(base_rotation_vec) if has_global_rotation else anchor_rotation @ prop_base_rotation_matrix(base_rotation_vec)
             final_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else anchor_rotation @ local_prop_rotation

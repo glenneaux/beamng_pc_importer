@@ -41,7 +41,7 @@ def test_prop_anchor_basis_and_local_translation_follow_beamng_docs():
     assert_vector_close(matrix.to_translation(), (2.0, 4.0, 0.0))
     assert_vector_close(matrix.col[0].to_3d(), (1.0, 0.0, 0.0))
     assert_vector_close(matrix.col[1].to_3d(), (0.0, 1.0, 0.0))
-    assert_vector_close(matrix.col[2].to_3d(), (0.0, 0.0, -1.0))
+    assert_vector_close(matrix.col[2].to_3d(), (0.0, 0.0, 1.0))
 
 
 def test_prop_inherited_options_and_static_function_factor_are_applied():
@@ -282,6 +282,31 @@ def test_cabover_steering_wheel_preserves_source_handedness():
     instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
     bpy.context.view_layer.update()
 
-    assert instance.matrix_world.to_3x3().determinant() < 0.0
+    assert instance.matrix_world.to_3x3().determinant() > 0.0
     assert instance.get("beamng_normalized_negative_scale") is False
     assert_vector_close(instance.data.vertices[0].co, (1.0, 0.0, 0.0))
+
+
+def test_cabover_steering_wheel_uses_orthonormal_rotation_basis():
+    part = PartDefinition(
+        name="us_semi_cabover_steer",
+        source_path=Path("vehicles/us_semi/us_semi_steeringwheels.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["steering", "cabover_steering_wheel", "int_strw", "dshl", "dshr", {"x": 0, "y": 90, "z": 180}, {"x": 0, "y": 0, "z": 1}, {"x": 0, "y": 0, "z": 0}, -1000, 1000, 0, 1, {"baseTranslation": {"x": 0, "y": 0, "z": 0}}],
+            ],
+        },
+    )
+    spec = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "int_strw": Vector((0.786, 0.1797, 2.0723)),
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+        },
+    )[0]
+
+    assert_vector_close(spec.transform_matrix.to_translation(), (0.786, 0.1797, 2.0723))
+    assert abs(spec.transform_matrix.to_3x3().determinant() - 1.0) < 0.000001
