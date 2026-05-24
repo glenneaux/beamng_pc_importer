@@ -1165,11 +1165,14 @@ def matrix_scale_only(matrix):
     return Matrix.Diagonal((abs(scale.x), abs(scale.y), abs(scale.z), 1.0))
 
 
-def prop_preview_mesh_basis_matrix():
-    # BeamNG applies the documented prop frame to the DAE mesh resource. Blender's
-    # Collada import gives us copied mesh data that needs this shared local-basis
-    # roll to match BeamNG's prop preview orientation.
-    return Matrix.Rotation(math.radians(90.0), 4, "Z")
+def prop_preview_mesh_basis_matrix(spec: FlexbodySpec):
+    # Steering props use a shared local mesh-basis roll in Blender's Collada
+    # preview path. Keep this semantic rather than mesh-name specific; other
+    # cockpit controls currently follow different authored conventions.
+    function_name = str(getattr(spec, "debug_prop_function", "")).lower()
+    if function_name == "steering":
+        return Matrix.Rotation(math.radians(90.0), 4, "Z"), "scale_only_steering_basis_z90"
+    return Matrix.Identity(4), "scale_only"
 
 
 def prop_keeps_template_orientation(mesh_name: str) -> bool:
@@ -1235,6 +1238,8 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
     if spec.debug_prop_row_rotation:
         instance["beamng_prop_row_rotation_deg"] = spec.debug_prop_row_rotation
     instance["beamng_prop_anim_factor"] = spec.debug_prop_anim_factor
+    if getattr(spec, "debug_prop_function", ""):
+        instance["beamng_prop_function"] = spec.debug_prop_function
     if spec.debug_prop_anchor_x_axis:
         instance["beamng_prop_anchor_x_axis"] = spec.debug_prop_anchor_x_axis
     if spec.debug_prop_anchor_y_axis:
@@ -1254,8 +1259,9 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
             if prop_keeps_template_orientation(spec.mesh):
                 instance["beamng_prop_template_orientation_mode"] = "template_rotation"
             else:
-                template_transform = prop_preview_mesh_basis_matrix() @ matrix_scale_only(template_obj.matrix_world)
-                instance["beamng_prop_template_orientation_mode"] = "scale_only_prop_basis_z90"
+                prop_basis, prop_basis_name = prop_preview_mesh_basis_matrix(spec)
+                template_transform = prop_basis @ matrix_scale_only(template_obj.matrix_world)
+                instance["beamng_prop_template_orientation_mode"] = prop_basis_name
         target_matrix = spec.transform_matrix @ template_transform
     if spec.source_type == "prop":
         target_matrix, normalized_negative_scale = bake_negative_handedness_into_mesh(instance, target_matrix)
