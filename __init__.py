@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 155
+ADDON_BUILD = 156
 
 
 def addon_version_label():
@@ -11933,7 +11933,8 @@ def import_beamng_pc_path(
                 mesh_to_dae_paths,
             )
             if dae_asset is None:
-                warnings.append(f"No DAE found for mesh '{spec.mesh}' from part '{spec.part_name}'")
+                source_label = "prop" if getattr(spec, "source_type", "") == "prop" else "mesh"
+                warnings.append(f"No DAE found for {source_label} '{spec.mesh}' from part '{spec.part_name}'")
                 continue
 
             dae_path = materialize_dae_asset(dae_asset, extracted_zip_assets)
@@ -11945,11 +11946,17 @@ def import_beamng_pc_path(
             template_lookup = imported_dae_cache[dae_asset]
             template_obj = find_matching_template(spec.mesh, template_lookup)
             if template_obj is None:
-                warnings.append(f"No imported object matched mesh '{spec.mesh}' in {dae_path.name}")
+                source_label = "prop" if getattr(spec, "source_type", "") == "prop" else "mesh"
+                warnings.append(f"No imported object matched {source_label} '{spec.mesh}' in {dae_path.name}")
                 continue
 
             parent_obj = part_objects.get(spec.resolved_part_id)
-            instantiate_flexbody(template_obj, spec, root_collection, parent_obj)
+            try:
+                instantiate_flexbody(template_obj, spec, root_collection, parent_obj)
+            except Exception as exc:
+                source_label = "prop" if getattr(spec, "source_type", "") == "prop" else "mesh"
+                warnings.append(f"Failed to instantiate {source_label} '{spec.mesh}' from part '{spec.part_name}': {exc}")
+                continue
             imported_count += 1
 
         update_import_progress(context, 98, "finishing import")

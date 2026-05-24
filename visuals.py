@@ -1171,7 +1171,8 @@ def prop_template_basis_from_dae(spec: FlexbodySpec, template_obj):
     # replacing the DAE rest basis with a reconstructed anchor/base basis.
     _template_loc, template_rot, template_scale = template_obj.matrix_world.decompose()
     positive_scale = Vector((abs(template_scale.x), abs(template_scale.y), abs(template_scale.z)))
-    return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), template_rot, positive_scale) @ spec.prop_anim_matrix
+    anim_matrix = getattr(spec, "prop_anim_matrix", Matrix.Identity(4))
+    return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), template_rot, positive_scale) @ anim_matrix
 
 
 def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collection, parent_obj=None):
