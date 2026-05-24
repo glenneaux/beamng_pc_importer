@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 158
+ADDON_BUILD = 159
 
 
 def addon_version_label():
@@ -1178,9 +1178,14 @@ def experimental_jbeam_panel_redraw_timer():
         if has_experimental_mesh:
             sync_active_jbeam_part_from_selection(bpy.context)
             prefs = get_addon_preferences(bpy.context)
-            if has_edit_mesh and (prefs is None or bool(getattr(prefs, "auto_sync_proxy_nodes", True))):
+            use_native_callback = blender_has_mesh_topology_update_callback()
+            if (
+                not use_native_callback
+                and has_edit_mesh
+                and (prefs is None or bool(getattr(prefs, "auto_sync_proxy_nodes", True)))
+            ):
                 poll_experimental_jbeam_edit_mesh_proxy_sync(bpy.context.scene)
-            if prefs is None or bool(getattr(prefs, "auto_scan_jbeam_edits", True)):
+            if not use_native_callback and (prefs is None or bool(getattr(prefs, "auto_scan_jbeam_edits", True))):
                 poll_experimental_jbeam_mesh_auto_scan(bpy.context.scene)
             for window in bpy.context.window_manager.windows:
                 screen = window.screen
@@ -1202,8 +1207,13 @@ _jbeam_proxy_sync_poll_due_time = 0.0
 _jbeam_auto_scan_due_time = 0.0
 _jbeam_auto_scan_timer_pending = False
 _jbeam_auto_scan_running = False
+_jbeam_callback_sync_running = False
 _jbeam_auto_scan_last_signature = None
 _jbeam_auto_scan_poll_due_time = 0.0
+
+
+def blender_has_mesh_topology_update_callback():
+    return getattr(bpy.app.handlers, "mesh_topology_update_post", None) is not None
 
 
 def redraw_experimental_jbeam_viewports():
@@ -1256,12 +1266,12 @@ def experimental_jbeam_auto_scan_timer():
         result = scan_experimental_jbeam_mesh_edits(scene, active_only=False)
         scene["beamng_jbeam_auto_scan_count"] = int(scene.get("beamng_jbeam_auto_scan_count", 0)) + 1
         scene["beamng_jbeam_last_auto_scan_message"] = (
-            f"Auto scanned {int(result.get('scanned_mesh_count', 0))} mesh(es), "
+            f"Fallback resynced {int(result.get('scanned_mesh_count', 0))} mesh(es), "
             f"pending {int(scene.get('beamng_jbeam_pending_node_move_count', 0))}"
         )
         redraw_experimental_jbeam_viewports()
     except Exception as exc:
-        scene["beamng_jbeam_last_auto_scan_message"] = f"Auto scan failed: {exc}"
+        scene["beamng_jbeam_last_auto_scan_message"] = f"Fallback resync failed: {exc}"
     finally:
         _jbeam_auto_scan_running = False
     return None
@@ -1375,9 +1385,49 @@ def tag_experimental_jbeam_auto_scan():
         bpy.app.timers.register(experimental_jbeam_auto_scan_timer, first_interval=JBEAM_AUTO_SCAN_DEBOUNCE_SECONDS)
 
 
+def experimental_jbeam_mesh_objects_for_mesh(scene, mesh):
+    if scene is None or mesh is None:
+        return []
+    return [
+        obj
+        for obj in experimental_jbeam_mesh_objects(scene, active_only=False)
+        if obj.type == "MESH" and obj.data is mesh
+    ]
+
+
+def sync_experimental_jbeam_changes_for_mesh(scene, mesh):
+    global _jbeam_callback_sync_running
+    if _jbeam_callback_sync_running:
+        return None
+    objects = experimental_jbeam_mesh_objects_for_mesh(scene, mesh)
+    if not objects:
+        return None
+    prefs = get_addon_preferences(bpy.context)
+    if prefs is not None and not bool(getattr(prefs, "auto_scan_jbeam_edits", True)):
+        return None
+
+    _jbeam_callback_sync_running = True
+    try:
+        result = scan_experimental_jbeam_mesh_edits(scene, target_objects=objects)
+        scene["beamng_jbeam_auto_scan_count"] = int(scene.get("beamng_jbeam_auto_scan_count", 0)) + 1
+        scene["beamng_jbeam_last_auto_scan_message"] = (
+            f"Callback synced {int(result.get('scanned_mesh_count', 0))} mesh(es), "
+            f"pending {int(scene.get('beamng_jbeam_pending_node_move_count', 0))}"
+        )
+        redraw_experimental_jbeam_viewports()
+        return result
+    except Exception as exc:
+        scene["beamng_jbeam_last_auto_scan_message"] = f"Callback sync failed: {exc}"
+        return None
+    finally:
+        _jbeam_callback_sync_running = False
+
+
 @persistent
 def experimental_jbeam_mesh_depsgraph_update_post(scene, depsgraph):
     try:
+        if blender_has_mesh_topology_update_callback():
+            return
         updated_ids = {update.id for update in depsgraph.updates}
         for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
             if obj in updated_ids or obj.data in updated_ids:
@@ -1397,7 +1447,7 @@ def experimental_jbeam_mesh_topology_update_post(mesh):
         scene = bpy.context.scene
         if scene is not None:
             sync_experimental_jbeam_proxy_nodes(scene)
-        tag_experimental_jbeam_auto_scan()
+            sync_experimental_jbeam_changes_for_mesh(scene, mesh)
     except Exception:
         return
 
@@ -3928,14 +3978,14 @@ def orphan_provisional_node_indices(obj):
     ]
 
 
-def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.0005):
+def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.0005, target_objects=None):
     changes = []
     restored_proxy_count = 0
     topology_change_count = 0
     scanned_mesh_count = 0
     dirty_mesh_count = 0
     non_triangle_face_count = 0
-    objects = experimental_jbeam_mesh_objects(scene, active_only=active_only)
+    objects = list(target_objects) if target_objects is not None else experimental_jbeam_mesh_objects(scene, active_only=active_only)
     owned_node_deletes_by_object = defaultdict(set)
 
     for obj in objects:
@@ -4369,15 +4419,26 @@ def scan_experimental_jbeam_mesh_edits(scene, active_only=False, tolerance=0.000
             int(scene.get("beamng_jbeam_removed_proxy_node_count", 0)) + removed_proxy_count
         )
 
-    scene["beamng_jbeam_pending_node_moves_json"] = json.dumps(changes)
-    scene["beamng_jbeam_pending_node_move_count"] = len(changes)
-    scene["beamng_jbeam_pending_topology_change_count"] = topology_change_count
+    all_pending_changes = []
+    all_pending_topology_change_count = 0
+    for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+        object_changes = mesh_json_list(obj.data, "beamng_node_move_changes_json") if obj.type == "MESH" else []
+        all_pending_changes.extend(object_changes)
+        all_pending_topology_change_count += sum(
+            1 for change in object_changes if change.get("section") in {"beams", "triangles"}
+        )
+
+    scene["beamng_jbeam_pending_node_moves_json"] = json.dumps(all_pending_changes)
+    scene["beamng_jbeam_pending_node_move_count"] = len(all_pending_changes)
+    scene["beamng_jbeam_pending_topology_change_count"] = all_pending_topology_change_count
     scene["beamng_jbeam_restored_proxy_move_count"] = restored_proxy_count
     scene["beamng_jbeam_non_triangle_face_count"] = non_triangle_face_count
     return {
-        "changes": changes,
+        "changes": all_pending_changes,
+        "scanned_changes": changes,
         "restored_proxy_count": restored_proxy_count,
-        "topology_change_count": topology_change_count,
+        "topology_change_count": all_pending_topology_change_count,
+        "scanned_topology_change_count": topology_change_count,
         "scanned_mesh_count": scanned_mesh_count,
         "dirty_mesh_count": dirty_mesh_count,
         "non_triangle_face_count": non_triangle_face_count,
@@ -7548,13 +7609,13 @@ def write_jbeam_user_override_stage_report(context, overwrite_existing=False, se
 
 class BEAMNG_OT_scan_experimental_jbeam_mesh_edits(Operator):
     bl_idname = "beamng_pc_importer.scan_experimental_jbeam_mesh_edits"
-    bl_label = "Scan JBeam Mesh Edits"
-    bl_description = "Detect moved owned nodes in experimental JBeam meshes and restore moved proxy/reference nodes"
+    bl_label = "Sync JBeam Mesh Changes"
+    bl_description = "Recovery/debug action: diff JBeam meshes against their stored baselines and rebuild pending changes"
     bl_options = {"REGISTER", "UNDO"}
 
     active_only: BoolProperty(
         name="Active Mesh Only",
-        description="Scan only the active experimental JBeam mesh when possible",
+        description="Sync only the active experimental JBeam mesh when possible",
         default=False,
     )
 
@@ -7563,8 +7624,8 @@ class BEAMNG_OT_scan_experimental_jbeam_mesh_edits(Operator):
         self.report(
             {"INFO"},
             (
-                f"Scanned {result['scanned_mesh_count']} JBeam mesh(es); "
-                f"recorded {len(result['changes'])} edit(s) "
+                f"Synced {result['scanned_mesh_count']} JBeam mesh(es); "
+                f"pending {len(result['changes'])} edit(s) "
                 f"({result['topology_change_count']} topology); "
                 f"restored {result['restored_proxy_count']} proxy node move(s)"
             ),
@@ -10654,9 +10715,9 @@ def draw_jbeam_edit_status(layout, context):
     if counts["model_ops"] != counts["history"]:
         box.label(text=f"Model ops: {counts['model_ops']} (refresh on accept/clear)", icon="INFO")
     row = box.row(align=True)
-    op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan Active")
+    op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Sync Active")
     op.active_only = True
-    op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan All")
+    op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Resync All")
     op.active_only = False
     row = box.row(align=True)
     row.enabled = counts["pending"] > 0
@@ -11050,7 +11111,7 @@ class VIEW3D_PT_beamng_jbeam_health(Panel):
         box.label(text=f"Dirty params: {counts['dirty_params']}")
         row = box.row(align=True)
         row.operator(BEAMNG_OT_check_experimental_jbeam_topology_health.bl_idname, text="Check Health")
-        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan All")
+        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Resync All")
         op.active_only = False
         validation_box = layout.box()
         validation_box.label(text="Active Mesh Live Check")
@@ -11270,9 +11331,9 @@ class VIEW3D_PT_beamng_advanced(Panel):
                 icon="ERROR" if health_missing_refs else "INFO",
             )
         row = box.row(align=True)
-        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan Active")
+        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Sync Active")
         op.active_only = True
-        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Scan All")
+        op = row.operator(BEAMNG_OT_scan_experimental_jbeam_mesh_edits.bl_idname, text="Resync All")
         op.active_only = False
         row.operator(BEAMNG_OT_check_experimental_jbeam_topology_health.bl_idname, text="Health")
         row = box.row(align=True)
@@ -11592,10 +11653,10 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         default=True,
     )
     auto_scan_jbeam_edits: BoolProperty(
-        name="Auto Scan JBeam Edits",
+        name="Auto Sync JBeam Changes",
         description=(
-            "After experimental JBeam mesh edits settle, automatically run Scan All so pending node, beam, "
-            "triangle, and proxy-delete changes stay current without pressing the button"
+            "Use Blender mesh topology callbacks to keep pending node, beam, triangle, and proxy-delete "
+            "changes current. Stock Blender falls back to a debounced resync"
         ),
         default=True,
     )
