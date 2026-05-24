@@ -34,10 +34,10 @@ def test_prop_anchor_basis_and_local_translation_follow_beamng_docs():
 
     assert len(specs) == 1
     matrix = specs[0].transform_matrix
-    assert_vector_close(matrix.to_translation(), (2.0, 4.0, 6.0))
+    assert_vector_close(matrix.to_translation(), (2.0, 4.0, 0.0))
     assert_vector_close(matrix.col[0].to_3d(), (1.0, 0.0, 0.0))
     assert_vector_close(matrix.col[1].to_3d(), (0.0, 1.0, 0.0))
-    assert_vector_close(matrix.col[2].to_3d(), (0.0, 0.0, 1.0))
+    assert_vector_close(matrix.col[2].to_3d(), (0.0, 0.0, -1.0))
 
 
 def test_prop_inherited_options_and_static_function_factor_are_applied():
@@ -116,11 +116,11 @@ def test_cabover_parking_brake_base_translation_moves_position():
     assert len(specs) == 1
     assert_vector_close(specs[0].debug_prop_base_translation, (-0.0, 0.063, -0.037))
     assert_vector_close(specs[0].debug_prop_local_translation, (0.0, 0.063, -0.037))
-    assert_vector_close(specs[0].debug_prop_world_translation_offset, (-0.063, -0.033534, 0.015636))
-    assert_vector_close(specs[0].transform_matrix.to_translation(), (0.723, 0.146166, 2.087936))
+    assert_vector_close(specs[0].debug_prop_world_translation_offset, (-0.062224, 0.029367, -0.024573))
+    assert_vector_close(specs[0].transform_matrix.to_translation(), (0.723776, 0.209067, 2.047727))
 
 
-def test_cabover_parking_brake_instancing_applies_base_translation_local_offset():
+def test_cabover_parking_brake_instancing_uses_raw_prop_axes():
     import bpy
 
     from beamng_pc_importer.visuals import instantiate_flexbody
@@ -155,6 +155,32 @@ def test_cabover_parking_brake_instancing_applies_base_translation_local_offset(
     instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
     bpy.context.view_layer.update()
 
-    assert_vector_close(instance.matrix_local.to_translation(), (0.723, -1.730834, 2.050936))
-    assert_vector_close(instance.get("beamng_prop_applied_local_visual_offset"), (-0.0, 0.063, -0.037))
-    assert_vector_close(instance.get("beamng_final_local_loc"), (0.723, -1.730834, 2.050936))
+    assert_vector_close(instance.matrix_local.to_translation(), (0.723776, -1.730933, 2.047727))
+    assert_vector_close(instance.get("beamng_final_local_loc"), (0.723776, -1.730933, 2.047727))
+
+
+def test_cabover_speedo_needle_raw_prop_axes_match_dae_rest_position():
+    part = PartDefinition(
+        name="us_semi_cabover_dashboard",
+        source_path=Path("vehicles/us_semi/us_semi_cabover_dashboard.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["wheelspeed", "cabover_needle_speedo", "dshl", "dshr", "dsh", {"x": 0, "y": -90, "z": -10}, {"x": 6, "y": 0, "z": 0}, {"x": 0, "y": 0, "z": 0}, 0, 70.7, -22.35, 1, {"baseTranslation": {"x": 0.331, "y": -0.224, "z": 0.209}}],
+            ],
+        },
+    )
+    spec = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+            "dsh": Vector((0.0, 0.44, 1.84654)),
+        },
+    )[0]
+
+    # DAE node matrix location is (0.6581002, -1.960148, 2.055337).
+    # With the import parent offset removed, the comparable JBeam-space Y is
+    # approximately -0.020148.
+    assert_vector_close(spec.transform_matrix.to_translation(), (0.658107, -0.020035, 2.05554), tolerance=0.00025)

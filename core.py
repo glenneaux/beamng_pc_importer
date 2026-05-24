@@ -830,6 +830,25 @@ def matrix_from_axes(origin, x_axis, y_axis):
     )
 
 
+def matrix_from_prop_axes(origin, x_axis, y_axis):
+    # BeamNG prop translation follows the raw normalized idRef->idX and
+    # idRef->idY axes. Some vanilla props are not perfectly orthogonal; forcing
+    # a right angle moves dash needles away from their authored DAE rest pose.
+    x_axis = x_axis.normalized() if x_axis.length > 0.000001 else Vector((1.0, 0.0, 0.0))
+    y_axis = y_axis.normalized() if y_axis.length > 0.000001 else Vector((0.0, 1.0, 0.0))
+    z_axis = y_axis.cross(x_axis)
+    z_axis = z_axis.normalized() if z_axis.length > 0.000001 else Vector((0.0, 0.0, 1.0))
+
+    return Matrix(
+        (
+            (x_axis.x, y_axis.x, z_axis.x, origin.x),
+            (x_axis.y, y_axis.y, z_axis.y, origin.y),
+            (x_axis.z, y_axis.z, z_axis.z, origin.z),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+
+
 def get_option_transform(options, component_context=None):
     options = options or {}
     translation = (
@@ -2372,7 +2391,7 @@ def get_prop_anchor(row, local_node_positions, global_node_positions):
                 missing.append(str(name))
         return None, None, {"missing": tuple(missing)}
 
-    rotation = matrix_from_axes(origin, x_ref - origin, y_ref - origin)
+    rotation = matrix_from_prop_axes(origin, x_ref - origin, y_ref - origin)
     rotation.translation = Vector((0.0, 0.0, 0.0))
     rotation_3x3 = rotation.to_3x3()
     debug = {

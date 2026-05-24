@@ -1264,12 +1264,6 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
         instance.parent = parent_obj
         instance.matrix_parent_inverse = Matrix.Identity(4)
         local_matrix = parent_obj.matrix_world.inverted() @ target_matrix
-        if spec.source_type == "prop" and spec.debug_prop_base_translation:
-            # BeamNG applies baseTranslation as prop-local visual offset after
-            # the anchor-derived placement. Keep this field-driven; no prop
-            # names or families belong in the transform path.
-            local_matrix.translation += Vector(spec.debug_prop_base_translation)
-            instance["beamng_prop_applied_local_visual_offset"] = spec.debug_prop_base_translation
         instance.matrix_local = local_matrix
         final_world_matrix = parent_obj.matrix_world @ local_matrix
     else:
