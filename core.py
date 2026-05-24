@@ -45,7 +45,6 @@ class FlexbodySpec:
     debug_prop_base_rotation: tuple = field(default_factory=tuple)
     debug_prop_row_rotation: tuple = field(default_factory=tuple)
     debug_prop_anim_factor: float = 0.0
-    debug_prop_function: str = ""
     debug_prop_anchor_x_axis: tuple = field(default_factory=tuple)
     debug_prop_anchor_y_axis: tuple = field(default_factory=tuple)
     debug_prop_anchor_z_axis: tuple = field(default_factory=tuple)
@@ -2446,7 +2445,6 @@ def parse_props(
         mesh_name = evaluate_mesh_name(row[1], component_context)
         if not mesh_name or mesh_name.startswith("no") or mesh_name.upper().endswith("LIGHT"):
             continue
-        prop_function = str(row[0])
         mesh_key = mesh_name.lower()
         keep_template_translation = False
 
@@ -2526,7 +2524,6 @@ def parse_props(
                     for value in row_rotation_vec
                 ),
                 debug_prop_anim_factor=round(row_anim_factor, 6),
-                debug_prop_function=prop_function,
                 debug_prop_anchor_x_axis=tuple(round(value, 6) for value in anchor_debug.get("x_axis", ())),
                 debug_prop_anchor_y_axis=tuple(round(value, 6) for value in anchor_debug.get("y_axis", ())),
                 debug_prop_anchor_z_axis=tuple(round(value, 6) for value in anchor_debug.get("z_axis", ())),

@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 147
+ADDON_BUILD = 148
 
 
 def addon_version_label():
@@ -10201,7 +10201,6 @@ class BEAMNG_OT_print_prop_transforms(Operator):
                     f"  missing_anchor_nodes={obj.get('beamng_prop_missing_anchor_nodes', ())}",
                     f"  local_translation=({format_vector(obj.get('beamng_prop_local_translation', (0.0, 0.0, 0.0)))})",
                     f"  global_translation=({format_vector(obj.get('beamng_prop_global_translation', (0.0, 0.0, 0.0)))})",
-                    f"  function={obj.get('beamng_prop_function', '')}",
                     f"  base_rot_deg=({format_vector(obj.get('beamng_prop_base_rotation_deg', (0.0, 0.0, 0.0)))})",
                     f"  row_rot_deg=({format_vector(obj.get('beamng_prop_row_rotation_deg', (0.0, 0.0, 0.0)))})",
                     f"  row_anim_factor={obj.get('beamng_prop_anim_factor', 0.0):.6f}",
