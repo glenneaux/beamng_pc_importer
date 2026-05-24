@@ -1176,15 +1176,6 @@ def prop_template_basis_from_dae(spec: FlexbodySpec, template_obj):
     return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), basis_rot, positive_scale)
 
 
-def prop_keeps_template_orientation(mesh_name: str) -> bool:
-    key = normalized_name(mesh_name)
-    return (
-        "enginefan" in key
-        or "enginepulley" in key
-        or "slipshaft" in key
-    )
-
-
 def bake_negative_handedness_into_mesh(instance, target_matrix):
     if target_matrix.to_3x3().determinant() >= 0.0:
         return target_matrix, False
@@ -1261,20 +1252,30 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
     else:
         template_transform = matrix_without_translation(template_obj.matrix_world)
         if spec.source_type == "prop":
-            if prop_keeps_template_orientation(spec.mesh):
-                instance["beamng_prop_template_orientation_mode"] = "template_rotation"
-            else:
-                template_transform = prop_template_basis_from_dae(spec, template_obj)
-                instance["beamng_prop_template_orientation_mode"] = "dae_derived_basis"
+            template_transform = prop_template_basis_from_dae(spec, template_obj)
+            instance["beamng_prop_template_orientation_mode"] = "dae_derived_basis"
         target_matrix = spec.transform_matrix @ template_transform
     if spec.source_type == "prop":
         target_matrix, normalized_negative_scale = bake_negative_handedness_into_mesh(instance, target_matrix)
     instance["beamng_normalized_negative_scale"] = normalized_negative_scale
+    instance["beamng_target_world_loc"] = tuple(round(value, 6) for value in target_matrix.to_translation())
 
     if parent_obj is not None:
         instance.parent = parent_obj
         instance.matrix_parent_inverse = Matrix.Identity(4)
-        instance.matrix_local = parent_obj.matrix_world.inverted() @ target_matrix
+        local_matrix = parent_obj.matrix_world.inverted() @ target_matrix
+        if spec.source_type == "prop" and spec.debug_prop_base_translation:
+            # BeamNG applies baseTranslation as prop-local visual offset after
+            # the anchor-derived placement. Keep this field-driven; no prop
+            # names or families belong in the transform path.
+            local_matrix.translation += Vector(spec.debug_prop_base_translation)
+            instance["beamng_prop_applied_local_visual_offset"] = spec.debug_prop_base_translation
+        instance.matrix_local = local_matrix
+        final_world_matrix = parent_obj.matrix_world @ local_matrix
     else:
         instance.matrix_world = target_matrix
+        local_matrix = target_matrix
+        final_world_matrix = target_matrix
+    instance["beamng_final_world_loc"] = tuple(round(value, 6) for value in final_world_matrix.to_translation())
+    instance["beamng_final_local_loc"] = tuple(round(value, 6) for value in local_matrix.to_translation())
     return instance

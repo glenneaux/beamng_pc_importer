@@ -118,3 +118,43 @@ def test_cabover_parking_brake_base_translation_moves_position():
     assert_vector_close(specs[0].debug_prop_local_translation, (0.0, 0.063, -0.037))
     assert_vector_close(specs[0].debug_prop_world_translation_offset, (-0.063, -0.033534, 0.015636))
     assert_vector_close(specs[0].transform_matrix.to_translation(), (0.723, 0.146166, 2.087936))
+
+
+def test_cabover_parking_brake_instancing_applies_base_translation_local_offset():
+    import bpy
+
+    from beamng_pc_importer.visuals import instantiate_flexbody
+
+    part = PartDefinition(
+        name="us_semi_cabover_dashboard",
+        source_path=Path("vehicles/us_semi/us_semi_cabover_dashboard.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["nop", "cabover_parking_brake_stalk", "int_strw", "dshl", "dshr", {"x": 180, "y": -90, "z": -40}, {"x": 0, "y": 0, "z": 40}, {"x": 0, "y": 0, "z": 0}, -1, 1, -1, 1, {"baseTranslation": {"x": -0.0, "y": 0.063, "z": -0.037}}],
+            ],
+        },
+    )
+    spec = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "int_strw": Vector((0.786, 0.1797, 2.0723)),
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+        },
+    )[0]
+
+    mesh = bpy.data.meshes.new("cabover_parking_brake_stalk_test_mesh")
+    template = bpy.data.objects.new("cabover_parking_brake_stalk", mesh)
+    parent = bpy.data.objects.new("us_semi_cabover_dashboard_parent", None)
+    parent.matrix_world = Matrix.Translation((0.0, 1.94, 0.0))
+    bpy.context.scene.collection.objects.link(template)
+    bpy.context.scene.collection.objects.link(parent)
+
+    instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
+    bpy.context.view_layer.update()
+
+    assert_vector_close(instance.matrix_local.to_translation(), (0.723, -1.730834, 2.050936))
+    assert_vector_close(instance.get("beamng_prop_applied_local_visual_offset"), (-0.0, 0.063, -0.037))
+    assert_vector_close(instance.get("beamng_final_local_loc"), (0.723, -1.730834, 2.050936))

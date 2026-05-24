@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 149
+ADDON_BUILD = 150
 
 
 def addon_version_label():
@@ -10203,6 +10203,7 @@ class BEAMNG_OT_print_prop_transforms(Operator):
                     f"  anim_translation=({format_vector(obj.get('beamng_prop_anim_translation', (0.0, 0.0, 0.0)))})",
                     f"  local_translation=({format_vector(obj.get('beamng_prop_local_translation', (0.0, 0.0, 0.0)))})",
                     f"  world_translation_offset=({format_vector(obj.get('beamng_prop_world_translation_offset', (0.0, 0.0, 0.0)))})",
+                    f"  applied_local_visual_offset=({format_vector(obj.get('beamng_prop_applied_local_visual_offset', (0.0, 0.0, 0.0)))})",
                     f"  global_translation=({format_vector(obj.get('beamng_prop_global_translation', (0.0, 0.0, 0.0)))})",
                     f"  base_rot_deg=({format_vector(obj.get('beamng_prop_base_rotation_deg', (0.0, 0.0, 0.0)))})",
                     f"  row_rot_deg=({format_vector(obj.get('beamng_prop_row_rotation_deg', (0.0, 0.0, 0.0)))})",
@@ -10213,6 +10214,9 @@ class BEAMNG_OT_print_prop_transforms(Operator):
                     f"  template_scale=({format_vector(obj.get('beamng_template_scale', (0.0, 0.0, 0.0)))})",
                     f"  template_orientation_mode={obj.get('beamng_prop_template_orientation_mode', '')}",
                     f"  normalized_negative_scale={obj.get('beamng_normalized_negative_scale', False)}",
+                    f"  target_world_loc=({format_vector(obj.get('beamng_target_world_loc', (0.0, 0.0, 0.0)))})",
+                    f"  final_world_loc=({format_vector(obj.get('beamng_final_world_loc', (0.0, 0.0, 0.0)))})",
+                    f"  final_local_loc=({format_vector(obj.get('beamng_final_local_loc', (0.0, 0.0, 0.0)))})",
                     f"  world_loc=({format_vector(transform['world_location'])})",
                     f"  world_rot_deg=({format_vector(transform['world_rotation_deg'])})",
                     f"  world_scale=({format_vector(transform['world_scale'])})",
