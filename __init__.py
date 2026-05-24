@@ -1846,6 +1846,9 @@ def draw_experimental_jbeam_proxy_node_overlay():
     prefs = get_addon_preferences(context)
     show_proxy_overlay = prefs is None or bool(getattr(prefs, "show_proxy_node_overlay", True))
     show_topology_overlay = prefs is None or bool(getattr(prefs, "show_jbeam_semantic_overlay", True))
+    prefer_native_overlay = prefs is not None and bool(getattr(prefs, "prefer_native_jbeam_overlay", True))
+    if prefer_native_overlay:
+        show_topology_overlay = False
     if not show_proxy_overlay and not show_topology_overlay:
         return
 
@@ -1871,6 +1874,8 @@ def draw_experimental_jbeam_proxy_node_overlay():
     view_right = region_data.view_rotation @ Vector((1.0, 0.0, 0.0))
     view_up = region_data.view_rotation @ Vector((0.0, 1.0, 0.0))
     for obj in experimental_jbeam_mesh_objects(scene, active_only=False):
+        if prefer_native_overlay and obj.mode == "EDIT":
+            continue
         for position in proxy_node_world_positions_for_overlay(obj):
             size = max(0.025, (position - region_data.view_location).length * 0.004)
             line_positions.extend(
@@ -11542,6 +11547,14 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         description="Draw proxy/reference JBeam nodes as orange crosses in the 3D View",
         default=True,
     )
+    prefer_native_jbeam_overlay: BoolProperty(
+        name="Prefer Native JBeam Overlay",
+        description=(
+            "Use the custom Blender native edit-mesh overlay for JBeam semantic colors/crosses and skip the "
+            "slower Python semantic redraw path. Disable if running stock Blender or debugging object-mode overlays"
+        ),
+        default=True,
+    )
     show_jbeam_semantic_overlay: BoolProperty(
         name="Show JBeam Semantic Colors",
         description="Draw colored overlay points/edges for owned nodes, proxy nodes, beams, triangle boundaries, and relationship edges",
@@ -11580,6 +11593,7 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         layout.prop(self, "auto_sync_proxy_nodes")
         layout.prop(self, "auto_scan_jbeam_edits")
         layout.prop(self, "show_proxy_node_overlay")
+        layout.prop(self, "prefer_native_jbeam_overlay")
         layout.prop(self, "show_jbeam_semantic_overlay")
         layout.prop(self, "apply_prop_animation_delta")
         layout.prop(self, "jbeam_position_precision")
