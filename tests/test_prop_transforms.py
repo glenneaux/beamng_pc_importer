@@ -11,6 +11,10 @@ def assert_vector_close(actual, expected, tolerance=0.000001):
         assert abs(actual_value - expected_value) <= tolerance
 
 
+def max_matrix_delta(left, right):
+    return max(abs(left[row][col] - right[row][col]) for row in range(3) for col in range(3))
+
+
 def test_prop_anchor_basis_and_local_translation_follow_beamng_docs():
     part = PartDefinition(
         name="test_part",
@@ -184,3 +188,51 @@ def test_cabover_speedo_needle_raw_prop_axes_match_dae_rest_position():
     # With the import parent offset removed, the comparable JBeam-space Y is
     # approximately -0.020148.
     assert_vector_close(spec.transform_matrix.to_translation(), (0.658107, -0.020035, 2.05554), tolerance=0.00025)
+
+
+def test_cabover_speedo_needle_instancing_preserves_animated_rotation():
+    import bpy
+
+    from beamng_pc_importer.visuals import instantiate_flexbody
+
+    part = PartDefinition(
+        name="us_semi_cabover_dashboard",
+        source_path=Path("vehicles/us_semi/us_semi_cabover_dashboard.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["wheelspeed", "cabover_needle_speedo", "dshl", "dshr", "dsh", {"x": 0, "y": -90, "z": -10}, {"x": 6, "y": 0, "z": 0}, {"x": 0, "y": 0, "z": 0}, 0, 70.7, -22.35, 1, {"baseTranslation": {"x": 0.331, "y": -0.224, "z": 0.209}}],
+            ],
+        },
+    )
+    spec = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+            "dsh": Vector((0.0, 0.44, 1.84654)),
+        },
+    )[0]
+
+    mesh = bpy.data.meshes.new("cabover_needle_speedo_test_mesh")
+    template = bpy.data.objects.new("cabover_needle_speedo", mesh)
+    template.matrix_world = Matrix(
+        (
+            (-1.60305e-10, -3.11206e-10, -0.001, 0.6581002),
+            (-9.83946e-4, -1.78469e-4, 2.13272e-10, -1.960148),
+            (-1.78469e-4, 9.83946e-4, -2.77601e-10, 2.055337),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    parent = bpy.data.objects.new("us_semi_cabover_dashboard_parent", None)
+    parent.matrix_world = Matrix.Translation((0.0, 1.94, 0.0))
+    bpy.context.scene.collection.objects.link(template)
+    bpy.context.scene.collection.objects.link(parent)
+
+    instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
+    bpy.context.view_layer.update()
+
+    template_rotation = template.matrix_world.to_3x3()
+    final_rotation = instance.matrix_world.to_3x3()
+    assert max_matrix_delta(final_rotation, template_rotation) > 0.0005

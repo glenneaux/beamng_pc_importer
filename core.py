@@ -28,6 +28,7 @@ class FlexbodySpec:
     part_name: str
     jbeam_path: Path
     transform_matrix: Matrix = field(default_factory=lambda: Matrix.Identity(4))
+    prop_rest_matrix: Matrix = field(default_factory=lambda: Matrix.Identity(4))
     pos: Vector = field(default_factory=lambda: Vector((0.0, 0.0, 0.0)))
     rot: Vector = field(default_factory=lambda: Vector((0.0, 0.0, 0.0)))
     scale: Vector = field(default_factory=lambda: Vector((1.0, 1.0, 1.0)))
@@ -2497,6 +2498,7 @@ def parse_props(
         global_prop_rotation = prop_global_rotation_matrix(global_rotation_vec)
         anchor_origin, anchor_rotation, anchor_debug = get_prop_anchor(row, local_node_positions, global_node_positions)
         prop_world_translation_offset = Vector((0.0, 0.0, 0.0))
+        prop_rest_matrix = Matrix.Identity(4)
         if anchor_origin is not None and anchor_rotation is not None:
             if has_global_translation:
                 prop_world_translation_offset = anchor_rotation.to_3x3() @ prop_anim_translation
@@ -2504,8 +2506,10 @@ def parse_props(
             else:
                 prop_world_translation_offset = anchor_rotation.to_3x3() @ prop_local_translation
                 final_origin = anchor_origin + prop_world_translation_offset
+            rest_rotation = global_prop_rotation @ prop_base_rotation_matrix(base_rotation_vec) if has_global_rotation else anchor_rotation @ prop_base_rotation_matrix(base_rotation_vec)
             final_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else anchor_rotation @ local_prop_rotation
             final_transform = Matrix.Translation(final_origin) @ final_rotation
+            prop_rest_matrix = Matrix.Translation(final_origin) @ rest_rotation
         else:
             if len(row) >= 5:
                 print(
@@ -2520,12 +2524,15 @@ def parse_props(
                 fallback_translation = prop_local_translation
             fallback_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else local_prop_rotation
             final_transform = base_transform @ Matrix.Translation(fallback_translation) @ fallback_rotation
+            rest_rotation = global_prop_rotation @ prop_base_rotation_matrix(base_rotation_vec) if has_global_rotation else prop_base_rotation_matrix(base_rotation_vec)
+            prop_rest_matrix = base_transform @ Matrix.Translation(fallback_translation) @ rest_rotation
         results.append(
             FlexbodySpec(
                 mesh=mesh_name,
                 part_name=part_def.name,
                 jbeam_path=part_def.source_path,
                 transform_matrix=final_transform,
+                prop_rest_matrix=prop_rest_matrix,
                 pos=final_transform.to_translation(),
                 rot=prop_rot,
                 scale=Vector((1.0, 1.0, 1.0)),

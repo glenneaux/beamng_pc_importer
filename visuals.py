@@ -1167,12 +1167,13 @@ def matrix_scale_only(matrix):
 
 def prop_template_basis_from_dae(spec: FlexbodySpec, template_obj):
     # BeamNG uses JBeam to place props, while the DAE still defines the mesh's
-    # authored local basis. Derive the Blender preview basis from those two
-    # source transforms instead of classifying prop names or functions.
-    _spec_loc, spec_rot, _spec_scale = spec.transform_matrix.decompose()
+    # authored local basis. Cancel only the authored/rest prop rotation here;
+    # the active transform still carries animated row rotation such as gauge
+    # needle offsets.
+    _rest_loc, rest_rot, _rest_scale = spec.prop_rest_matrix.decompose()
     _template_loc, template_rot, template_scale = template_obj.matrix_world.decompose()
     positive_scale = Vector((abs(template_scale.x), abs(template_scale.y), abs(template_scale.z)))
-    basis_rot = spec_rot.inverted() @ template_rot
+    basis_rot = rest_rot.inverted() @ template_rot
     return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), basis_rot, positive_scale)
 
 
