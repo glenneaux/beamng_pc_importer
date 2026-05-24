@@ -1177,19 +1177,6 @@ def prop_template_basis_from_dae(spec: FlexbodySpec, template_obj):
     return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), basis_rot, positive_scale)
 
 
-def bake_negative_handedness_into_mesh(instance, target_matrix):
-    if target_matrix.to_3x3().determinant() >= 0.0:
-        return target_matrix, False
-
-    # Keep the same visual result, but move the reflection from object scale into
-    # this prop's mesh data so Blender reports a positive object transform.
-    reflection = Matrix.Diagonal((-1.0, -1.0, -1.0, 1.0))
-    instance.data = instance.data.copy()
-    instance.data.transform(reflection)
-    instance.data.update()
-    return target_matrix @ reflection, True
-
-
 def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collection, parent_obj=None):
     instance = template_obj.copy()
     instance.data = template_obj.data
@@ -1256,8 +1243,11 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
             template_transform = prop_template_basis_from_dae(spec, template_obj)
             instance["beamng_prop_template_orientation_mode"] = "dae_derived_basis"
         target_matrix = spec.transform_matrix @ template_transform
-    if spec.source_type == "prop":
-        target_matrix, normalized_negative_scale = bake_negative_handedness_into_mesh(instance, target_matrix)
+    if spec.source_type == "prop" and target_matrix.to_3x3().determinant() < 0.0:
+        # BeamNG prop axes can be left-handed. Preserve that authored handedness
+        # instead of baking a corrective reflection into the mesh, because the
+        # visual prop should follow the DAE/JBeam source exactly.
+        normalized_negative_scale = False
     instance["beamng_normalized_negative_scale"] = normalized_negative_scale
     instance["beamng_target_world_loc"] = tuple(round(value, 6) for value in target_matrix.to_translation())
 

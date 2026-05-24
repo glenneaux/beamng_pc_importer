@@ -236,3 +236,52 @@ def test_cabover_speedo_needle_instancing_preserves_animated_rotation():
     template_rotation = template.matrix_world.to_3x3()
     final_rotation = instance.matrix_world.to_3x3()
     assert max_matrix_delta(final_rotation, template_rotation) > 0.0005
+
+
+def test_cabover_steering_wheel_preserves_source_handedness():
+    import bpy
+
+    from beamng_pc_importer.visuals import instantiate_flexbody
+
+    part = PartDefinition(
+        name="us_semi_cabover_steer",
+        source_path=Path("vehicles/us_semi/us_semi_steeringwheels.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["steering", "cabover_steering_wheel", "int_strw", "dshl", "dshr", {"x": 0, "y": 90, "z": 180}, {"x": 0, "y": 0, "z": 1}, {"x": 0, "y": 0, "z": 0}, -1000, 1000, 0, 1, {"baseTranslation": {"x": 0, "y": 0, "z": 0}}],
+            ],
+        },
+    )
+    spec = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "int_strw": Vector((0.786, 0.1797, 2.0723)),
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+        },
+    )[0]
+
+    mesh = bpy.data.meshes.new("cabover_steering_wheel_test_mesh")
+    mesh.from_pydata([(1.0, 0.0, 0.0)], [], [])
+    template = bpy.data.objects.new("cabover_steering_wheel", mesh)
+    template.matrix_world = Matrix(
+        (
+            (0.001, 0.0, 0.0, 0.7860397),
+            (0.0, 9.06308e-4, 4.22618e-4, -1.760317),
+            (0.0, -4.22618e-4, 9.06308e-4, 2.072255),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    parent = bpy.data.objects.new("us_semi_cabover_steer_parent", None)
+    parent.matrix_world = Matrix.Translation((0.0, 1.94, 0.0))
+    bpy.context.scene.collection.objects.link(template)
+    bpy.context.scene.collection.objects.link(parent)
+
+    instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
+    bpy.context.view_layer.update()
+
+    assert instance.matrix_world.to_3x3().determinant() < 0.0
+    assert instance.get("beamng_normalized_negative_scale") is False
+    assert_vector_close(instance.data.vertices[0].co, (1.0, 0.0, 0.0))
