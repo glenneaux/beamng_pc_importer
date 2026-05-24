@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 156
+ADDON_BUILD = 157
 
 
 def addon_version_label():
@@ -10208,6 +10208,7 @@ class BEAMNG_OT_print_prop_transforms(Operator):
                     f"  base_rot_deg=({format_vector(obj.get('beamng_prop_base_rotation_deg', (0.0, 0.0, 0.0)))})",
                     f"  row_rot_deg=({format_vector(obj.get('beamng_prop_row_rotation_deg', (0.0, 0.0, 0.0)))})",
                     f"  row_anim_factor={obj.get('beamng_prop_anim_factor', 0.0):.6f}",
+                    f"  animation_delta_applied={obj.get('beamng_prop_animation_delta_applied', False)}",
                     f"  spec_pos=({format_vector(obj.get('beamng_spec_pos', (0.0, 0.0, 0.0)))})",
                     f"  spec_rot_deg=({format_vector(obj.get('beamng_spec_rot_deg', (0.0, 0.0, 0.0)))})",
                     f"  template_rot_deg=({format_vector(obj.get('beamng_template_rotation_deg', (0.0, 0.0, 0.0)))})",
@@ -11546,6 +11547,14 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         description="Draw colored overlay points/edges for owned nodes, proxy nodes, beams, triangle boundaries, and relationship edges",
         default=True,
     )
+    apply_prop_animation_delta: BoolProperty(
+        name="Apply Prop Animation Rotation Delta",
+        description=(
+            "Preview static prop row animation rotations on top of the authored DAE rest orientation. "
+            "Disable for layout/authoring imports where the DAE rest pose should be shown unchanged"
+        ),
+        default=False,
+    )
     jbeam_position_precision: IntProperty(
         name="JBeam Project Decimal Places",
         description=(
@@ -11572,6 +11581,7 @@ class BeamNGPCImporterPreferences(AddonPreferences):
         layout.prop(self, "auto_scan_jbeam_edits")
         layout.prop(self, "show_proxy_node_overlay")
         layout.prop(self, "show_jbeam_semantic_overlay")
+        layout.prop(self, "apply_prop_animation_delta")
         layout.prop(self, "jbeam_position_precision")
         layout.prop(self, "jbeam_export_mod_name")
 
@@ -11952,7 +11962,17 @@ def import_beamng_pc_path(
 
             parent_obj = part_objects.get(spec.resolved_part_id)
             try:
-                instantiate_flexbody(template_obj, spec, root_collection, parent_obj)
+                prefs = get_addon_preferences(context)
+                apply_prop_animation_delta = bool(
+                    prefs and getattr(prefs, "apply_prop_animation_delta", False)
+                )
+                instantiate_flexbody(
+                    template_obj,
+                    spec,
+                    root_collection,
+                    parent_obj,
+                    apply_prop_animation_delta=apply_prop_animation_delta,
+                )
             except Exception as exc:
                 source_label = "prop" if getattr(spec, "source_type", "") == "prop" else "mesh"
                 warnings.append(f"Failed to instantiate {source_label} '{spec.mesh}' from part '{spec.part_name}': {exc}")

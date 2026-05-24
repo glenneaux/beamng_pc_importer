@@ -190,7 +190,7 @@ def test_cabover_speedo_needle_raw_prop_axes_match_dae_rest_position():
     assert_vector_close(spec.transform_matrix.to_translation(), (0.658107, -0.020035, 2.05554), tolerance=0.00025)
 
 
-def test_cabover_speedo_needle_instancing_preserves_animated_rotation():
+def test_cabover_speedo_needle_instancing_can_apply_animated_rotation():
     import bpy
 
     from beamng_pc_importer.visuals import instantiate_flexbody
@@ -230,12 +230,66 @@ def test_cabover_speedo_needle_instancing_preserves_animated_rotation():
     bpy.context.scene.collection.objects.link(template)
     bpy.context.scene.collection.objects.link(parent)
 
-    instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
+    instance = instantiate_flexbody(
+        template,
+        spec,
+        bpy.context.scene.collection,
+        parent_obj=parent,
+        apply_prop_animation_delta=True,
+    )
     bpy.context.view_layer.update()
 
     template_rotation = template.matrix_world.to_3x3()
     final_rotation = instance.matrix_world.to_3x3()
     assert max_matrix_delta(final_rotation, template_rotation) > 0.0005
+    assert instance.get("beamng_prop_animation_delta_applied") is True
+
+
+def test_cabover_speedo_needle_instancing_defaults_to_dae_rest_orientation():
+    import bpy
+
+    from beamng_pc_importer.visuals import instantiate_flexbody
+
+    part = PartDefinition(
+        name="us_semi_cabover_dashboard",
+        source_path=Path("vehicles/us_semi/us_semi_cabover_dashboard.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["wheelspeed", "cabover_needle_speedo", "dshl", "dshr", "dsh", {"x": 0, "y": -90, "z": -10}, {"x": 6, "y": 0, "z": 0}, {"x": 0, "y": 0, "z": 0}, 0, 70.7, -22.35, 1, {"baseTranslation": {"x": 0.331, "y": -0.224, "z": 0.209}}],
+            ],
+        },
+    )
+    spec = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+            "dsh": Vector((0.0, 0.44, 1.84654)),
+        },
+    )[0]
+
+    mesh = bpy.data.meshes.new("cabover_needle_speedo_default_test_mesh")
+    template = bpy.data.objects.new("cabover_needle_speedo", mesh)
+    template.matrix_world = Matrix(
+        (
+            (-1.60305e-10, -3.11206e-10, -0.001, 0.6581002),
+            (-9.83946e-4, -1.78469e-4, 2.13272e-10, -1.960148),
+            (-1.78469e-4, 9.83946e-4, -2.77601e-10, 2.055337),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    parent = bpy.data.objects.new("us_semi_cabover_dashboard_parent_default", None)
+    parent.matrix_world = Matrix.Translation((0.0, 1.94, 0.0))
+    bpy.context.scene.collection.objects.link(template)
+    bpy.context.scene.collection.objects.link(parent)
+
+    instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
+    bpy.context.view_layer.update()
+
+    assert max_matrix_delta(instance.matrix_world, template.matrix_world) < 0.000001
+    assert instance.get("beamng_prop_animation_delta_applied") is False
 
 
 def test_cabover_steering_wheel_preserves_source_handedness():
@@ -331,7 +385,7 @@ def test_cabover_parking_brake_visual_uses_dae_rest_orientation_plus_anim_delta(
     bpy.context.view_layer.update()
 
     assert_vector_close(instance.matrix_local.to_translation(), (0.723776, -1.730933, 2.047727))
-    assert max_matrix_delta(instance.matrix_world, template.matrix_world) > 0.0005
+    assert max_matrix_delta(instance.matrix_world, template.matrix_world) < 0.000001
 
 
 def test_cabover_steering_wheel_uses_orthonormal_rotation_basis():

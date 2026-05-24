@@ -1165,17 +1165,17 @@ def matrix_scale_only(matrix):
     return Matrix.Diagonal((abs(scale.x), abs(scale.y), abs(scale.z), 1.0))
 
 
-def prop_template_basis_from_dae(spec: FlexbodySpec, template_obj):
+def prop_template_basis_from_dae(spec: FlexbodySpec, template_obj, apply_animation_delta=False):
     # BeamNG prop DAE nodes already carry the authored rest orientation. Use
     # JBeam to relocate the prop and apply the current animation delta without
     # replacing the DAE rest basis with a reconstructed anchor/base basis.
     _template_loc, template_rot, template_scale = template_obj.matrix_world.decompose()
     positive_scale = Vector((abs(template_scale.x), abs(template_scale.y), abs(template_scale.z)))
-    anim_matrix = getattr(spec, "prop_anim_matrix", Matrix.Identity(4))
+    anim_matrix = getattr(spec, "prop_anim_matrix", Matrix.Identity(4)) if apply_animation_delta else Matrix.Identity(4)
     return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), template_rot, positive_scale) @ anim_matrix
 
 
-def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collection, parent_obj=None):
+def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collection, parent_obj=None, apply_prop_animation_delta=False):
     instance = template_obj.copy()
     instance.data = template_obj.data
     destination_collection.objects.link(instance)
@@ -1238,8 +1238,9 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
     else:
         template_transform = matrix_without_translation(template_obj.matrix_world)
         if spec.source_type == "prop":
-            template_transform = prop_template_basis_from_dae(spec, template_obj)
+            template_transform = prop_template_basis_from_dae(spec, template_obj, apply_prop_animation_delta)
             instance["beamng_prop_template_orientation_mode"] = "dae_derived_basis"
+            instance["beamng_prop_animation_delta_applied"] = bool(apply_prop_animation_delta)
         if spec.source_type == "prop":
             target_matrix = Matrix.Translation(spec.transform_matrix.to_translation()) @ template_transform
         else:
