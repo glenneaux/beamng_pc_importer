@@ -287,6 +287,53 @@ def test_cabover_steering_wheel_preserves_source_handedness():
     assert_vector_close(instance.data.vertices[0].co, (1.0, 0.0, 0.0))
 
 
+def test_cabover_parking_brake_visual_uses_dae_rest_orientation_plus_anim_delta():
+    import bpy
+
+    from beamng_pc_importer.visuals import instantiate_flexbody
+
+    part = PartDefinition(
+        name="us_semi_cabover_dashboard",
+        source_path=Path("vehicles/us_semi/us_semi_cabover_dashboard.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["nop", "cabover_parking_brake_stalk", "int_strw", "dshl", "dshr", {"x": 180, "y": -90, "z": -40}, {"x": 0, "y": 0, "z": 40}, {"x": 0, "y": 0, "z": 0}, -1, 1, -1, 1, {"baseTranslation": {"x": -0.0, "y": 0.063, "z": -0.037}}],
+            ],
+        },
+    )
+    spec = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "int_strw": Vector((0.786, 0.1797, 2.0723)),
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+        },
+    )[0]
+
+    mesh = bpy.data.meshes.new("cabover_parking_brake_stalk_test_mesh")
+    template = bpy.data.objects.new("cabover_parking_brake_stalk", mesh)
+    template.matrix_world = Matrix(
+        (
+            (0.001, 0.0, 0.0, 0.7140779),
+            (0.0, 9.16924e-4, 3.99063e-4, -1.773748),
+            (0.0, -3.99063e-4, 9.16924e-4, 2.074368),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    parent = bpy.data.objects.new("us_semi_cabover_dashboard_parent", None)
+    parent.matrix_world = Matrix.Translation((0.0, 1.94, 0.0))
+    bpy.context.scene.collection.objects.link(template)
+    bpy.context.scene.collection.objects.link(parent)
+
+    instance = instantiate_flexbody(template, spec, bpy.context.scene.collection, parent_obj=parent)
+    bpy.context.view_layer.update()
+
+    assert_vector_close(instance.matrix_local.to_translation(), (0.723776, -1.730933, 2.047727))
+    assert max_matrix_delta(instance.matrix_world, template.matrix_world) > 0.0005
+
+
 def test_cabover_steering_wheel_uses_orthonormal_rotation_basis():
     part = PartDefinition(
         name="us_semi_cabover_steer",

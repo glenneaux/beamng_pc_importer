@@ -1166,15 +1166,12 @@ def matrix_scale_only(matrix):
 
 
 def prop_template_basis_from_dae(spec: FlexbodySpec, template_obj):
-    # BeamNG uses JBeam to place props, while the DAE still defines the mesh's
-    # authored local basis. Cancel only the authored/rest prop rotation here;
-    # the active transform still carries animated row rotation such as gauge
-    # needle offsets.
-    _rest_loc, rest_rot, _rest_scale = spec.prop_rest_matrix.decompose()
+    # BeamNG prop DAE nodes already carry the authored rest orientation. Use
+    # JBeam to relocate the prop and apply the current animation delta without
+    # replacing the DAE rest basis with a reconstructed anchor/base basis.
     _template_loc, template_rot, template_scale = template_obj.matrix_world.decompose()
     positive_scale = Vector((abs(template_scale.x), abs(template_scale.y), abs(template_scale.z)))
-    basis_rot = rest_rot.inverted() @ template_rot
-    return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), basis_rot, positive_scale)
+    return Matrix.LocRotScale(Vector((0.0, 0.0, 0.0)), template_rot, positive_scale) @ spec.prop_anim_matrix
 
 
 def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collection, parent_obj=None):
@@ -1242,7 +1239,10 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
         if spec.source_type == "prop":
             template_transform = prop_template_basis_from_dae(spec, template_obj)
             instance["beamng_prop_template_orientation_mode"] = "dae_derived_basis"
-        target_matrix = spec.transform_matrix @ template_transform
+        if spec.source_type == "prop":
+            target_matrix = Matrix.Translation(spec.transform_matrix.to_translation()) @ template_transform
+        else:
+            target_matrix = spec.transform_matrix @ template_transform
     if spec.source_type == "prop" and target_matrix.to_3x3().determinant() < 0.0:
         # BeamNG prop axes can be left-handed. Preserve that authored handedness
         # instead of baking a corrective reflection into the mesh, because the

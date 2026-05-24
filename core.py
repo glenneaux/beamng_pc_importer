@@ -29,6 +29,7 @@ class FlexbodySpec:
     jbeam_path: Path
     transform_matrix: Matrix = field(default_factory=lambda: Matrix.Identity(4))
     prop_rest_matrix: Matrix = field(default_factory=lambda: Matrix.Identity(4))
+    prop_anim_matrix: Matrix = field(default_factory=lambda: Matrix.Identity(4))
     pos: Vector = field(default_factory=lambda: Vector((0.0, 0.0, 0.0)))
     rot: Vector = field(default_factory=lambda: Vector((0.0, 0.0, 0.0)))
     scale: Vector = field(default_factory=lambda: Vector((1.0, 1.0, 1.0)))
@@ -2535,6 +2536,7 @@ def parse_props(
                 jbeam_path=part_def.source_path,
                 transform_matrix=final_transform,
                 prop_rest_matrix=prop_rest_matrix,
+                prop_anim_matrix=prop_anim_rotation_matrix(anim_rotation_vec),
                 pos=final_transform.to_translation(),
                 rot=prop_rot,
                 scale=Vector((1.0, 1.0, 1.0)),
