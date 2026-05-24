@@ -10,7 +10,7 @@ bl_info = {
 
 # Build numbers increment for each build of the current bl_info version.
 # Reset ADDON_BUILD to 1 whenever bl_info["version"] changes.
-ADDON_BUILD = 157
+ADDON_BUILD = 158
 
 
 def addon_version_label():
@@ -1034,6 +1034,24 @@ def experimental_jbeam_part_objects(scene):
             obj.name,
         ),
     )
+
+
+def set_experimental_jbeam_meshes_visible(scene, *, active_only=False, active_obj=None):
+    changed = 0
+    active_key = jbeam_assembly_part_key_for_object(active_obj) if active_obj else ""
+    for obj in experimental_jbeam_part_objects(scene):
+        should_show = not active_only or obj is active_obj or (
+            active_key and jbeam_assembly_part_key_for_object(obj) == active_key
+        )
+        was_hidden = bool(obj.hide_get() or obj.hide_viewport)
+        obj.hide_set(not should_show)
+        obj.hide_viewport = not should_show
+        if should_show:
+            obj.hide_render = False
+            obj.hide_select = False
+        if was_hidden == should_show:
+            changed += 1
+    return changed
 
 
 def refresh_jbeam_assembly_parts(scene):
@@ -7617,6 +7635,39 @@ class BEAMNG_OT_activate_jbeam_assembly_part(Operator):
         return {"CANCELLED"}
 
 
+class BEAMNG_OT_isolate_active_jbeam_mesh(Operator):
+    bl_idname = "beamng_pc_importer.isolate_active_jbeam_mesh"
+    bl_label = "Hide Other JBeam Meshes"
+    bl_description = "Hide all experimental JBeam mesh objects except the active/selected JBeam part"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = active_experimental_jbeam_mesh(context) or active_jbeam_assembly_part_object(context.scene)
+        if obj is None:
+            self.report({"WARNING"}, "Select or activate a JBeam mesh first")
+            return {"CANCELLED"}
+        refresh_jbeam_assembly_parts(context.scene)
+        set_active_jbeam_assembly_part(context.scene, obj)
+        apply_jbeam_active_part_reference_display(context.scene)
+        changed = set_experimental_jbeam_meshes_visible(context.scene, active_only=True, active_obj=obj)
+        self.report({"INFO"}, f"Showing {obj.get('beamng_part_name', obj.name)}; hid/updated {changed} JBeam mesh(es)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_show_all_experimental_jbeam_meshes(Operator):
+    bl_idname = "beamng_pc_importer.show_all_experimental_jbeam_meshes"
+    bl_label = "Show All JBeam Meshes"
+    bl_description = "Unhide all experimental JBeam mesh objects"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        refresh_jbeam_assembly_parts(context.scene)
+        changed = set_experimental_jbeam_meshes_visible(context.scene, active_only=False)
+        apply_jbeam_active_part_reference_display(context.scene)
+        self.report({"INFO"}, f"Shown/updated {changed} JBeam mesh(es)")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_accept_experimental_jbeam_node_moves(Operator):
     bl_idname = "beamng_pc_importer.accept_experimental_jbeam_node_moves"
     bl_label = "Accept JBeam Edits"
@@ -10638,6 +10689,9 @@ def draw_jbeam_assembly_part_controls(layout, context):
     row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Use Selected")
     clear = row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Clear")
     clear.clear = True
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_isolate_active_jbeam_mesh.bl_idname, text="Hide Others")
+    row.operator(BEAMNG_OT_show_all_experimental_jbeam_meshes.bl_idname, text="Show All")
     box.operator(BEAMNG_OT_validate_jbeam_assembly.bl_idname, text="Validate Assembly")
     slot_count = len(getattr(context.scene, "beamng_slot_editor_items", []) or [])
     if slot_count:
@@ -11062,6 +11116,9 @@ def draw_authoring_workflow_panel(layout, context):
     row.operator(IMPORT_OT_beamng_jbeam_topology.bl_idname, text="Import JBeam")
     row = box.row(align=True)
     row.operator(BEAMNG_OT_set_active_jbeam_part_from_selection.bl_idname, text="Use Selected Part")
+    row.operator(BEAMNG_OT_isolate_active_jbeam_mesh.bl_idname, text="Hide Others")
+    row = box.row(align=True)
+    row.operator(BEAMNG_OT_show_all_experimental_jbeam_meshes.bl_idname, text="Show All JBeam Meshes")
     row = box.row(align=True)
     row.operator(BEAMNG_OT_validate_jbeam_assembly.bl_idname, text="Validate Assembly")
     row.operator(BEAMNG_OT_write_authoring_workflow_report.bl_idname, text="Workflow Report")
@@ -12766,6 +12823,8 @@ classes = (
     BEAMNG_OT_refresh_jbeam_assembly_parts,
     BEAMNG_OT_set_active_jbeam_part_from_selection,
     BEAMNG_OT_activate_jbeam_assembly_part,
+    BEAMNG_OT_isolate_active_jbeam_mesh,
+    BEAMNG_OT_show_all_experimental_jbeam_meshes,
     BEAMNG_OT_accept_experimental_jbeam_node_moves,
     BEAMNG_OT_mark_selected_edges_as_jbeam_beams,
     BEAMNG_OT_set_selected_jbeam_edge_semantic,

@@ -37,6 +37,11 @@ non-trivial design changes.**
 The add-on runs inside Blender's bundled Python; you do not need a separate
 runtime to use the add-on.
 
+The local custom Blender source checkout lives at `I:\blender4.2_SRC\blender`.
+When rebuilding that fork, run `.\make` / `.\make.bat` from the Blender repo
+root instead of driving CMake targets directly unless there is a specific
+reason to do an incremental target build.
+
 For tooling (the `ruff` formatter / linter) install the optional `dev` extra
 into a regular Python:
 
