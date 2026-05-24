@@ -1230,8 +1230,14 @@ def instantiate_flexbody(template_obj, spec: FlexbodySpec, destination_collectio
         instance["beamng_prop_anchor_y_ref"] = spec.debug_anchor_y
     if spec.debug_missing_anchor_nodes:
         instance["beamng_prop_missing_anchor_nodes"] = spec.debug_missing_anchor_nodes
+    if spec.debug_prop_base_translation:
+        instance["beamng_prop_base_translation"] = spec.debug_prop_base_translation
+    if spec.debug_prop_anim_translation:
+        instance["beamng_prop_anim_translation"] = spec.debug_prop_anim_translation
     if spec.debug_prop_local_translation:
         instance["beamng_prop_local_translation"] = spec.debug_prop_local_translation
+    if spec.debug_prop_world_translation_offset:
+        instance["beamng_prop_world_translation_offset"] = spec.debug_prop_world_translation_offset
     if spec.debug_prop_global_translation:
         instance["beamng_prop_global_translation"] = spec.debug_prop_global_translation
     if spec.debug_prop_base_rotation:

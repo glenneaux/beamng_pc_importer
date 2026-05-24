@@ -40,7 +40,10 @@ class FlexbodySpec:
     debug_anchor_x: tuple = field(default_factory=tuple)
     debug_anchor_y: tuple = field(default_factory=tuple)
     debug_missing_anchor_nodes: tuple = field(default_factory=tuple)
+    debug_prop_base_translation: tuple = field(default_factory=tuple)
+    debug_prop_anim_translation: tuple = field(default_factory=tuple)
     debug_prop_local_translation: tuple = field(default_factory=tuple)
+    debug_prop_world_translation_offset: tuple = field(default_factory=tuple)
     debug_prop_global_translation: tuple = field(default_factory=tuple)
     debug_prop_base_rotation: tuple = field(default_factory=tuple)
     debug_prop_row_rotation: tuple = field(default_factory=tuple)
@@ -2474,11 +2477,14 @@ def parse_props(
         local_prop_rotation = prop_base_rotation_matrix(base_rotation_vec) @ prop_anim_rotation_matrix(anim_rotation_vec)
         global_prop_rotation = prop_global_rotation_matrix(global_rotation_vec)
         anchor_origin, anchor_rotation, anchor_debug = get_prop_anchor(row, local_node_positions, global_node_positions)
+        prop_world_translation_offset = Vector((0.0, 0.0, 0.0))
         if anchor_origin is not None and anchor_rotation is not None:
             if has_global_translation:
-                final_origin = (base_transform @ prop_global_translation) + (anchor_rotation.to_3x3() @ prop_anim_translation)
+                prop_world_translation_offset = anchor_rotation.to_3x3() @ prop_anim_translation
+                final_origin = (base_transform @ prop_global_translation) + prop_world_translation_offset
             else:
-                final_origin = anchor_origin + (anchor_rotation.to_3x3() @ prop_local_translation)
+                prop_world_translation_offset = anchor_rotation.to_3x3() @ prop_local_translation
+                final_origin = anchor_origin + prop_world_translation_offset
             final_rotation = global_prop_rotation @ local_prop_rotation if has_global_rotation else anchor_rotation @ local_prop_rotation
             final_transform = Matrix.Translation(final_origin) @ final_rotation
         else:
@@ -2513,7 +2519,10 @@ def parse_props(
                 debug_anchor_x=tuple(round(value, 6) for value in anchor_debug.get("x_ref", ())),
                 debug_anchor_y=tuple(round(value, 6) for value in anchor_debug.get("y_ref", ())),
                 debug_missing_anchor_nodes=tuple(anchor_debug.get("missing", tuple())),
+                debug_prop_base_translation=tuple(round(value, 6) for value in prop_base_translation),
+                debug_prop_anim_translation=tuple(round(value, 6) for value in prop_anim_translation),
                 debug_prop_local_translation=tuple(round(value, 6) for value in prop_local_translation),
+                debug_prop_world_translation_offset=tuple(round(value, 6) for value in prop_world_translation_offset),
                 debug_prop_global_translation=tuple(round(value, 6) for value in prop_global_translation),
                 debug_prop_base_rotation=tuple(
                     round(value, 6)

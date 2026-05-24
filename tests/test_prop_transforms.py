@@ -90,3 +90,31 @@ def test_prop_global_translation_overrides_base_translation_position():
 
     assert len(specs) == 1
     assert_vector_close(specs[0].transform_matrix.to_translation(), (10.0, 20.0, 30.0))
+
+
+def test_cabover_parking_brake_base_translation_moves_position():
+    part = PartDefinition(
+        name="us_semi_cabover_dashboard",
+        source_path=Path("vehicles/us_semi/us_semi_cabover_dashboard.jbeam"),
+        data={
+            "props": [
+                ["func", "mesh", "idRef:", "idX:", "idY:", "baseRotation", "rotation", "translation", "min", "max", "offset", "multiplier"],
+                ["nop", "cabover_parking_brake_stalk", "int_strw", "dshl", "dshr", {"x": 180, "y": -90, "z": -40}, {"x": 0, "y": 0, "z": 40}, {"x": 0, "y": 0, "z": 0}, -1, 1, -1, 1, {"baseTranslation": {"x": -0.0, "y": 0.063, "z": -0.037}}],
+            ],
+        },
+    )
+    specs = parse_props(
+        part,
+        Matrix.Identity(4),
+        local_node_positions={
+            "int_strw": Vector((0.786, 0.1797, 2.0723)),
+            "dshl": Vector((0.786, 0.07443, 1.84654)),
+            "dshr": Vector((-0.786, 0.07443, 1.84654)),
+        },
+    )
+
+    assert len(specs) == 1
+    assert_vector_close(specs[0].debug_prop_base_translation, (-0.0, 0.063, -0.037))
+    assert_vector_close(specs[0].debug_prop_local_translation, (0.0, 0.063, -0.037))
+    assert_vector_close(specs[0].debug_prop_world_translation_offset, (-0.063, -0.033534, 0.015636))
+    assert_vector_close(specs[0].transform_matrix.to_translation(), (0.723, 0.146166, 2.087936))
